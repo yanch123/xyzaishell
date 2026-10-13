@@ -106,8 +106,10 @@ if [[ "$mode" == --disposable-user ]]; then
   username="xyzssh_$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
   # '*' has no usable password but is not OpenSSH's '!' locked-account prefix.
   # Password auth is also disabled in this daemon's isolated configuration.
+  # --system already suppresses mail-spool creation. CREATE_MAIL_SPOOL belongs
+  # to /etc/default/useradd and is not a valid --key login.defs override.
   "${as_root[@]}" useradd --system --no-log-init --no-create-home --no-user-group \
-    --key CREATE_MAIL_SPOOL=no --home-dir "$fixture/home" \
+    --home-dir "$fixture/home" \
     --shell /bin/sh --password '*' "$username"
   fixture_user=$username
   fixture_uid=$(id -u "$username")
