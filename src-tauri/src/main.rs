@@ -80,8 +80,8 @@ fn get_model_config_status(state: State<'_, TaskManager>) -> ModelConfigStatus {
     state.config_status()
 }
 #[tauri::command]
-async fn reload_model_config(state: State<'_, TaskManager>) -> ModelConfigStatus {
-    state.reload_config()
+async fn reload_model_config(state: State<'_, TaskManager>) -> Result<ModelConfigStatus, ApiError> {
+    Ok(state.reload_config())
 }
 #[tauri::command]
 fn confirm_model_destination(

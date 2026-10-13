@@ -19,7 +19,7 @@ test('browser preview: split layout, honest capabilities, isolated drafts and mo
   await expect(page.getByRole('textbox', { name: '聊天消息' })).toHaveValue('');
   await page.getByRole('textbox', { name: '聊天消息' }).fill('未发送草稿 B');
   await page.getByRole('button', { name: '打开聊天列表', exact: true }).click();
-  await page.getByRole('button', { name: '新任务 1', exact: true }).click();
+  await page.getByRole('button', { name: /^新任务 1(?: 有未发送草稿)?$/ }).click();
   await expect(page.getByRole('textbox', { name: '聊天消息' })).toHaveValue('未发送草稿 A');
   await page.getByRole('textbox', { name: '聊天消息' }).press('Control+Enter');
   await expect(page.getByRole('article', { name: '模型回复' })).toHaveCount(0);
