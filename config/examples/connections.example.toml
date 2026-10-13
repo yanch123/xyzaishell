@@ -1,4 +1,4 @@
-# design-v0.1 软件管理格式的示意，不是可直接连接的凭据文件。
+# design-v0.1 Windows 软件管理格式的示意，不是可直接连接的凭据文件。
 # 密码/私钥口令由本机应用收集并用 Windows DPAPI CurrentUser 保护。
 # 以下 protected_* 字符串是假占位，不是有效密文；不要在此填明文密码。
 schema_version = 1

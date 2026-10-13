@@ -1,8 +1,8 @@
-# 接口与事件契约（design-v0.1）
+# 03 接口与事件契约（design-v0.1）
 
-> 状态：拟议设计，不是可编译 SDK、已实现 API 或用户冻结协议。下面的类型片段用于对齐 Rust、TypeScript 与测试；实现前仍需评审命名、容量、IPC 编码及依赖版本。提案技术栈为 Windows 10/11 x64、Tauri 2、Rust/Tokio、React/TypeScript、xterm.js、russh 与 Rig。
+> 状态：拟议设计，不是可编译 SDK、已实现 API 或用户冻结协议。下面的类型片段用于对齐 Rust、TypeScript 与测试；实现前仍需评审命名、容量、IPC 编码及依赖版本。已确认客户端目标为 Windows 10/11 x64 与 Ubuntu 22.04/24.04 x64；提案技术栈为 Tauri 2、Rust/Tokio、React/TypeScript、xterm.js、russh 与 Rig，共享核心与平台适配分离。
 
-相关文档：[架构](architecture.md)、[配置](configuration.md)、[安全边界](security.md)、[测试](testing.md)。
+相关文档：[架构](02-architecture.md)、[配置](04-configuration.md)、[安全边界](05-security.md)、[测试](06-testing.md)。
 
 ## 1. 必须保持的不变量
 
@@ -62,6 +62,40 @@ type SecretRef = {
 - 普通前端 DTO 不包含 API Key、SSH 密码、私钥内容、解密机密、原始认证错误或完整配置文件。
 - 模型工具调用的任务身份由后端运行上下文绑定；不能让模型通过参数中的另一个 `task_id` 获得跨任务能力。
 
+### 2.1 平台适配契约
+
+以下是后端边界的文档示意，不是模型工具或开放文件系统 API：
+
+```ts
+type Platform = "windows" | "linux";
+type CredentialBackend =
+  | "dpapi_current_user" | "linux_secret_service" | "session_only";
+type CredentialAvailability =
+  | "available" | "locked" | "unavailable" | "access_denied";
+type CredentialPurpose = "ssh_password" | "ssh_key_passphrase";
+type PlatformStatus = {
+  platform: Platform;
+  credential_backend: CredentialBackend;
+  credential_availability: CredentialAvailability;
+  persistent_credentials: boolean;
+};
+```
+
+| 后端端口 | 输入／结果 | 约束 |
+| --- | --- | --- |
+| `AppPaths.resolve` | 平台和启动环境 → 已验证的配置／状态／缓存根目录 | Windows 系统目录；Linux XDG；不按工作目录搜索，也不执行本地 shell |
+| `RestrictedFileAccess.open` | 受控配置对象或用户选定私钥 → 后端文件句柄 | Windows 绝对路径／ACL／重解析点；Linux POSIX 路径／UID／mode／链接与文件类型；模型不能传任意路径 |
+| `CredentialStore.status` | 无 → `PlatformStatus` | 区分可用、锁定、缺失／不可达和拒绝；状态不是解密成功保证 |
+| `CredentialStore.store/resolve/remove` | 连接 ID、`CredentialPurpose`、受控凭据更新／内部存储描述符 → 仅后端秘密句柄或安全结果 | 身份与用途绑定；Windows DPAPI 描述符或 Linux keyring 引用不能互换，不对模型／通用 UI 暴露 |
+| `CredentialSession.set/clear` | 专用认证 UI 输入、连接 ID、用途 → 仅进程内存凭据 | 仅用户显式选会话内存模式；不进入 TOML／SQLite／日志／IPC 广播 |
+| `ConfigFileStore.save` | 文件类别、`expected_revision`／内容版本、新内容 → 新修订或安全错误 | 稳定跨进程锁、受限同目录临时文件、平台替换／同步、冲突与保存结果未知分开 |
+
+`secret_protection` 与 `protected_*`／`*_secret_ref` 的持久字段约束以[配置规范](04-configuration.md#4-ssh-连接-schema-与凭据保管)为准。当前没有已发布 schema；不能把 Windows 密文从文件直接复制为 Linux 引用。
+
+安全存储故障不自动选择 `session_only`；由专用设置／认证 UI 明确选择后才能使用，且不修改任务审批策略。SSH 登录密码在连接认证阶段进入 SSH 库，不通过尚未建立的 PTY 键入。任务秘密的远端交互使用仍遵循原有 `SecretRef`／安全输入适配器边界。
+
+Windows／Linux 适配器运行同一组契约测试；平台能力缺失需显式返回错误，不能通过本地命令工具、明文文件或另一个账号绕开。
+
 ## 3. 前端 → 后端 IPC
 
 下列命令是拟议方法名。Tauri 允许前端调用 Rust commands，持续数据可使用 Channels；实际权限仍要按窗口 capability 限制。参考 [Tauri 调用 Rust](https://v2.tauri.app/develop/calling-rust/)。
@@ -70,11 +104,14 @@ type SecretRef = {
 
 | 方法 | 关键请求 → 响应 | 前置条件 / 失败语义 |
 | --- | --- | --- |
+| `get_platform_status` | 无 → `PlatformStatus` 与设置 UI 专用路径摘要 | 无秘密或 keyring 内部引用；不是模型工具 |
 | `get_config_status` | 无 → 三类配置的版本、状态和脱敏字段摘要 | 不返回机密值或可复用密文；本机路径仅给设置 UI |
 | `reload_model_config` | `expected_snapshot_id?` → 新模型快照摘要 | 只读启动时选定路径；失败不替换旧快照，新快照用于后续 run（包括同一任务的新 run） |
 | `probe_model_compatibility` | `model_snapshot_id` → 各项测试状态 | 使用已确认目标；不发送实际终端/任务数据；未测不能记为通过 |
 | `list_connection_profiles` | 无 → 档案展示字段与 `credential_present` | 无密码/口令/私钥正文 |
-| `save_connection_profile` | `expected_revision, profile, credential_update?` → 新修订号与档案 ID | 仅设置 UI；密码只在此专用请求短暂传入后端；原子写/冲突检测 |
+| `save_connection_profile` | `expected_revision, profile, credential_update?` → 新修订号与档案 ID | 仅设置 UI；遵守已选文件级保护模式；秘密只在专用请求短暂传入；原子写／冲突／保存未知检测 |
+| `set_credential_mode` | `expected_revision, mode` → 新修订与影响摘要 | 仅设置 UI；文件级显式变更，先展示受影响档案；不默认删除原凭据，失败不明文回退 |
+| `set_session_credential` | `connection_id, purpose, credential` → 本进程可用状态 | 专用认证 UI；仅显式会话内存模式，不持久化、不广播；下次启动需重填 |
 | `connect_server` | `connection_id, profile_revision, size` → `SessionRef, status=connecting` | 实例已有活动/连接中会话则 `SESSION_BUSY`；异步结果经事件返回 |
 | `confirm_host_key` | `challenge_id, expected_fingerprint, decision` → 已接受或拒绝 | 仅信任确认 UI；指纹/主机/端口/挑战必须匹配；不能由 AI 调用 |
 | `disconnect_server` | `SessionRef` → `closing` 或 `closed` | 不保证远端程序结束；未证实结果标未知 |
@@ -198,7 +235,7 @@ Rig 拟用于构建 completion/agent、工具描述与流式适配；本产品�
 - tool-call ID 仅用于模型协议关联；执行去重仍使用后端动作 ID。
 - 模型超时或 provider 重试不能自动重复已经派发的终端工具。恢复模型推理不等于恢复远端执行。
 - 空闲流、畸形 JSON、未知工具、超长参数、工具未完成即断流都要返回明确状态；只执行完整且验证通过的调用。
-- Provider 的“支持 tools”或 SSE 成功不是执行授权。Chat Completions + SSE + tools 需按选定服务/模型实测，详见 [配置兼容性](configuration.md#31-兼容性验证)。
+- Provider 的“支持 tools”或 SSE 成功不是执行授权。Chat Completions + SSE + tools 需按选定服务/模型实测，详见 [配置兼容性](04-configuration.md#31-兼容性验证)。
 
 ## 6. 终端观察、结果与未知状态
 
@@ -343,6 +380,11 @@ type DecisionAssessment = {
 | --- | --- | --- |
 | `CONFIG_NOT_FOUND / CONFIG_INVALID / CONFIG_VERSION_UNSUPPORTED` | 配置缺失、语义错误或版本不支持 | 用户修正并显式 reload；旧快照不假装更新 |
 | `CONFIG_CONFLICT` | 多进程/外部编辑冲突 | 重读并让用户决定，不覆盖 |
+| `CONFIG_SAVE_UNCERTAIN` | 替换后同步／复核失败，无法确认最终保存状态 | 停止后续覆盖，重读核对；不能假定旧版仍在或自动重试 |
+| `LOCAL_PATH_INVALID / LOCAL_FILE_PERMISSION_DENIED` | 平台路径、文件类型、归属或访问限制不合格 | 用户修正；不搜寻其他目录／放宽权限 |
+| `CREDENTIAL_BACKEND_MISMATCH / CREDENTIAL_REF_INVALID` | 保护模式不适用此平台，或凭据引用不匹配连接与用途 | 重新配置；不转换为明文或尝试其他应用凭据 |
+| `CREDENTIAL_STORE_UNAVAILABLE / CREDENTIAL_STORE_LOCKED / CREDENTIAL_ACCESS_DENIED` | 平台凭据库缺失／不可达、锁定或拒绝访问 | 用户修复／解锁或显式选会话内存模式；不自动明文回退 |
+| `SSH_CREDENTIAL_REQUIRED` | 没有可用的 SSH 登录凭据／私钥口令 | 专用认证 UI 手工填写；不是聊天或远端 PTY 输入 |
 | `MODEL_AUTH_FAILED / MODEL_PROTOCOL_UNSUPPORTED / MODEL_STREAM_INVALID` | 服务认证或协议不兼容 | 安全错误；不换目标或执行文本兜底 |
 | `SESSION_BUSY / SESSION_NOT_CONNECTED / SESSION_STALE` | 会话占用、不在线或代次失效 | 不切换到其他连接继续 |
 | `HOST_KEY_UNTRUSTED / HOST_KEY_CHANGED` | 需要信任核验 | 明确用户核验；变更默认阻止 |
@@ -369,5 +411,6 @@ type DecisionAssessment = {
 - 没有结束证据时不伪造 exit code；用户确认 Enter 不把上一动作标成成功。
 - 大量输出、慢 UI、慢模型和多实例配置更新都保持内存/队列有界且错误可见。
 - disabled evaluator 的 `unknown` 不破坏基线策略，也不使未解决场景自动放行。
+- Windows／Linux 使用相同执行、授权及事件契约；路径、保护模式、keyring 状态、会话内存认证、保存结果未知和跨平台迁移各有反例测试。
 
-这些是未来实现的验收约束。本次仅完成文档与配置示例，不存在接口测试、Windows 集成测试或真实服务兼容测试已经通过的结论。
+这些是未来实现的验收约束。本次仅完成文档与配置示例，不存在接口测试、Windows／Linux 桌面集成测试或真实服务兼容测试已经通过的结论。

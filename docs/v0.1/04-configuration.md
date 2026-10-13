@@ -1,8 +1,8 @@
-# 配置与机密边界（design-v0.1）
+# 04 配置与机密边界（design-v0.1）
 
-> 状态：供开发评审的设计草案。用户确认了“三类配置分开”，但本文的 TOML 字段、路径、环境变量语义、DPAPI 方案和数值默认值都是工程提案，尚未冻结。本仓库没有配置解析器或可运行应用；示例通过 TOML 语法检查不代表运行时验证或安全机制已实现。
+> 状态：供开发评审的设计草案。用户确认了“三类配置分开”，但本文的 TOML 字段、路径、环境变量语义、平台安全存储方案和数值默认值都是工程提案，尚未冻结。本仓库没有配置解析器或可运行应用；示例通过 TOML 语法检查不代表运行时验证或安全机制已实现。
 
-相关文档：[接口契约](interfaces.md)、[架构](architecture.md)、[安全设计](security.md)。
+相关文档：[接口契约](03-interfaces.md)、[架构](02-architecture.md)、[安全设计](05-security.md)。
 
 ## 1. 已确认的三类配置
 
@@ -16,29 +16,43 @@
 
 ## 2. 路径和优先级提案
 
-拟定运行时根目录为当前 Windows 用户的 `%APPDATA%\xyzaishell`。这里 `%APPDATA%` 是文档表示法；实现应使用系统取得的用户应用数据目录，不从项目工作目录猜测。
+Windows 与 Linux 使用同一三类配置 schema，但路径由平台适配器解析，不能在共享核心硬编码 Windows 目录。以下均为建议目录；不是从当前工作目录推导，也不是应用支持 shell 插值。
+
+| 数据 | Windows 提案 | Linux 提案 |
+| --- | --- | --- |
+| 模型／SSH／任务配置与 known_hosts | `%APPDATA%\xyzaishell` | `$XDG_CONFIG_HOME/xyzaishell`，默认 `$HOME/.config/xyzaishell` |
+| 非秘密 SQLite、历史／审计状态 | `%LOCALAPPDATA%\xyzaishell\state` | `$XDG_STATE_HOME/xyzaishell`，默认 `$HOME/.local/state/xyzaishell` |
+| 可丢弃缓存 | `%LOCALAPPDATA%\xyzaishell\cache` | `$XDG_CACHE_HOME/xyzaishell`，默认 `$HOME/.cache/xyzaishell` |
+
+Linux 的 XDG 变量未设置或为空时采用上表默认；相对值按 XDG 规范视为无效并忽略，使用默认值且在设置 UI 给出提示。解析后的默认目录仍须通过权限与本地文件系统检查；不向系统级配置目录或当前工作目录继续搜寻秘密。此规则与下节 `XYZAI_MODEL_CONFIG` 的显式错误语义不同。[XDG Base Directory 规范](https://specifications.freedesktop.org/basedir/latest/)
 
 ```text
-%APPDATA%\xyzaishell\
+<平台配置根目录>/
   model.toml                  用户维护的全局模型配置
   connections.toml            软件管理的 SSH 连接配置
   known_hosts                 独立的 SSH 主机密钥信任记录
-  tasks\
+  tasks/
     <task_id>.toml             每个任务一份；该任务的不同 run 复用
 ```
 
-`known_hosts` 是信任记录，不是第四种机密配置；运行日志/缓存也不属于上述三类配置。不得把这些运行时文件纳入 Git。
+上图 `/` 只表示层级，实现使用各平台路径 API。`known_hosts` 是信任记录，不是第四种机密配置；状态与缓存也不改变三类配置的划分。Linux 安全存储内的 SSH 凭据由其服务管理，不在上述文件中以明文保存。不得把这些运行时文件纳入 Git。
 
 ### 2.1 `XYZAI_MODEL_CONFIG` 的拟定语义
 
-1. 若应用启动时存在非空 `XYZAI_MODEL_CONFIG`，它只表示模型配置文件的**绝对本地路径**，例如 `C:\Users\EXAMPLE\AppData\Roaming\xyzaishell\model.toml`。
+1. 若应用启动时存在非空 `XYZAI_MODEL_CONFIG`，它只表示模型配置文件的**绝对本地路径**，例如 Windows 的 `C:\Users\EXAMPLE\AppData\Roaming\xyzaishell\model.toml` 或 Linux 的 `/home/EXAMPLE/.config/xyzaishell/model.toml`。
 2. 变量未设置时读取默认 `model.toml`。已设置但为空、相对路径、目录、无权限、格式错误或文件缺失时，显式报错；不能静默退回其他模型服务。
 3. 不将该变量解释成 TOML 内容、API Key 或远程路径；不递归展开字符串中的 `%VAR%`、`$VAR` 或 `~`。
 4. v1 不同时读取 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`XYZAI_API_KEY` 等后备变量，防止 SDK 默认环境读取覆盖已选文件。必须向模型适配器显式传入配置快照。
 5. v1 不另设 SSH/任务路径环境变量，也不按当前工作目录搜寻配置。改变变量后重启应用选择新路径；“重新加载”只读取本次进程已选定的路径。
 6. 环境变量名称和“变量指向文件而非直接填三个值”的语义仍待用户/工程评审确认，不能描述为已确认需求。
 
-本地配置路径和私钥路径拟要求 Windows 盘符绝对路径；默认拒绝 UNC、设备命名空间路径和网络共享，避免把机密读写到意外网络位置。任务路径只能由后端生成，不能让模型传入路径或 `../`。实现需规范化路径、检查目录归属及重解析点，不能仅检查字符串前缀。
+本地路径校验分别处理：
+
+- Windows 要求盘符绝对路径；默认拒绝 UNC、设备命名空间和网络共享，检查目录归属、ACL 与重解析点。
+- Linux 要求以 `/` 开头的绝对路径；区分大小写，不将反斜杠当目录分隔符，不展开 `~`／`$HOME`。检查实际文件类型、UID、权限、符号链接／硬链接及目标归属，避免路径替换竞态；拒绝设备文件、FIFO 和其他非普通配置／私钥文件。首版仅支持通过验证的本地文件系统，不因 POSIX 路径形式就认定 NFS／共享挂载安全。
+- 任务路径只能由后端根据任务 ID 在所选根目录生成，模型不能传入路径或 `../`。路径校验与打开文件须形成受控边界；不能仅检查字符串前缀，也不能让跨平台导入自动转换成不明本机路径。
+
+Windows 与 Linux GUI 从桌面启动时取得的环境可能与交互 shell 不同；设置 UI 应显示本次选定的配置路径。环境变量说明不得暗示应用会执行 `.bashrc` 等文件。
 
 ### 2.2 默认与覆盖规则
 
@@ -50,7 +64,7 @@
 
 ## 3. 模型配置 schema
 
-完整示例：[model.example.toml](../config/examples/model.example.toml)。示例域名与 Key 只是占位，运行时必须拒绝把占位配置当作可用连接。
+完整示例：[model.example.toml](../../config/examples/model.example.toml)。示例域名与 Key 只是占位，运行时必须拒绝把占位配置当作可用连接。
 
 | 路径 | 类型 / 默认值 | 校验与含义 |
 | --- | --- | --- |
@@ -85,17 +99,17 @@ Rig 拟承担 provider/model/tool/streaming 的适配；应用仍显式提供 Ke
 
 ### 3.2 模型 Key 的本地存储风险
 
-用户可编辑的 TOML 内 `api_key` 拟以明文保存；这不是加密保险库。默认目录/文件应设置仅必要本机账户可读的 ACL，提示不要放在同步盘、共享目录或 Git 仓库。编辑器备份、崩溃转储、恶意同用户进程仍可能暴露它；后续若引入系统凭据存储，必须新增明确 schema/迁移设计，不能声称当前示例已经加密。
+用户可编辑的 TOML 内 `api_key` 拟以明文保存；这不是加密保险库。默认目录/文件应限制到必要本机账户（Windows ACL；Linux 应用目录 `0700`、秘密文件 `0600`，并检查已有目录的归属与权限），提示不要放在同步盘、共享目录或 Git 仓库。编辑器备份、崩溃转储、恶意同用户进程仍可能暴露它；后续若引入系统凭据存储，必须新增明确 schema/迁移设计，不能声称当前示例已经加密。
 
 ## 4. SSH 连接 schema 与凭据保管
 
-完整示例：[connections.example.toml](../config/examples/connections.example.toml)。可保存多个连接档案，但一个应用实例同一时刻只连接一个服务器、一个可见 SSH PTY；这不等于在同一实例内增加多服务器标签页。
+完整示例：[Windows 连接](../../config/examples/connections.example.toml)、[Linux 连接](../../config/examples/connections.linux.example.toml)。可保存多个连接档案，但一个应用实例同一时刻只连接一个服务器、一个可见 SSH PTY；这不等于在同一实例内增加多服务器标签页。
 
 | 路径 | 类型 | 约束 |
 | --- | --- | --- |
 | `schema_version` | 整数 `1` | 必填 |
 | `revision` | 非负整数 | 软件写入的并发修订号；更新前比较，不能把它当作可信授权 |
-| `storage.secret_protection` | `dpapi_current_user` | v1 工程提案固定值 |
+| `storage.secret_protection` | `dpapi_current_user`、`linux_secret_service` 或 `session_only` | 必填；Windows 持久存储用前者，Linux 持久存储用第二项；会话内存模式必须用户显式选择 |
 | `connections` | 对象数组 | 各连接 `id` 唯一，由软件生成；不用于任意文件路径 |
 | `connections[].id` | 不透明字符串 | 实际档案拟采用后端 UUID；示例 ID 不可直接运行 |
 | `connections[].label` | 非空字符串 | 只作 UI 标签，不拼接 shell |
@@ -103,13 +117,23 @@ Rig 拟承担 provider/model/tool/streaming 的适配；应用仍显式提供 Ke
 | `connections[].port` | 整数 `1..65535` | 默认 `22` |
 | `connections[].username` | 非空字符串 | 不含 NUL/控制字符；由 SSH 库按协议传递 |
 | `connections[].auth.kind` | `password` 或 `private_key` | 两种认证 schema 互斥 |
-| `auth.protected_password` | DPAPI 密文编码字符串 | `password` 模式必需；不得放明文密码 |
+| `auth.protected_password` | DPAPI 密文编码字符串 | 仅 `dpapi_current_user` + `password` 必需；不得放明文密码 |
+| `auth.password_secret_ref` | 不透明引用字符串 | 仅 `linux_secret_service` + `password` 必需；指向本机安全存储，不是秘密、路径或 D-Bus 任意对象入口 |
 | `auth.private_key_path` | 绝对本地路径 | `private_key` 模式必需；仅读取用户选定文件，不扫描其他私钥 |
-| `auth.protected_passphrase` | 可选 DPAPI 密文编码字符串 | 加密私钥的口令；不需要时省略 |
+| `auth.protected_passphrase` | 可选 DPAPI 密文编码字符串 | 仅 `dpapi_current_user` + `private_key`；不保存口令时省略 |
+| `auth.passphrase_secret_ref` | 可选不透明引用字符串 | 仅 `linux_secret_service` + `private_key`；不保存口令时省略 |
 
-未知认证模式拒绝处理。密码模式不能带私钥路径；私钥模式不能带登录密码。前端只收到 `credential_present`、档案展示字段和安全错误码；读取配置接口不能返回 `protected_*` 字符串或解密结果。设置凭据的专用 UI 请求可以短暂把用户输入送往 Rust 后端，但不得进入聊天、通用事件或模型工具。
+`storage.secret_protection` 对整个连接文件生效，不能在同一文件混用两平台的机密字段。 改变该模式是文件级变更，必须展示所有受影响档案并以整份文件的期望修订提交，不能由保存单个档案悄悄切换；转为 `session_only` 需移除所有持久机密字段，但不会默认删除原安全存储条目。未知认证／保护模式拒绝处理；在错误平台加载持久保护模式返回 `CREDENTIAL_BACKEND_MISMATCH`，不能尝试其他后端或把密文当密码。Windows 保留 `protected_*` 字段，Linux 使用 `*_secret_ref`，两组互斥；`session_only` 禁止这两组所有字段。密码模式不能带私钥路径／私钥口令字段；私钥模式不能带登录密码字段。前端只收到 `credential_present`、档案展示字段和安全错误码；读取配置接口不能返回 `protected_*`、安全存储引用字符串或解密结果。设置凭据的专用 UI 请求可以短暂把用户输入送往 Rust 后端，但不得进入聊天、通用事件或模型工具。
 
 DPAPI CurrentUser 仅是拟定的静态保护机制：后端在当前 Windows 用户上下文保护/解保护密码与私钥口令，不使用 `CRYPTPROTECT_LOCAL_MACHINE`。DPAPI 通常依赖原用户登录身份及机器环境；复制文件到其他环境不保证可解密。它不保护已被控制的同用户进程、解密后的内存或用户选定的私钥文件本身。参考 [Microsoft CryptProtectData](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata)。
+
+Linux 拟通过 Secret Service 兼容适配器把 SSH 密码／私钥口令交给本机安全存储。引用由后端生成并校验应用命名空间、连接 ID 和用途（密码／口令）；配置中的任意字符串不能读取其他应用的 keyring 条目。安全存储的持久化、解锁及访问控制取决于实际提供者，不能把它描述为 DPAPI 的同等保证或宣称所有 Linux 都有可用 keyring。[Secret Service API](https://specifications.freedesktop.org/secret-service/latest/)
+
+- 服务未安装／不可达、无可用桌面 D-Bus 会话、keyring 锁定、用户取消解锁或访问被拒时，返回区别明确的安全错误；不自动新建明文凭据文件，也不改写模型／任务密钥文件。
+- 可请用户修复／解锁，或显式选择 `session_only`。后者从专用 SSH 认证 UI 手工输入，仅在当前进程内存保留；关闭进程后需重填，重启和重连不会重放历史输入。连接文件只保留非秘密档案及该模式，禁止写入秘密、密文或持久引用。
+- 已有持久凭据的读取失败不能自动切换模式；用户选择会话内存模式时应明确是否保留旧的安全存储条目。默认不删除旧条目，删除另行确认。
+- 加密私钥缺少保存的口令时，连接前由专用 UI 请求一次性口令；不能盲目往尚未建立的 PTY 输入 SSH 登录凭据。这与任务运行中的远端交互密码输入是不同路径。
+- Windows DPAPI 密文不能跨平台使用；Linux 引用复制到另一台机器也不保证有效。迁移只复用重新校验的非秘密信息，重新选择私钥并重新输入认证材料；不提供明文凭据导出作为兼容手段。
 
 私钥仍保留在原路径，不自动复制到应用目录。口令错误、文件格式不支持、读取失败应分别给出安全错误；不能自动回退到其他账号/认证方法。SSH 密码保存同样不构成对远程 `sudo`、数据库或网站口令的可复用授权。
 
@@ -117,7 +141,7 @@ DPAPI CurrentUser 仅是拟定的静态保护机制：后端在当前 Windows �
 
 ## 5. 每任务配置 schema
 
-完整示例：[task.example.toml](../config/examples/task.example.toml)。
+完整示例：[task.example.toml](../../config/examples/task.example.toml)。
 
 | 路径 | 类型 | 约束 |
 | --- | --- | --- |
@@ -151,7 +175,7 @@ DPAPI CurrentUser 仅是拟定的静态保护机制：后端在当前 Windows �
 
 ### 5.2 用户可编辑明文的风险
 
-任务文件拟保留明文以便用户自己填写，这与 SSH 软件管理密文是不同取舍。首次生成/打开时应提示：不要提交、同步或分享；本机编辑器可能生成备份；离开任务后按需清除文件。应用生成的临时文件、备份也必须采用同等 ACL，不能为了容错把明文另存宽权限目录。模型上下文、审计、诊断包默认不包含原文件。
+任务文件拟保留明文以便用户自己填写，这与 SSH 软件管理的密文／安全存储引用是不同取舍。首次生成/打开时应提示：不要提交、同步或分享；本机编辑器可能生成备份；离开任务后按需清除文件。应用生成的临时文件、备份也必须采用同等访问限制（Windows ACL；Linux `0600` 文件／`0700` 私有目录），不能为了容错把明文另存宽权限目录。模型上下文、审计、诊断包默认不包含原文件。
 
 ## 6. 加载、快照与并发写入
 
@@ -167,21 +191,30 @@ DPAPI CurrentUser 仅是拟定的静态保护机制：后端在当前 Windows �
 
 ### 6.2 多进程与外部编辑
 
-允许用户启动不同实例连接不同服务器，不依赖“全系统只能有一个进程”解决文件并发。软件管理文件采用：跨进程锁 → 重读修订号 → 比较 `expected_revision` → 写同目录临时文件 → flush/必要同步 → Windows 支持的原子替换 → 返回新修订。失败保留旧文件；冲突返回 `CONFIG_CONFLICT`，不能最后写入者默默覆盖。
+允许用户启动不同实例连接不同服务器，不依赖“全系统只能有一个进程”解决文件并发。共享保存契约为：稳定锁对象的跨进程锁 → 重读修订号 → 比较 `expected_revision`／内容版本 → 创建同目录受限临时文件 → 写入并同步 → 平台替换 → 复核并返回修订。锁对象不得随被替换文件的 inode／句柄变化而失效；不能锁旧文件后误以为新文件也受同一锁保护。
 
-任务文件追加字段也按文件锁和期望内容版本检查；不得覆盖用户刚填写的值。外部编辑器可能不遵循应用锁，因此提交前还要比较当前内容版本并报告冲突。并发写/电源故障的保证要通过 Windows 故障注入验证，不能只因用了 rename 就声称完成。加载遇到编辑器写到一半的文件，只报告未加载成功，不执行半份配置。
+- Windows：由适配器选取并验证替换／首次创建流程，处理共享模式、文件占用、ACL 继承及替换错误；不能先删除旧文件再写新文件。[Microsoft ReplaceFileW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew)
+- Linux：临时文件位于同一文件系统的目标目录，以受限权限创建；同步内容后使用原子 rename，再同步父目录。rename 的可见性原子性与断电后的持久性是不同保证，不得把跨文件系统 copy+delete 当作原子替换。[Linux rename](https://man7.org/linux/man-pages/man2/rename.2.html)、[Linux fsync](https://man7.org/linux/man-pages/man2/fsync.2.html)
+- 提交前失败应保持旧版可用；替换后同步失败或无法判定当前磁盘版本时返回 `CONFIG_SAVE_UNCERTAIN`，保留必要恢复信息并要求重读核对。不能在这种情况下声称“肯定没保存”，也不能自动重试覆盖。
+- 版本冲突返回 `CONFIG_CONFLICT`，不静默采用最后写入者。任务追加字段同样核对期望内容版本，不覆盖已填值。外部编辑器不一定遵循锁，提交前比较不能消除全部竞态；编辑期间并发保存不在完全隔离保证内，应提示避免同时写入，保留受限恢复副本／冲突信息并进行故障测试。
+- Linux keyring 更新与 TOML 保存不是单一事务。更新凭据先创建新条目而非覆盖旧条目，再提交新引用；配置保存确定后才处理旧条目清理。提交失败／状态未知时不可先删旧条目；未引用条目的恢复与清理只限本应用归属，并需避免删除其他实例仍使用的条目。不会用明文临时文件弥合这两个存储的事务差异。
+
+并发写、进程退出、磁盘满、文件占用和断电边界必须在两平台分别注入验证。加载遇到编辑器写到一半的文件，只报告未加载成功，不执行半份配置。原子文件保存不等于远端命令可回滚或恰好执行一次。
 
 ## 7. 错误、诊断和测试边界
 
-错误结构参见 [接口错误](interfaces.md#9-错误契约)。配置错误沿用 `{code, safe_message, request_id, retry}`，可附 `{category, field_path, line?, column?}` 安全定位字段：不回显 TOML 源行、值、HTTP 认证头、SSH 握手机密或底层完整响应。用户本地 UI 可显示配置路径，但该路径不进入模型工具错误或遥测。日志只记类别、后端 ID、版本和安全原因码。
+错误结构参见 [接口错误](03-interfaces.md#9-错误契约)。配置错误沿用 `{code, safe_message, request_id, retry}`，可附 `{category, field_path, line?, column?}` 安全定位字段：不回显 TOML 源行、值、HTTP 认证头、SSH 握手机密或底层完整响应。用户本地 UI 可显示配置路径，但该路径不进入模型工具错误或遥测。日志只记类别、后端 ID、版本和安全原因码。
 
 必测项目：
 
-- 三份示例是有效 TOML；占位值不能被当成真实可用配置。
+- 四份示例（共享模型／任务、Windows／Linux 连接）是有效 TOML；占位值不能被当成真实可用配置。
 - 环境变量缺失/空值/相对路径/无权限/错误 TOML/版本不支持的结果明确。
 - Key 只在所选 HTTPS 目标认证；重定向、目标变更和调试日志不泄漏。
 - 模型/SSH/任务机密互不可读；跨任务引用失败。
-- DPAPI 在本用户成功，在不适用身份/环境失败时不回退明文。
+- Windows DPAPI 在本用户成功，在不适用身份／环境失败时不回退明文；Linux keyring 正常、锁定、缺失、无 D-Bus 和拒绝解锁均有明确结果。
+- Windows／Linux 路径格式、XDG 默认与错误值、大小写、中文／空格、链接替换、UID／ACL／mode 及不支持的文件系统均被校验。
+- 各保护模式的必需／禁止字段、错误平台加载、跨连接引用和跨机器迁移失败不造成错误取密；会话内存模式不落盘。
+- Windows 替换与 Linux rename／父目录同步、锁对象稳定性、提交状态未知、keyring／文件分步失败均有可恢复证据。
 - 特殊字符、多行值、错误字段名、缺失机密、文件中途修改、并发写冲突不导致误执行。
 - 显式 reload 的快照生效点、旧批准失效、正在执行动作不换值可复现。
 - 脱敏错误不含实际值；过滤跨片段已知值有测试，同时记录不能覆盖未知变换的限制。
@@ -189,9 +222,11 @@ DPAPI CurrentUser 仅是拟定的静态保护机制：后端在当前 Windows �
 ## 8. 待评审项
 
 1. 是否接受 `XYZAI_MODEL_CONFIG` 指向绝对文件路径，以及当前默认目录方案。
-2. 用户编辑的模型/任务明文文件与 SSH DPAPI 密文的取舍、导出/迁移 UX。
+2. 用户编辑的模型／任务明文文件与 SSH 平台安全存储的取舍、Linux 提供者选择及会话内存模式、重新录入式迁移 UX。
 3. 回环 HTTP 是否进入 v1，及 UI 的风险提示。
 4. 兼容性验证范围、超时/容量默认值与实际服务能力矩阵。
 5. 首批可安全支持的机密注入方式；未验证方式保持人工处理。
+
+本文仍使用 `schema_version = 1`，因为尚无已发布配置解析器；design-v0.1 内的 Windows／Linux 字段是同一待冻结草案。将来若有已发布用户数据，任何不兼容改动必须升级 schema 并定义迁移，不能借用此说明静默改变格式。
 
 以上待评审项不影响“三类配置分开、任务机密不进入 prompt、应用策略控制实际发送”的设计底线。
