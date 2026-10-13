@@ -1,0 +1,33 @@
+# design-v0.1 软件管理格式的示意，不是可直接连接的凭据文件。
+# 密码/私钥口令由本机应用收集并用 Windows DPAPI CurrentUser 保护。
+# 以下 protected_* 字符串是假占位，不是有效密文；不要在此填明文密码。
+schema_version = 1
+revision = 0
+
+[storage]
+secret_protection = "dpapi_current_user"
+
+[[connections]]
+id = "EXAMPLE_PASSWORD_PROFILE"
+label = "示例密码连接"
+host = "server.example.invalid"
+port = 22
+username = "REPLACE_WITH_SSH_ACCOUNT"
+
+[connections.auth]
+kind = "password"
+protected_password = "DPAPI_PLACEHOLDER_NOT_REAL_CIPHERTEXT"
+
+[[connections]]
+id = "EXAMPLE_KEY_PROFILE"
+label = "示例私钥连接"
+host = "key-server.example.invalid"
+port = 22
+username = "REPLACE_WITH_SSH_ACCOUNT"
+
+[connections.auth]
+kind = "private_key"
+# TOML 单引号字符串不需要对 Windows 路径中的反斜杠转义。
+private_key_path = 'C:\Users\EXAMPLE\.ssh\id_ed25519'
+# 仅加密私钥需要这个字段；由应用生成，明文口令不写入该文件。
+protected_passphrase = "DPAPI_PLACEHOLDER_NOT_REAL_CIPHERTEXT"

@@ -1,0 +1,25 @@
+# Local application state and credentials; examples remain versioned.
+.env
+.env.*
+!.env.example
+model.toml
+connections.toml
+task.toml
+config/local/
+runtime/
+tasks/
+*.pem
+*.key
+*.ppk
+id_rsa*
+id_ed25519*
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+# Future build outputs
+/target/
+/node_modules/
+/dist/
+/src-tauri/target/

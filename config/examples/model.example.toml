@@ -1,0 +1,24 @@
+# design-v0.1 工程草案；不是已经实现或经用户冻结的配置格式。
+# 只含占位值。复制到仓库外后填写；禁止提交实际 API Key。
+schema_version = 1
+
+[model]
+protocol = "openai_chat_completions"
+base_url = "https://api.example.invalid/v1"
+api_key = "REPLACE_WITH_LOCAL_API_KEY"
+name = "REPLACE_WITH_PROVIDER_MODEL_NAME"
+
+[capabilities]
+# 这是本应用要求，不是对该服务能力的声明；必须通过兼容性验证。
+streaming = "required"
+tool_calling = "required"
+
+[request]
+connect_timeout_seconds = 10
+request_timeout_seconds = 120
+stream_idle_timeout_seconds = 30
+max_output_tokens = 4096
+
+[transport]
+# 只允许显式启用的本机回环 HTTP；不允许远程明文 HTTP。
+allow_loopback_http = false

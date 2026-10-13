@@ -1,0 +1,15 @@
+# design-v0.1 每个 AI 任务单独的本地文件；由应用生成文件名和 task.id。
+# 只在仓库外的本机文件中填写；value 明文保存，可能被编辑器备份/同步。
+# 模型只收到字段名与是否已填写，不能读取 value。
+schema_version = 1
+
+[task]
+id = "GENERATED_BY_APPLICATION"
+
+[secrets.deploy_password]
+required = true
+value = ""
+
+[secrets.service_token]
+required = false
+value = ""
