@@ -23,3 +23,7 @@ id_ed25519*
 /node_modules/
 /dist/
 /src-tauri/target/
+# Generated frontend and Tauri metadata
+*.tsbuildinfo
+/src-tauri/gen/
+/coverage/

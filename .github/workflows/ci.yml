@@ -1,0 +1,124 @@
+name: Build and test
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      source-ref:
+        description: Exact source commit selected by the release workflow.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' && github.ref_type == 'branch' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  frontend:
+    name: Frontend tests and production build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.23.3'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Test pipeline helper scripts
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+
+  desktop:
+    name: Rust tests and ${{ matrix.label }} package
+    needs: frontend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: linux-x64
+            bundle: deb
+          - os: windows-2022
+            label: windows-x64
+            bundle: nsis
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-desktop
+      - run: npm run build
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build installer from locked dependencies
+        env:
+          BUNDLE: ${{ matrix.bundle }}
+        run: npm run tauri -- build --ci --bundles "$BUNDLE" -- --locked
+      - name: Collect package and provenance
+        env:
+          BUILD_PLATFORM: ${{ matrix.label }}
+          BUNDLE: ${{ matrix.bundle }}
+        run: python .github/scripts/artifacts.py collect --platform "$BUILD_PLATFORM" --bundle "$BUNDLE" --output "$RUNNER_TEMP/xyzaishell-package"
+      - name: Upload candidate installer (not a release)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installers-${{ matrix.label }}
+          path: ${{ runner.temp }}/xyzaishell-package/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  linux-install-smoke:
+    name: ${{ matrix.os }} package install and headless startup smoke
+    needs: desktop
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: installers-linux-x64
+          path: ${{ runner.temp }}/xyzaishell-package
+      - name: Install the Ubuntu 22.04-built package on this runner
+        env:
+          PACKAGE_DIR: ${{ runner.temp }}/xyzaishell-package
+        run: bash .github/scripts/linux-install-smoke.sh
+      - name: Save smoke-test evidence (not desktop acceptance)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-smoke-${{ matrix.os }}
+          path: ${{ runner.temp }}/xyzaishell-smoke/
+          if-no-files-found: warn
+          retention-days: 14

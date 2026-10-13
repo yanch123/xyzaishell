@@ -1,0 +1,114 @@
+name: Prepare draft release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable version tag on main, for example v0.1.0.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate version tag and main ancestry
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve a stable tag already merged to main
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Expected stable vX.Y.Z tag'; exit 1; }
+          sha=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          git merge-base --is-ancestor "$sha" refs/remotes/origin/main || { echo 'Tag must already be on main'; exit 1; }
+          git checkout --detach "$sha"
+          python3 .github/scripts/artifacts.py check-version --tag "$RELEASE_TAG"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Rebuild and verify the exact tagged source
+    needs: preflight
+    uses: ./.github/workflows/ci.yml
+    with:
+      source-ref: ${{ needs.preflight.outputs.sha }}
+    permissions:
+      contents: read
+
+  draft:
+    name: Stage source, installers, and checksums in a draft
+    needs: [preflight, verify]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: installers-*
+          path: ${{ runner.temp }}/release-installers
+      - name: Validate provenance and prepare source archives
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          python3 .github/scripts/artifacts.py release \
+            --tag "$RELEASE_TAG" \
+            --installers "$RUNNER_TEMP/release-installers" \
+            --output "$RUNNER_TEMP/release-assets"
+      - name: Prepare honest draft release notes
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF_NOTES
+          # xyzaishell $RELEASE_TAG — release candidate
+
+          Source commit: $RELEASE_SHA
+          Build and automated test evidence: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Included: source ZIP/TAR.GZ, Windows x64 NSIS installer, Ubuntu x64 DEB, per-platform build provenance, and SHA256SUMS.txt.
+
+          The DEB is built on Ubuntu 22.04. CI separately checks its installation, linkage, and headless startup on Ubuntu 22.04 and 24.04. Windows packaging runs on Windows Server 2022. Installers are not code-signed by this workflow; Windows may show publisher/SmartScreen warnings. No certificate or updater-signing key is configured.
+
+          This draft must stay unpublished until the release owner reviews real Windows 10/11 and Ubuntu 22.04/24.04 desktop acceptance, installation/upgrade/uninstall, SSH/model/security results, dependency licenses, and remaining limitations from docs/v0.1/06-testing.md. CI compilation and Xvfb startup do not establish those results. Add the exact tested OS/build/desktop, case results, evidence links, and unsupported combinations before publishing.
+          EOF_NOTES
+      - name: Create draft only (never replace an existing release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'A release already exists for this tag; inspect it before replacing any assets.'
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" "$RUNNER_TEMP/release-assets/"* \
+            --verify-tag --target "$RELEASE_SHA" --draft \
+            --title "xyzaishell $RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md"

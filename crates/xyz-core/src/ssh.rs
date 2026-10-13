@@ -1,0 +1,1304 @@
+//! One SSH connection and one visible shell PTY per application instance.
+//! Credentials are accepted only by the dedicated connection request. They are
+//! never serialized, logged, persisted, or returned through an event.
+use base64::{engine::general_purpose::STANDARD, Engine};
+use russh::{
+    client,
+    keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate},
+    ChannelMsg, Disconnect,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, VecDeque},
+    io::Read,
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
+use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
+
+pub const MAX_INPUT_BYTES: usize = 16 * 1024;
+pub const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
+const INPUT_QUEUE_FRAMES: usize = 16;
+const OUTPUT_WINDOW_BYTES: usize = 256 * 1024;
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiError {
+    pub code: String,
+    pub safe_message: String,
+    pub retry: String,
+}
+impl ApiError {
+    pub fn new(code: &str, message: &str) -> Self {
+        Self {
+            code: code.into(),
+            safe_message: message.into(),
+            retry: "after_user_action".into(),
+        }
+    }
+    fn unknown() -> Self {
+        Self::new(
+            "DELIVERY_UNKNOWN",
+            "The write may have reached the server. Do not automatically resend it.",
+        )
+    }
+}
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.safe_message)
+    }
+}
+impl std::error::Error for ApiError {}
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+impl Secret {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Authentication {
+    Password {
+        password: Secret,
+    },
+    PrivateKey {
+        private_key_path: String,
+        passphrase: Option<Secret>,
+    },
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectRequest {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth: Authentication,
+    pub session_only: bool,
+    pub size: TerminalSize,
+}
+impl ConnectRequest {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        self.size.validate()?;
+        if !self.session_only {
+            return Err(ApiError::new(
+                "CREDENTIAL_MODE_REQUIRED",
+                "Explicit session-only credential storage is required for this milestone.",
+            ));
+        }
+        if self.host.is_empty()
+            || self.host.len() > 253
+            || self
+                .host
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '@'))
+            || self.port == 0
+        {
+            return Err(ApiError::new(
+                "SSH_CONFIG_INVALID",
+                "Enter a hostname or IP address and a port from 1 to 65535.",
+            ));
+        }
+        if self.username.is_empty()
+            || self.username.len() > 256
+            || self.username.chars().any(char::is_control)
+        {
+            return Err(ApiError::new(
+                "SSH_CONFIG_INVALID",
+                "Enter a valid SSH username.",
+            ));
+        }
+        match &self.auth {
+            Authentication::Password { password } if password.0.len() > 16384 => {
+                return Err(ApiError::new(
+                    "SSH_CREDENTIAL_INVALID",
+                    "The credential is too large.",
+                ))
+            }
+            Authentication::PrivateKey {
+                private_key_path,
+                passphrase,
+            } => {
+                if !Path::new(private_key_path).is_absolute() || private_key_path.len() > 4096 {
+                    return Err(ApiError::new(
+                        "LOCAL_PATH_INVALID",
+                        "Choose an absolute private-key path.",
+                    ));
+                }
+                validate_private_key_platform()?;
+                if passphrase.as_ref().is_some_and(|p| p.0.len() > 16384) {
+                    return Err(ApiError::new(
+                        "SSH_CREDENTIAL_INVALID",
+                        "The credential is too large.",
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalSize {
+    pub cols: u32,
+    pub rows: u32,
+}
+impl TerminalSize {
+    pub fn validate(self) -> Result<(), ApiError> {
+        if (1..=1000).contains(&self.cols) && (1..=1000).contains(&self.rows) {
+            Ok(())
+        } else {
+            Err(ApiError::new(
+                "INPUT_INVALID",
+                "Terminal dimensions must be from 1 to 1000.",
+            ))
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRef {
+    pub session_id: String,
+    pub generation: String,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    Disconnected,
+    Connecting,
+    AwaitingHostKey,
+    Authenticating,
+    Connected,
+    Closing,
+    Error,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub revision: String,
+    pub session: Option<SessionRef>,
+    pub state: SessionState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ApiError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_key: Option<HostKeyChallenge>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostKeyChallenge {
+    pub challenge_id: String,
+    pub session: SessionRef,
+    pub host: String,
+    pub port: u16,
+    pub algorithm: String,
+    pub fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_fingerprint: Option<String>,
+    pub changed: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostKeyDecision {
+    pub challenge_id: String,
+    pub expected_fingerprint: String,
+    pub decision: TrustDecision,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustDecision {
+    Accept,
+    Reject,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WriteReceipt {
+    pub transport_seq: String,
+    pub delivery: String,
+    pub remote_outcome: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SshEvent {
+    #[serde(rename = "session.state")]
+    State { snapshot: SessionSnapshot },
+    #[serde(rename = "host_key.challenge")]
+    HostKey { challenge: HostKeyChallenge },
+    #[serde(rename = "terminal.output")]
+    Output {
+        session: SessionRef,
+        seq: String,
+        data_base64: String,
+        stream: String,
+    },
+    #[serde(rename = "session.exit")]
+    Exit {
+        session: SessionRef,
+        exit_status: u32,
+    },
+}
+pub type EventSink = Arc<dyn Fn(SshEvent) -> bool + Send + Sync>;
+
+#[derive(Clone)]
+pub struct SessionManager {
+    inner: Arc<Inner>,
+}
+struct Inner {
+    state: Mutex<ManagerState>,
+    sink: EventSink,
+}
+struct ManagerState {
+    snapshot: SessionSnapshot,
+    revision: u64,
+    generation: u64,
+    live: Option<LiveSession>,
+    trusted: HashMap<(String, u16), String>,
+    challenge: Option<(String, String, oneshot::Sender<bool>)>,
+}
+struct LiveSession {
+    session: SessionRef,
+    commands: mpsc::Sender<Command>,
+    cancel: watch::Sender<bool>,
+    output_window: Arc<Semaphore>,
+    unacked: VecDeque<(u64, OwnedSemaphorePermit)>,
+}
+enum Command {
+    Write {
+        data: Zeroizing<Vec<u8>>,
+        reply: oneshot::Sender<Result<WriteReceipt, ApiError>>,
+    },
+    Resize(TerminalSize),
+}
+impl SessionManager {
+    pub fn new(sink: EventSink) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                sink,
+                state: Mutex::new(ManagerState {
+                    snapshot: SessionSnapshot {
+                        revision: "0".into(),
+                        session: None,
+                        state: SessionState::Disconnected,
+                        host: None,
+                        port: None,
+                        username: None,
+                        error: None,
+                        host_key: None,
+                    },
+                    revision: 0,
+                    generation: 0,
+                    live: None,
+                    trusted: HashMap::new(),
+                    challenge: None,
+                }),
+            }),
+        }
+    }
+    fn lock(&self) -> MutexGuard<'_, ManagerState> {
+        self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub fn snapshot(&self) -> SessionSnapshot {
+        self.lock().snapshot.clone()
+    }
+    fn emit(&self, event: SshEvent) -> Result<(), ApiError> {
+        if (self.inner.sink)(event) {
+            Ok(())
+        } else {
+            Err(ApiError::new(
+                "UI_UNAVAILABLE",
+                "The terminal display is unavailable; the session is being closed.",
+            ))
+        }
+    }
+    pub fn connect(&self, request: ConnectRequest) -> Result<SessionSnapshot, ApiError> {
+        request.validate()?;
+        let (commands, receiver) = mpsc::channel(INPUT_QUEUE_FRAMES);
+        let (cancel, cancelled) = watch::channel(false);
+        let snapshot = {
+            let mut state = self.lock();
+            if state.live.is_some() {
+                return Err(ApiError::new(
+                    "SESSION_BUSY",
+                    "Disconnect the current server before opening another connection.",
+                ));
+            }
+            state.generation += 1;
+            state.revision += 1;
+            let session = SessionRef {
+                session_id: Uuid::new_v4().to_string(),
+                generation: state.generation.to_string(),
+            };
+            state.live = Some(LiveSession {
+                session: session.clone(),
+                commands,
+                cancel,
+                output_window: Arc::new(Semaphore::new(OUTPUT_WINDOW_BYTES)),
+                unacked: VecDeque::new(),
+            });
+            state.snapshot = SessionSnapshot {
+                revision: state.revision.to_string(),
+                session: Some(session),
+                state: SessionState::Connecting,
+                host: Some(request.host.clone()),
+                port: Some(request.port),
+                username: Some(request.username.clone()),
+                error: None,
+                host_key: None,
+            };
+            state.snapshot.clone()
+        };
+        let session = snapshot
+            .session
+            .clone()
+            .ok_or_else(|| ApiError::new("INTERNAL_STATE", "No session identity was created."))?;
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager.run(session, request, receiver, cancelled).await;
+        });
+        // A snapshot revision prevents late command responses overwriting newer events.
+        let _ = self.emit(SshEvent::State {
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
+    }
+    fn change_state(
+        &self,
+        session: &SessionRef,
+        next: SessionState,
+        error: Option<ApiError>,
+    ) -> Result<(), ApiError> {
+        let snapshot = {
+            let mut state = self.lock();
+            let live = require_live(&state, session)?;
+            if *live.cancel.borrow() {
+                return Err(ApiError::new(
+                    "SESSION_CLOSING",
+                    "The SSH connection is closing.",
+                ));
+            }
+            state.revision += 1;
+            state.snapshot.revision = state.revision.to_string();
+            state.snapshot.state = next;
+            state.snapshot.error = error;
+            if next != SessionState::AwaitingHostKey {
+                state.snapshot.host_key = None;
+            }
+            state.snapshot.clone()
+        };
+        self.emit(SshEvent::State { snapshot })
+    }
+    pub fn confirm_host_key(&self, request: HostKeyDecision) -> Result<(), ApiError> {
+        let sender = {
+            let mut state = self.lock();
+            let Some((id, fingerprint, _)) = &state.challenge else {
+                return Err(ApiError::new(
+                    "HOST_KEY_STALE",
+                    "This host-key request has expired.",
+                ));
+            };
+            if id != &request.challenge_id || fingerprint != &request.expected_fingerprint {
+                return Err(ApiError::new(
+                    "HOST_KEY_STALE",
+                    "The challenge or fingerprint does not match the current server.",
+                ));
+            }
+            state.challenge.take().map(|(_, _, sender)| sender)
+        };
+        sender
+            .ok_or_else(|| ApiError::new("HOST_KEY_STALE", "This host-key request has expired."))?
+            .send(matches!(request.decision, TrustDecision::Accept))
+            .map_err(|_| {
+                ApiError::new(
+                    "HOST_KEY_STALE",
+                    "The connection no longer needs this confirmation.",
+                )
+            })
+    }
+    pub fn disconnect(&self, session: &SessionRef) -> Result<(), ApiError> {
+        let snapshot = {
+            let mut state = self.lock();
+            let live = require_live(&state, session)?;
+            let cancel = live.cancel.clone();
+            state.revision += 1;
+            state.snapshot.revision = state.revision.to_string();
+            state.snapshot.state = SessionState::Closing;
+            state.snapshot.host_key = None;
+            let snapshot = state.snapshot.clone();
+            let _ = cancel.send(true);
+            snapshot
+        };
+        self.emit(SshEvent::State { snapshot })
+    }
+    pub fn resize(&self, session: &SessionRef, size: TerminalSize) -> Result<(), ApiError> {
+        size.validate()?;
+        let state = self.lock();
+        let live = require_connected(&state, session)?;
+        live.commands
+            .try_send(Command::Resize(size))
+            .map_err(queue_error)
+    }
+    pub async fn write(
+        &self,
+        session: &SessionRef,
+        encoded: &str,
+    ) -> Result<WriteReceipt, ApiError> {
+        let data = decode_input(encoded)?;
+        let (sender, response) = oneshot::channel();
+        {
+            let state = self.lock();
+            let live = require_connected(&state, session)?;
+            live.commands
+                .try_send(Command::Write {
+                    data,
+                    reply: sender,
+                })
+                .map_err(queue_error)?;
+        }
+        // Never retry after queue acceptance, including if this caller is cancelled.
+        response.await.unwrap_or_else(|_| Err(ApiError::unknown()))
+    }
+    pub fn ack_output(&self, session: &SessionRef, seq: &str) -> Result<(), ApiError> {
+        let seq: u64 = seq
+            .parse()
+            .map_err(|_| ApiError::new("INPUT_INVALID", "Invalid output acknowledgement."))?;
+        let mut state = self.lock();
+        // A delayed renderer callback may outlive disconnect or reconnect. It
+        // must not release credits for another generation or surface a false
+        // connection failure after successful final output rendering.
+        if state
+            .live
+            .as_ref()
+            .is_none_or(|live| &live.session != session)
+        {
+            return Ok(());
+        }
+        if let Some(live) = state.live.as_mut() {
+            // Future acknowledgements must not release bytes that are not displayed.
+            if live.unacked.back().is_some_and(|(last, _)| seq > *last) {
+                return Err(ApiError::new(
+                    "INPUT_INVALID",
+                    "Output acknowledgement exceeds the published cursor.",
+                ));
+            }
+            while live
+                .unacked
+                .front()
+                .is_some_and(|(pending, _)| *pending <= seq)
+            {
+                live.unacked.pop_front();
+            }
+        }
+        Ok(())
+    }
+    async fn publish_output(
+        &self,
+        session: &SessionRef,
+        seq: &mut u64,
+        bytes: &[u8],
+        stream: &str,
+    ) -> Result<(), ApiError> {
+        for chunk in bytes.chunks(MAX_OUTPUT_CHUNK) {
+            let semaphore = { require_live(&self.lock(), session)?.output_window.clone() };
+            let permit = semaphore
+                .acquire_many_owned(chunk.len() as u32)
+                .await
+                .map_err(|_| ApiError::new("SESSION_NOT_CONNECTED", "The terminal is closed."))?;
+            *seq += 1;
+            {
+                let mut state = self.lock();
+                require_live(&state, session)?;
+                if let Some(live) = state.live.as_mut() {
+                    live.unacked.push_back((*seq, permit));
+                }
+            }
+            self.emit(SshEvent::Output {
+                session: session.clone(),
+                seq: seq.to_string(),
+                data_base64: STANDARD.encode(chunk),
+                stream: stream.into(),
+            })?;
+        }
+        Ok(())
+    }
+    async fn run(
+        &self,
+        session: SessionRef,
+        request: ConnectRequest,
+        mut receiver: mpsc::Receiver<Command>,
+        mut cancelled: watch::Receiver<bool>,
+    ) {
+        let mut output_seq = 0;
+        let operation = self.run_connected(
+            &session,
+            request,
+            &mut receiver,
+            cancelled.clone(),
+            &mut output_seq,
+        );
+        let result = tokio::select! { biased; _ = cancelled.changed() => Ok(()), result = operation => result };
+        // Anything still in the queue is provably not sent. An in-flight write is
+        // reported unknown by its dropped response, never silently replayed.
+        receiver.close();
+        while let Some(command) = receiver.recv().await {
+            if let Command::Write { reply, .. } = command {
+                let _ = reply.send(Err(ApiError::new(
+                    "NOT_SENT",
+                    "The session closed before this frame was written.",
+                )));
+            }
+        }
+        let snapshot = {
+            let mut state = self.lock();
+            if state
+                .live
+                .as_ref()
+                .is_none_or(|live| live.session != session)
+            {
+                return;
+            }
+            state.live = None;
+            state.challenge = None;
+            state.revision += 1;
+            state.snapshot.revision = state.revision.to_string();
+            state.snapshot.state = if result.is_ok() {
+                SessionState::Disconnected
+            } else {
+                SessionState::Error
+            };
+            state.snapshot.error = result.err();
+            state.snapshot.host_key = None;
+            state.snapshot.clone()
+        };
+        let _ = self.emit(SshEvent::State { snapshot });
+    }
+    async fn run_connected(
+        &self,
+        session_ref: &SessionRef,
+        request: ConnectRequest,
+        receiver: &mut mpsc::Receiver<Command>,
+        cancelled: watch::Receiver<bool>,
+        output_seq: &mut u64,
+    ) -> Result<(), ApiError> {
+        let handler = ClientHandler {
+            manager: self.clone(),
+            session: session_ref.clone(),
+            host: request.host.clone(),
+            port: request.port,
+            cancelled,
+        };
+        let config = Arc::new(client::Config {
+            inactivity_timeout: None,
+            keepalive_interval: Some(Duration::from_secs(15)),
+            keepalive_max: 3,
+            channel_buffer_size: 16,
+            ..Default::default()
+        });
+        // TCP establishment is bounded separately; human host-key review gets 120s.
+        let socket = tokio::time::timeout(
+            NETWORK_TIMEOUT,
+            tokio::net::TcpStream::connect((request.host.as_str(), request.port)),
+        )
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                "SSH_CONNECT_TIMEOUT",
+                "The SSH server did not respond in time.",
+            )
+        })?
+        .map_err(|_| {
+            ApiError::new(
+                "SSH_CONNECT_FAILED",
+                "Unable to connect to the SSH server. Check the host, port, and network.",
+            )
+        })?;
+        // A duplicate socket handle guarantees cancellation closes the actual
+        // transport, even while russh owns an independently spawned event loop.
+        let socket = socket.into_std().map_err(|_| {
+            ApiError::new("SSH_CONNECT_FAILED", "Unable to prepare the SSH transport.")
+        })?;
+        let _shutdown = ShutdownOnDrop(socket.try_clone().map_err(|_| {
+            ApiError::new(
+                "SSH_CONNECT_FAILED",
+                "Unable to prepare transport cancellation.",
+            )
+        })?);
+        let socket = tokio::net::TcpStream::from_std(socket).map_err(|_| {
+            ApiError::new("SSH_CONNECT_FAILED", "Unable to prepare the SSH transport.")
+        })?;
+        let mut session = tokio::time::timeout(
+            Duration::from_secs(150),
+            client::connect_stream(config, socket, handler),
+        )
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                "SSH_HANDSHAKE_TIMEOUT",
+                "SSH negotiation or host-key confirmation timed out.",
+            )
+        })?
+        .map_err(|_| {
+            ApiError::new(
+                "SSH_HANDSHAKE_FAILED",
+                "SSH negotiation failed or the host key was not trusted.",
+            )
+        })?;
+        self.change_state(session_ref, SessionState::Authenticating, None)?;
+        let auth = async {
+            match request.auth {
+                Authentication::Password { mut password } => session
+                    .authenticate_password(request.username, std::mem::take(&mut password.0))
+                    .await
+                    .map_err(|_| ApiError::new("SSH_AUTH_FAILED", "SSH authentication failed.")),
+                Authentication::PrivateKey {
+                    private_key_path,
+                    passphrase,
+                } => {
+                    let key = tokio::task::spawn_blocking(move || {
+                        read_private_key(
+                            &private_key_path,
+                            passphrase.as_ref().map(|p| p.0.as_str()),
+                        )
+                    })
+                    .await
+                    .map_err(|_| {
+                        ApiError::new("SSH_KEY_FAILED", "Unable to load the selected private key.")
+                    })??;
+                    let hash = session
+                        .best_supported_rsa_hash()
+                        .await
+                        .map_err(|_| {
+                            ApiError::new(
+                                "SSH_AUTH_FAILED",
+                                "Unable to negotiate the key signature algorithm.",
+                            )
+                        })?
+                        .flatten();
+                    session
+                        .authenticate_publickey(
+                            request.username,
+                            PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+                        )
+                        .await
+                        .map_err(|_| {
+                            ApiError::new("SSH_AUTH_FAILED", "SSH key authentication failed.")
+                        })
+                }
+            }
+        };
+        let auth_result = tokio::time::timeout(NETWORK_TIMEOUT, auth)
+            .await
+            .map_err(|_| ApiError::new("SSH_AUTH_TIMEOUT", "SSH authentication timed out."))??;
+        if !auth_result.success() {
+            return Err(ApiError::new("SSH_AUTH_FAILED", "SSH authentication was rejected. Check the credentials or required authentication method."));
+        }
+        let mut channel = tokio::time::timeout(NETWORK_TIMEOUT, session.channel_open_session())
+            .await
+            .map_err(|_| ApiError::new("SSH_PTY_FAILED", "Opening the SSH session timed out."))?
+            .map_err(|_| {
+                ApiError::new("SSH_PTY_FAILED", "The server refused a session channel.")
+            })?;
+        channel
+            .request_pty(
+                true,
+                "xterm-256color",
+                request.size.cols,
+                request.size.rows,
+                0,
+                0,
+                &[],
+            )
+            .await
+            .map_err(|_| ApiError::new("SSH_PTY_FAILED", "Unable to request a terminal."))?;
+        self.wait_request_success(session_ref, &mut channel, output_seq, "SSH_PTY_FAILED")
+            .await?;
+        channel.request_shell(true).await.map_err(|_| {
+            ApiError::new(
+                "SSH_SHELL_FAILED",
+                "Unable to request an interactive shell.",
+            )
+        })?;
+        self.wait_request_success(session_ref, &mut channel, output_seq, "SSH_SHELL_FAILED")
+            .await?;
+        self.change_state(session_ref, SessionState::Connected, None)?;
+        let mut transport_seq = 0u64;
+        loop {
+            tokio::select! {
+                command = receiver.recv() => match command {
+                    Some(Command::Write { data, reply }) => {
+                        // The sole writer serializes frames; it does not arbitrate human/AI intent.
+                        transport_seq += 1;
+                        let write = tokio::time::timeout(NETWORK_TIMEOUT, channel.data(&data[..])).await;
+                        let success = matches!(write, Ok(Ok(())));
+                        let receipt = if success { Ok(WriteReceipt { transport_seq: transport_seq.to_string(), delivery: "write_accepted".into(), remote_outcome: "unknown".into() }) } else { Err(ApiError::unknown()) };
+                        let _ = reply.send(receipt);
+                        if !success { return Err(ApiError::unknown()); }
+                    }
+                    Some(Command::Resize(size)) => {
+                        tokio::time::timeout(NETWORK_TIMEOUT, channel.window_change(size.cols, size.rows, 0, 0)).await.map_err(|_| ApiError::new("SSH_RESIZE_FAILED", "Terminal resize timed out."))?.map_err(|_| ApiError::new("SSH_RESIZE_FAILED", "The terminal resize could not be sent."))?;
+                    }
+                    None => break,
+                },
+                message = channel.wait() => {
+                    if !self.handle_channel_message(session_ref, message, output_seq).await? { break; }
+                }
+            }
+        }
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.disconnect(Disconnect::ByApplication, "", "en"),
+        )
+        .await;
+        Ok(())
+    }
+    async fn wait_request_success(
+        &self,
+        session: &SessionRef,
+        channel: &mut russh::Channel<client::Msg>,
+        seq: &mut u64,
+        code: &str,
+    ) -> Result<(), ApiError> {
+        tokio::time::timeout(NETWORK_TIMEOUT, async {
+            loop {
+                match channel.wait().await {
+                    Some(ChannelMsg::Success) => return Ok(()),
+                    Some(ChannelMsg::Failure) | None | Some(ChannelMsg::Close) => {
+                        return Err(ApiError::new(
+                            code,
+                            "The server refused the requested terminal or shell.",
+                        ))
+                    }
+                    message => {
+                        if !self.handle_channel_message(session, message, seq).await? {
+                            return Err(ApiError::new(
+                                code,
+                                "The server closed the requested terminal or shell.",
+                            ));
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                code,
+                "The server did not acknowledge the terminal or shell request.",
+            )
+        })?
+    }
+    async fn handle_channel_message(
+        &self,
+        session: &SessionRef,
+        message: Option<ChannelMsg>,
+        seq: &mut u64,
+    ) -> Result<bool, ApiError> {
+        match message {
+            Some(ChannelMsg::Data { data }) => {
+                self.publish_output(session, seq, &data, "stdout").await?
+            }
+            Some(ChannelMsg::ExtendedData { data, .. }) => {
+                self.publish_output(session, seq, &data, "stderr").await?
+            }
+            Some(ChannelMsg::ExitStatus { exit_status }) => self.emit(SshEvent::Exit {
+                session: session.clone(),
+                exit_status,
+            })?,
+            Some(ChannelMsg::Close) | None => return Ok(false),
+            _ => {}
+        }
+        Ok(true)
+    }
+}
+
+fn require_live<'a>(
+    state: &'a ManagerState,
+    session: &SessionRef,
+) -> Result<&'a LiveSession, ApiError> {
+    let live = state.live.as_ref().ok_or_else(|| {
+        ApiError::new(
+            "SESSION_NOT_CONNECTED",
+            "There is no active SSH connection.",
+        )
+    })?;
+    if &live.session != session {
+        return Err(ApiError::new(
+            "SESSION_STALE",
+            "This request belongs to an old SSH connection.",
+        ));
+    }
+    Ok(live)
+}
+fn require_connected<'a>(
+    state: &'a ManagerState,
+    session: &SessionRef,
+) -> Result<&'a LiveSession, ApiError> {
+    let live = require_live(state, session)?;
+    if state.snapshot.state != SessionState::Connected || *live.cancel.borrow() {
+        return Err(ApiError::new(
+            "SESSION_NOT_CONNECTED",
+            "The SSH terminal is not connected.",
+        ));
+    }
+    Ok(live)
+}
+fn queue_error<T>(error: mpsc::error::TrySendError<T>) -> ApiError {
+    match error {
+        mpsc::error::TrySendError::Full(_) => ApiError::new(
+            "BACKPRESSURE",
+            "The terminal input queue is full. This frame was not accepted.",
+        ),
+        mpsc::error::TrySendError::Closed(_) => ApiError::new(
+            "SESSION_NOT_CONNECTED",
+            "The SSH terminal is closed. This frame was not accepted.",
+        ),
+    }
+}
+fn decode_input(encoded: &str) -> Result<Zeroizing<Vec<u8>>, ApiError> {
+    if encoded.len() > MAX_INPUT_BYTES.div_ceil(3) * 4 {
+        return Err(ApiError::new(
+            "INPUT_TOO_LARGE",
+            "Terminal input must be at most 16 KiB per frame.",
+        ));
+    }
+    let bytes = Zeroizing::new(
+        STANDARD
+            .decode(encoded)
+            .map_err(|_| ApiError::new("INPUT_INVALID", "Terminal input must be valid base64."))?,
+    );
+    if bytes.is_empty() || bytes.len() > MAX_INPUT_BYTES {
+        return Err(ApiError::new(
+            "INPUT_TOO_LARGE",
+            "Terminal input must contain 1 to 16384 bytes.",
+        ));
+    }
+    Ok(bytes)
+}
+fn validate_private_key_platform() -> Result<(), ApiError> {
+    #[cfg(windows)]
+    {
+        Err(ApiError::new("SSH_KEY_PLATFORM_UNSUPPORTED", "Windows private-key authentication is unavailable until ownership and ACL validation is implemented. Use session-only password authentication for this milestone."))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
+}
+
+fn read_private_key(
+    path: &str,
+    passphrase: Option<&str>,
+) -> Result<russh::keys::PrivateKey, ApiError> {
+    validate_private_key_platform()?;
+    let invalid = || {
+        ApiError::new(
+            "LOCAL_FILE_PERMISSION_DENIED",
+            "The selected key must be a readable, private, regular file owned by this user.",
+        )
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself, then reject it using handle metadata.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path).map_err(|_| invalid())?;
+    let metadata = file.metadata().map_err(|_| invalid())?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err(invalid());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and does not mutate memory.
+        if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(invalid());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(invalid());
+        }
+    }
+    let mut text = Zeroizing::new(String::new());
+    file.take(1024 * 1024 + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| invalid())?;
+    if text.len() > 1024 * 1024 {
+        return Err(invalid());
+    }
+    russh::keys::decode_secret_key(&text, passphrase).map_err(|_| {
+        ApiError::new(
+            "SSH_KEY_FAILED",
+            "Unable to decode the private key. Check its format and passphrase.",
+        )
+    })
+}
+
+struct ClientHandler {
+    manager: SessionManager,
+    session: SessionRef,
+    host: String,
+    port: u16,
+    cancelled: watch::Receiver<bool>,
+}
+impl client::Handler for ClientHandler {
+    type Error = russh::Error;
+    async fn check_server_key(
+        &mut self,
+        key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        // Certificate trust/CA management is not implemented; never imply it is verified.
+        if key.certificate().is_some() {
+            return Ok(false);
+        }
+        let key = key.public_key();
+        let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+        let (sender, response) = oneshot::channel();
+        let (challenge, previous_state) = {
+            let mut state = self.manager.lock();
+            if require_live(&state, &self.session).is_err() || *self.cancelled.borrow() {
+                return Ok(false);
+            }
+            let previous = state.trusted.get(&(self.host.clone(), self.port)).cloned();
+            if previous.as_ref() == Some(&fingerprint) {
+                return Ok(true);
+            }
+            let challenge = HostKeyChallenge {
+                challenge_id: Uuid::new_v4().to_string(),
+                session: self.session.clone(),
+                host: self.host.clone(),
+                port: self.port,
+                algorithm: key.algorithm().to_string(),
+                fingerprint: fingerprint.clone(),
+                changed: previous.is_some(),
+                previous_fingerprint: previous,
+            };
+            state.challenge = Some((challenge.challenge_id.clone(), fingerprint.clone(), sender));
+            state.snapshot.host_key = Some(challenge.clone());
+            (challenge, state.snapshot.state)
+        };
+        if self
+            .manager
+            .change_state(&self.session, SessionState::AwaitingHostKey, None)
+            .is_err()
+            || self.manager.emit(SshEvent::HostKey { challenge }).is_err()
+        {
+            return Ok(false);
+        }
+        let accepted = tokio::select! {
+            biased;
+            _ = self.cancelled.changed() => false,
+            result = tokio::time::timeout(Duration::from_secs(120), response) => matches!(result, Ok(Ok(true))),
+        };
+        let accepted = {
+            let mut state = self.manager.lock();
+            if require_live(&state, &self.session).is_err() {
+                return Ok(false);
+            }
+            state.challenge = None;
+            if accepted && !*self.cancelled.borrow() {
+                state
+                    .trusted
+                    .insert((self.host.clone(), self.port), fingerprint);
+                true
+            } else {
+                false
+            }
+        };
+        if accepted
+            && self
+                .manager
+                .change_state(&self.session, previous_state, None)
+                .is_err()
+        {
+            return Ok(false);
+        }
+        Ok(accepted)
+    }
+}
+
+struct ShutdownOnDrop(std::net::TcpStream);
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> ConnectRequest {
+        ConnectRequest {
+            host: "example.invalid".into(),
+            port: 22,
+            username: "tester".into(),
+            auth: Authentication::Password {
+                password: Secret::new("test-only-credential".into()),
+            },
+            session_only: true,
+            size: TerminalSize { cols: 80, rows: 24 },
+        }
+    }
+    fn connected() -> (SessionManager, SessionRef, mpsc::Receiver<Command>) {
+        let manager = SessionManager::new(Arc::new(|_| true));
+        let session = SessionRef {
+            session_id: "fixture-session".into(),
+            generation: "1".into(),
+        };
+        let (commands, receiver) = mpsc::channel(INPUT_QUEUE_FRAMES);
+        let (cancel, _) = watch::channel(false);
+        {
+            let mut state = manager.lock();
+            state.snapshot.session = Some(session.clone());
+            state.snapshot.state = SessionState::Connected;
+            state.live = Some(LiveSession {
+                session: session.clone(),
+                commands,
+                cancel,
+                output_window: Arc::new(Semaphore::new(OUTPUT_WINDOW_BYTES)),
+                unacked: VecDeque::new(),
+            });
+        }
+        (manager, session, receiver)
+    }
+
+    #[test]
+    fn validates_dimensions_and_connection_fields() {
+        let mut req = request();
+        assert!(req.validate().is_ok());
+        req.size.cols = 0;
+        assert_eq!(req.validate().unwrap_err().code, "INPUT_INVALID");
+        req.size.cols = 1001;
+        assert!(req.validate().is_err());
+        req.size.cols = 80;
+        for host in ["", "ssh://host", "user@host", "host\nother", "host name"] {
+            req.host = host.into();
+            assert_eq!(req.validate().unwrap_err().code, "SSH_CONFIG_INVALID");
+        }
+        req.host = "::1".into();
+        assert!(req.validate().is_ok());
+        req.port = 0;
+        assert!(req.validate().is_err());
+    }
+    #[test]
+    fn session_only_requires_explicit_opt_in() {
+        let mut req = request();
+        req.session_only = false;
+        assert_eq!(req.validate().unwrap_err().code, "CREDENTIAL_MODE_REQUIRED");
+    }
+    #[test]
+    fn private_key_requires_absolute_path() {
+        let mut req = request();
+        req.auth = Authentication::PrivateKey {
+            private_key_path: "relative-key".into(),
+            passphrase: None,
+        };
+        assert_eq!(req.validate().unwrap_err().code, "LOCAL_PATH_INVALID");
+    }
+    #[test]
+    fn binary_codec_preserves_bytes_and_rejects_oversized_frames() {
+        let raw = [0, 0xff, 0xc3, 0xa9, 0x1b, b'[', b'm'];
+        assert_eq!(&decode_input(&STANDARD.encode(raw)).unwrap()[..], raw);
+        assert!(decode_input(&STANDARD.encode(vec![7; MAX_INPUT_BYTES])).is_ok());
+        assert_eq!(
+            decode_input(&STANDARD.encode(vec![7; MAX_INPUT_BYTES + 1]))
+                .unwrap_err()
+                .code,
+            "INPUT_TOO_LARGE"
+        );
+        assert_eq!(
+            decode_input("not!base64").unwrap_err().code,
+            "INPUT_INVALID"
+        );
+        assert!(decode_input("").is_err());
+    }
+    #[test]
+    fn connection_dto_rejects_unknown_fields() {
+        let invalid = r#"{"host":"h","port":22,"username":"u","auth":{"kind":"password","password":"fixture","approved":true},"session_only":true,"size":{"cols":80,"rows":24}}"#;
+        assert!(serde_json::from_str::<ConnectRequest>(invalid).is_err());
+    }
+    #[test]
+    fn one_connection_and_session_generation_are_enforced() {
+        let (manager, session, _receiver) = connected();
+        assert_eq!(manager.connect(request()).unwrap_err().code, "SESSION_BUSY");
+        let stale = SessionRef {
+            generation: "0".into(),
+            ..session
+        };
+        assert_eq!(
+            manager
+                .resize(&stale, TerminalSize { cols: 80, rows: 24 })
+                .unwrap_err()
+                .code,
+            "SESSION_STALE"
+        );
+        assert_eq!(
+            manager.disconnect(&stale).unwrap_err().code,
+            "SESSION_STALE"
+        );
+    }
+    #[tokio::test]
+    async fn writes_are_fifo_and_receipts_never_claim_remote_success() {
+        let (manager, session, mut receiver) = connected();
+        let writer = manager.clone();
+        let task = tokio::spawn(async move { writer.write(&session, "aGVsbG8=").await });
+        match receiver.recv().await.unwrap() {
+            Command::Write { data, reply } => {
+                assert_eq!(&data[..], b"hello");
+                reply
+                    .send(Ok(WriteReceipt {
+                        transport_seq: "1".into(),
+                        delivery: "write_accepted".into(),
+                        remote_outcome: "unknown".into(),
+                    }))
+                    .unwrap();
+            }
+            _ => panic!("expected input frame"),
+        }
+        assert_eq!(task.await.unwrap().unwrap().remote_outcome, "unknown");
+    }
+    #[tokio::test]
+    async fn full_queue_refuses_entire_input_without_replay() {
+        let (manager, session, _receiver) = connected();
+        for _ in 0..INPUT_QUEUE_FRAMES {
+            manager
+                .resize(&session, TerminalSize { cols: 80, rows: 24 })
+                .unwrap();
+        }
+        assert_eq!(
+            manager.write(&session, "aGVsbG8=").await.unwrap_err().code,
+            "BACKPRESSURE"
+        );
+        assert_eq!(manager.lock().live.as_ref().unwrap().commands.capacity(), 0);
+    }
+    #[tokio::test]
+    async fn dropped_inflight_receipt_is_unknown() {
+        let (manager, session, mut receiver) = connected();
+        let task = tokio::spawn(async move { manager.write(&session, "aGVsbG8=").await });
+        drop(receiver.recv().await.unwrap());
+        assert_eq!(task.await.unwrap().unwrap_err().code, "DELIVERY_UNKNOWN");
+    }
+    #[test]
+    fn host_key_confirmation_matches_both_challenge_and_fingerprint() {
+        let manager = SessionManager::new(Arc::new(|_| true));
+        let (sender, mut receiver) = oneshot::channel();
+        manager.lock().challenge = Some(("challenge".into(), "SHA256:fixture".into(), sender));
+        assert_eq!(
+            manager
+                .confirm_host_key(HostKeyDecision {
+                    challenge_id: "challenge".into(),
+                    expected_fingerprint: "SHA256:other".into(),
+                    decision: TrustDecision::Accept
+                })
+                .unwrap_err()
+                .code,
+            "HOST_KEY_STALE"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        manager
+            .confirm_host_key(HostKeyDecision {
+                challenge_id: "challenge".into(),
+                expected_fingerprint: "SHA256:fixture".into(),
+                decision: TrustDecision::Reject,
+            })
+            .unwrap();
+        assert!(!receiver.try_recv().unwrap());
+        assert_eq!(
+            manager
+                .confirm_host_key(HostKeyDecision {
+                    challenge_id: "challenge".into(),
+                    expected_fingerprint: "SHA256:fixture".into(),
+                    decision: TrustDecision::Accept
+                })
+                .unwrap_err()
+                .code,
+            "HOST_KEY_STALE"
+        );
+    }
+    #[tokio::test]
+    async fn output_backpressure_requires_actual_cursor_acknowledgement() {
+        let (manager, session, _receiver) = connected();
+        let mut seq = 0;
+        manager
+            .publish_output(&session, &mut seq, &vec![7; OUTPUT_WINDOW_BYTES], "stdout")
+            .await
+            .unwrap();
+        assert_eq!(seq, (OUTPUT_WINDOW_BYTES / MAX_OUTPUT_CHUNK) as u64);
+        let semaphore = manager.lock().live.as_ref().unwrap().output_window.clone();
+        assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(
+            manager
+                .ack_output(&session, &(seq + 1).to_string())
+                .unwrap_err()
+                .code,
+            "INPUT_INVALID"
+        );
+        assert_eq!(semaphore.available_permits(), 0);
+        manager.ack_output(&session, "1").unwrap();
+        assert_eq!(semaphore.available_permits(), MAX_OUTPUT_CHUNK);
+        manager.ack_output(&session, &seq.to_string()).unwrap();
+        assert_eq!(semaphore.available_permits(), OUTPUT_WINDOW_BYTES);
+    }
+    #[test]
+    fn initial_snapshot_contains_no_credentials() {
+        let manager = SessionManager::new(Arc::new(|_| true));
+        let serialized = serde_json::to_string(&manager.snapshot()).unwrap();
+        assert!(!serialized.contains("password"));
+        assert!(!serialized.contains("passphrase"));
+        assert!(!serialized.contains("private_key"));
+        assert_eq!(manager.snapshot().state, SessionState::Disconnected);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn key_reader_refuses_publicly_accessible_files_and_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let base = std::env::temp_dir().join(format!("xyz-key-check-{}", Uuid::new_v4()));
+        std::fs::create_dir(&base).unwrap();
+        let path = base.join("credential-fixture");
+        std::fs::write(&path, "not-a-private-key").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            read_private_key(path.to_str().unwrap(), None)
+                .unwrap_err()
+                .code,
+            "LOCAL_FILE_PERMISSION_DENIED"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = base.join("link");
+        symlink(&path, &link).unwrap();
+        assert_eq!(
+            read_private_key(link.to_str().unwrap(), None)
+                .unwrap_err()
+                .code,
+            "LOCAL_FILE_PERMISSION_DENIED"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+}
