@@ -25,6 +25,19 @@ runs:
         rustup component add rustfmt clippy
         rustc --version --verbose
         cargo --version
+    - name: Cache Cargo dependencies and build outputs
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        # Never cache the whole Cargo home: it can contain credential/config files.
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/registry/src/
+          ~/.cargo/git/db/
+          target/
+        key: cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+        restore-keys: |
+          cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
     - name: Install locked frontend dependencies
       shell: bash
       run: npm ci

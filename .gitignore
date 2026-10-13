@@ -27,3 +27,7 @@ id_ed25519*
 *.tsbuildinfo
 /src-tauri/gen/
 /coverage/
+
+# Browser preview tests (synthetic data only)
+/playwright-report/
+/test-results/

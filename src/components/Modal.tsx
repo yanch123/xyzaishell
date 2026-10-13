@@ -4,11 +4,15 @@ import { Icon } from './Icon';
 export function Modal({ title, eyebrow, children, onClose, className = '' }: { title: string; eyebrow?: string; children: ReactNode; onClose: () => void; className?: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const titleId = useId();
+  // Capture before React makes the background inert and the browser blurs it.
+  const returnFocus = useRef(document.activeElement as HTMLElement | null);
   useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
     const first = ref.current?.querySelector<HTMLElement>('input, button, textarea, select, [tabindex="0"]');
     first?.focus();
-    return () => { previous?.focus(); };
+    return () => {
+      const previous = returnFocus.current;
+      if (previous?.isConnected && !previous.closest('[inert]')) previous.focus();
+    };
   }, []);
   return <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
     <div className={`modal ${className}`} ref={ref} role="dialog" aria-modal="true" aria-labelledby={titleId} onKeyDown={event => {

@@ -1,29 +1,92 @@
-import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ModelEvent } from '../lib/model';
+import { chat, modelConfig, stream } from '../test/modelFixtures';
+const mocks = vi.hoisted(() => ({ native: vi.fn(), listen: vi.fn(), config: vi.fn(), list: vi.fn(), create: vi.fn(), get: vi.fn(), send: vi.fn(), cancel: vi.fn(), reload: vi.fn(), confirm: vi.fn(), probe: vi.fn() }));
+vi.mock('../lib/bridge', () => ({ desktopAvailable: mocks.native }));
+vi.mock('../lib/modelBridge', () => ({ modelBridge: mocks }));
 import { ChatPane } from './ChatPane';
-describe('M1 chat shell', () => {
-  it('is explicit about unavailable AI and never creates a model reply', async () => {
-    const user = userEvent.setup();
-    render(<ChatPane showHistory onToggleHistory={vi.fn()} onSettings={vi.fn()} />);
-    expect(screen.getByText('AI 尚未接入')).toBeDefined();
-    await user.type(screen.getByRole('textbox',{name:'任务草稿'}),'检查服务器'); await user.click(screen.getByRole('button',{name:'保存草稿'}));
-    expect(screen.getByText('未发送')).toBeDefined(); expect(screen.getByText('检查服务器',{selector:'p'})).toBeDefined();
-    expect(screen.getByText(/没有模型回复或终端执行/)).toBeDefined();
+import { useModelChat } from '../hooks/useModelChat';
+let emit: (event: ModelEvent) => void;
+const consent = vi.fn();
+function Harness() {
+  const model = useModelChat();
+  return <ChatPane model={model} showHistory onToggleHistory={vi.fn()} onSettings={vi.fn()} onConsent={consent} />;
+}
+beforeEach(() => {
+  vi.resetAllMocks();
+  mocks.native.mockReturnValue(true);
+  mocks.listen.mockImplementation(async handler => { emit = handler; return vi.fn(); });
+  mocks.config.mockResolvedValue({ ...modelConfig });
+  mocks.list.mockResolvedValue([chat()]);
+  mocks.create.mockResolvedValue(chat('chat-b'));
+  mocks.get.mockImplementation(async id => chat(id));
+  mocks.send.mockImplementation(async id => stream(id));
+});
+async function ready() {
+  render(<Harness />);
+  await waitFor(() => expect(screen.getByRole('button', { name: '新建聊天' }).hasAttribute('disabled')).toBe(false));
+}
+describe('M2 model chat UI', () => {
+  it('sends explicit chat text and streams a real backend response without implying terminal access', async () => {
+    const user = userEvent.setup(); await ready();
+    expect(screen.getByText(/不读取终端、不执行命令/)).toBeDefined();
+    await user.type(screen.getByRole('textbox', { name: '聊天消息' }), '解释这条命令');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    expect(mocks.send).toHaveBeenCalledWith('chat-a', '解释这条命令');
+    expect(screen.getByText('正在等待模型响应…')).toBeDefined();
+    act(() => emit({ kind: 'chat_updated', chat: stream('chat-a', '3', 'This is a streamed response.') }));
+    expect(screen.getByText('This is a streamed response.')).toBeDefined();
+    expect(screen.getByRole('button', { name: '停止生成' })).toBeDefined();
+    expect(screen.getByText(/未执行任何终端操作/)).toBeDefined();
   });
-  it('keeps drafts and saved messages separate across chats', async () => {
-    const user = userEvent.setup();
-    render(<ChatPane showHistory onToggleHistory={vi.fn()} onSettings={vi.fn()} />);
-    await user.type(screen.getByRole('textbox'),'未发送草稿 A'); await user.click(screen.getByRole('button',{name:'新建聊天'}));
+  it('asks for consent before a first send instead of calling the provider', async () => {
+    mocks.config.mockResolvedValue({ ...modelConfig, consented: false });
+    const user = userEvent.setup(); await ready();
+    await user.type(screen.getByRole('textbox'), 'message');
+    await user.click(screen.getByRole('button', { name: '确认并发送' }));
+    expect(consent).toHaveBeenCalledWith('chat-a'); expect(mocks.send).not.toHaveBeenCalled();
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('message');
+  });
+  it('keeps unsent drafts separate when creating and switching chats', async () => {
+    const user = userEvent.setup(); await ready();
+    await user.type(screen.getByRole('textbox'), '未发送草稿 A');
+    await user.click(screen.getByRole('button', { name: '新建聊天' }));
     expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('');
-    await user.type(screen.getByRole('textbox'),'草稿 B'); await user.click(screen.getByRole('button',{name:'新任务 1'}));
+    await user.type(screen.getByRole('textbox'), '草稿 B');
+    await user.click(screen.getByRole('button', { name: '新任务 1' }));
     expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('未发送草稿 A');
+    expect(mocks.send).not.toHaveBeenCalled(); expect(mocks.cancel).not.toHaveBeenCalled();
   });
-  it('renders hostile text as text rather than HTML', async () => {
-    const user = userEvent.setup();
-    render(<ChatPane showHistory={false} onToggleHistory={vi.fn()} onSettings={vi.fn()} />);
-    const payload = '<img src=x onerror=alert(1)><script>unsafe</script>';
-    fireEvent.change(screen.getByRole('textbox'),{target:{value:payload}}); await user.click(screen.getByRole('button',{name:'保存草稿'}));
-    expect(screen.getByText(payload,{selector:'p'})).toBeDefined(); expect(document.querySelector('script')).toBeNull(); expect(document.querySelector('img')).toBeNull();
+  it('renders hostile model and user text as plain text, with no HTML, image or executable links', async () => {
+    const payload = '<img src=x onerror=alert(1)><script>unsafe</script> [run](javascript:alert(1))';
+    const incoming = stream('chat-a', '2', payload); incoming.messages[0].text = payload;
+    mocks.list.mockResolvedValue([incoming]);
+    await ready();
+    expect(screen.getAllByText(payload, { selector: 'p' })).toHaveLength(2);
+    expect(document.querySelector('script')).toBeNull(); expect(document.querySelector('img')).toBeNull(); expect(document.querySelector('a')).toBeNull();
+  });
+  it('displays incomplete cancellation and stream errors distinctly', async () => {
+    const incoming = stream('chat-a', '2', 'partial'); incoming.active_run_id = null; incoming.messages[1].state = 'cancelled';
+    mocks.list.mockResolvedValue([incoming]); await ready();
+    expect(screen.getByText('已停止 · 回复不完整')).toBeDefined();
+    const failed = { ...incoming, revision: '3', messages: incoming.messages.map(message => message.role === 'assistant' ? { ...message, state: 'error' as const, error: { code: 'MODEL_STREAM_INVALID', safe_message: '模型流意外中断，请检查服务。', retry: 'after_user_action' as const } } : message) };
+    act(() => emit({ kind: 'chat_updated', chat: failed }));
+    expect(screen.getByText('出错 · 回复不完整')).toBeDefined(); expect(screen.getByRole('alert').textContent).toContain('模型流意外中断');
+  });
+  it('blocks overlong UTF-8 messages without silently trimming text', async () => {
+    await ready();
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '中'.repeat(5500) } });
+    expect(screen.getByText('消息超过 16 KiB，请缩短后发送')).toBeDefined();
+    expect(screen.getByRole('button', { name: '发送' }).hasAttribute('disabled')).toBe(true);
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value.length).toBe(5500); expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('shows an honest browser preview and never simulates a model response', async () => {
+    mocks.native.mockReturnValue(false); render(<Harness />);
+    expect(screen.getByText('网页预览 · 模型连接不可用')).toBeDefined();
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'not sent' } });
+    expect(screen.getByRole('button', { name: '确认并发送' }).hasAttribute('disabled')).toBe(true);
+    expect(mocks.send).not.toHaveBeenCalled(); expect(mocks.list).not.toHaveBeenCalled();
   });
 });

@@ -46,6 +46,37 @@ jobs:
       - name: Test pipeline helper scripts
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
 
+  browser-preview:
+    name: Browser preview smoke (mock data only)
+    needs: frontend
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.23.3'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser
+      - name: Require a captured browser screenshot
+        run: test -n "$(find test-results -type f -name '*.png' -print -quit)"
+      - name: Save browser preview screenshots and report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: browser-preview-smoke
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
   desktop:
     name: Rust tests and ${{ matrix.label }} package
     needs: frontend
@@ -73,6 +104,11 @@ jobs:
       - run: npm run build
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
+      - name: Test real OpenSSH PTY interoperability on the disposable Linux runner
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install --no-install-recommends -y openssh-server
+          bash .github/scripts/openssh-test.sh --disposable-user
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build installer from locked dependencies
         env:

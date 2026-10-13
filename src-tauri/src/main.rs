@@ -6,6 +6,10 @@ use xyz_core::ssh::{
     ApiError, ConnectRequest, HostKeyDecision, SessionManager, SessionRef, SessionSnapshot,
     TerminalSize, WriteReceipt,
 };
+use xyz_core::{
+    model::{ModelConfigManager, ModelConfigStatus},
+    tasks::{ChatSnapshot, TaskManager},
+};
 
 #[tauri::command]
 fn get_session_snapshot(state: State<'_, SessionManager>) -> SessionSnapshot {
@@ -71,6 +75,57 @@ async fn interrupt_remote(
     state.write(&session, "Aw==").await
 }
 
+#[tauri::command]
+fn get_model_config_status(state: State<'_, TaskManager>) -> ModelConfigStatus {
+    state.config_status()
+}
+#[tauri::command]
+async fn reload_model_config(state: State<'_, TaskManager>) -> ModelConfigStatus {
+    state.reload_config()
+}
+#[tauri::command]
+fn confirm_model_destination(
+    revision: String,
+    destination: String,
+    state: State<'_, TaskManager>,
+) -> Result<ModelConfigStatus, ApiError> {
+    state.confirm_destination(&revision, &destination)
+}
+#[tauri::command]
+fn list_chats(state: State<'_, TaskManager>) -> Vec<ChatSnapshot> {
+    state.list_chats()
+}
+#[tauri::command]
+fn create_chat(title: String, state: State<'_, TaskManager>) -> Result<ChatSnapshot, ApiError> {
+    state.create_chat(&title)
+}
+#[tauri::command]
+fn get_chat(chat_id: String, state: State<'_, TaskManager>) -> Result<ChatSnapshot, ApiError> {
+    state.get_chat(&chat_id)
+}
+#[tauri::command]
+async fn send_chat_message(
+    chat_id: String,
+    text: String,
+    state: State<'_, TaskManager>,
+) -> Result<ChatSnapshot, ApiError> {
+    state.send_message(&chat_id, &text)
+}
+#[tauri::command]
+fn cancel_chat_run(
+    chat_id: String,
+    run_id: String,
+    state: State<'_, TaskManager>,
+) -> Result<ChatSnapshot, ApiError> {
+    state.cancel_run(&chat_id, &run_id)
+}
+#[tauri::command]
+async fn probe_model_compatibility(
+    state: State<'_, TaskManager>,
+) -> Result<ChatSnapshot, ApiError> {
+    state.probe()
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -78,6 +133,11 @@ fn main() {
             app.manage(SessionManager::new(Arc::new(move |event| {
                 handle.emit("ssh:event", event).is_ok()
             })));
+            let handle = app.handle().clone();
+            app.manage(TaskManager::new(
+                ModelConfigManager::new(),
+                Arc::new(move |event| handle.emit("model:event", event).is_ok()),
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -88,7 +148,16 @@ fn main() {
             resize_terminal,
             ack_terminal_output,
             send_user_input,
-            interrupt_remote
+            interrupt_remote,
+            get_model_config_status,
+            reload_model_config,
+            confirm_model_destination,
+            list_chats,
+            create_chat,
+            get_chat,
+            send_chat_message,
+            cancel_chat_run,
+            probe_model_compatibility
         ])
         .run(tauri::generate_context!())
         .expect("Unable to start xyzaishell desktop host");

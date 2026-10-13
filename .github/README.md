@@ -4,11 +4,16 @@
 
 - Work is staged on `dev`. Pushes to `dev`/`main`, pull requests targeting either branch, and manual CI runs execute `ci.yml`.
 - Both platforms use the same source commit, root `Cargo.lock`, `package-lock.json`, and exact Rust version from `rust-toolchain.toml`. Node is pinned to 22.23.3 in the workflow/setup action.
+- Cargo registry index/cache/source, public Git dependency databases, and `target/` are cached with OS, architecture, exact-toolchain-file hash, lockfile hash, and source SHA keys. Restore fallback stays within the same OS/toolchain/lockfile. Cargo config and credential files are never cached; all locked tests and builds still run.
 - CI runs frontend tests and a production build, Rust formatting/tests/Clippy, then Tauri packaging. The root Cargo workspace means packages are in `target/release/bundle`, not `src-tauri/target`.
 - Windows x64 NSIS is built on `windows-2022`. Ubuntu x64 DEB is built on `ubuntu-22.04`, the oldest promised Linux baseline. No AppImage, macOS, or ARM artifact is advertised.
 - Candidate installers, SHA-256 checksums, and build provenance are retained as Actions artifacts for 14 days. A successful development build does not publish a GitHub Release.
 
 ## What the checks establish
+
+A separate Playwright/Chromium job runs the browser preview with synthetic/mock data and uploads success screenshots, traces when applicable, and the HTML report as `browser-preview-smoke`. This verifies preview rendering and the mocked interaction flows in the tests; it is not Tauri IPC, WebView2/WebKitGTK, SSH, model-service, or native desktop acceptance. Inspect the screenshots as well as the test result before making visual-quality claims.
+
+The Linux build job explicitly runs the normally ignored real-OpenSSH integration test using `.github/scripts/openssh-test.sh --disposable-user`. It creates fresh temporary host/client keys and a temporary unprivileged account only on a disposable `CI=true` runner, binds the isolated daemon to loopback, checks real PTY/shell/resize behavior and the absence of hidden exec/subsystem requests, and cleans up. It does not use a production SSH server or credentials. The CI result must be checked before claiming this interoperability test passed; ordinary `cargo test` reports it as ignored.
 
 `linux-install-smoke` downloads the actual Ubuntu 22.04-built DEB into fresh Ubuntu 22.04 and 24.04 jobs, checks its checksum, installs its declared dependencies, checks binary linkage and desktop entry, and launches it with an isolated configuration in Xvfb. It requires a visible top-level window and a live process. Evidence is retained separately for each OS.
 
