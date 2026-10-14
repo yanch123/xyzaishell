@@ -348,6 +348,25 @@ class NativeHelperTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "baseline bytes"):
                 native.verify_profile_backup(root, digest)
 
+    def test_windows_backup_acl_uses_fixture_powershell_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            backup = root / "connections.v1.backup.toml"
+            backup.write_bytes(b"synthetic-v1-profile")
+            digest = native.hashlib.sha256(backup.read_bytes()).hexdigest()
+            with mock.patch.object(native.os, "name", "nt"), mock.patch.object(native.subprocess, "run") as run:
+                native.verify_profile_backup(root, digest)
+                args, kwargs = run.call_args
+                self.assertEqual(args[0][0], "pwsh")
+                self.assertTrue(kwargs["check"])
+                self.assertEqual(kwargs["timeout"], 15)
+                self.assertIn("Get-Acl", args[0][-1])
+                self.assertIn("AreAccessRulesProtected", args[0][-1])
+                self.assertIn("$unexpected.Count -ne 0", args[0][-1])
+                run.side_effect = native.subprocess.CalledProcessError(1, "pwsh")
+                with self.assertRaises(native.subprocess.CalledProcessError):
+                    native.verify_profile_backup(root, digest)
+
     def test_wait_is_bounded_and_retries_transient_errors(self):
         values = iter([False, True])
         self.assertTrue(native.wait_for(lambda: next(values), timeout=1))

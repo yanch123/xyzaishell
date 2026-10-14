@@ -487,7 +487,9 @@ def verify_profile_backup(config, expected_digest):
                   "$unexpected=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | "
                   "Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -notin $allowed }); "
                   "if ($owner -ne $sid -or -not $acl.AreAccessRulesProtected -or $unexpected.Count -ne 0) { throw 'Unsafe legacy profile backup ACL' }")
-        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], check=True, timeout=15)
+        # Match the pwsh host used by the Windows fixture. Windows PowerShell
+        # cannot reliably load its Security module with inherited pwsh module paths.
+        subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", script], check=True, timeout=15)
 
 
 def open_shell_logs(driver, version):

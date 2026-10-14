@@ -1,6 +1,6 @@
 # 08 — v0.1.2 使用指南
 
-本文对应 v0.1.2 开发版本，不表示新版安装包已经发布。下载安装包请查看 [GitHub Releases](https://github.com/yanch123/xyzaishell/releases) 的实际版本；v0.1.1 用户可参考[旧版指南](../v0.1.1/05-user-guide.md)。建议先在测试服务器上使用。
+本文对应 v0.1.2。下载安装包及验证范围请查看 [GitHub Releases](https://github.com/yanch123/xyzaishell/releases) 的实际版本；v0.1.1 用户可参考[旧版指南](../v0.1.1/05-user-guide.md)。建议先在测试服务器上使用。
 
 ## 1. 连接服务器
 
