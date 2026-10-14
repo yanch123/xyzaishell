@@ -9,6 +9,7 @@ impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!("xyz-shell-service-{}", Uuid::new_v4()));
         let snapshot = SessionSnapshot {
+            profile_id: None,
             revision: "1".into(),
             session: Some(SessionRef {
                 session_id: Uuid::new_v4().to_string(),

@@ -1,7 +1,7 @@
 import type { ApiError, SessionRef } from './types';
 
 /** All execution authority lives in the native dispatcher; these are display DTOs. */
-export type TaskPhase = 'preparing' | 'awaiting_display' | 'waiting_approval' | 'dispatching' | 'needs_user' | 'needs_secrets' | 'completed' | 'cancelled' | 'failed';
+export type TaskPhase = 'preparing' | 'awaiting_display' | 'waiting_approval' | 'dispatching' | 'awaiting_completion' | 'unsupported_action' | 'needs_user' | 'needs_secrets' | 'completed' | 'cancelled' | 'failed';
 export type TerminalAction = {
   kind?: 'command' | 'secret_input';
   secret_field?: string | null;
@@ -10,7 +10,11 @@ export type TerminalAction = {
   command_text: string;
   append_enter: true;
   digest: string;
-  policy: 'auto_read_only' | 'require_approval';
+  policy: 'auto_read_only' | 'auto_normal' | 'require_approval' | 'manual_only';
+  risk?: 'normal' | 'dangerous' | 'unknown';
+  blocked?: boolean;
+  exit_code?: number | null;
+  command_completed?: boolean;
   reason: string;
   approval_id: string | null;
   expires_at_unix_ms: number;
@@ -32,7 +36,7 @@ export type TerminalTaskSnapshot = {
   terminal_ready: boolean;
   error: ApiError | null;
   owner: boolean;
-  remote_outcome: 'unknown' | 'not_sent';
+  remote_outcome: 'unknown' | 'not_sent' | 'foreground_returned';
   round: number;
   secret_request?: { fields: { name: string; required: boolean }[]; purpose: string } | null;
 };
@@ -48,6 +52,7 @@ export type ActionIdentity = TaskIdentity & { action_id: string; display_revisio
 export type AgentEvent = { kind: 'task_updated'; task: TerminalTaskSnapshot };
 export const TASK_PHASE_LABELS: Record<TaskPhase, string> = {
   preparing: '模型分析中', awaiting_display: '命令已准备 · 等待显示', waiting_approval: '等待本次批准',
+  awaiting_completion: '等待命令返回与 Shell 就绪', unsupported_action: '未知风险 · 需要手动处理',
   needs_secrets: '需要任务秘密 · 等待本机填写', dispatching: '正在派发', needs_user: '需你核实终端', completed: 'AI 流程已结束', cancelled: 'AI 已停止', failed: 'AI 流程出错',
 };
 export const DELIVERY_LABELS: Record<TerminalAction['delivery'], string> = {

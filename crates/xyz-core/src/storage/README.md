@@ -20,18 +20,31 @@ permissions, local filesystem, links and component traversal at use time.
 
 ## Intended host flow
 
-1. `ProfileStore::open(root)` and explicit `initialize(CredentialMode)` when absent.
-   Never choose SessionOnly because a native backend failed. `list` returns only
-   safe display fields and presence; its decimal-string revision is converted
-   with checked parsing for `save` / `resolve_for_authentication`.
-2. Persistent `save` accepts `CredentialChange::{Keep,Clear,Set}`. Native secret
-   writes create a new opaque item before committing its reference. On errors,
-   especially `SaveUncertain`, reread; do not delete an old item, automatically
-   retry a write, or assume rollback. Orphan cleanup is deliberately deferred.
-3. In SessionOnly, profile `save` accepts only Keep. Use `set_session` or
-   `clear_session` explicitly; Clear/Set in profile saves return
-   `SessionCredentialUpdateRequired`. Session memory is bounded and zeroized on
-   drop. Password/passphrase bytes only go to the SSH authentication adapter.
+1. `ProfileStore::open(root)` and `initialize(native_mode)` when absent, then
+   `migrate()`. Schema 1 is validated under the stable profile lock, copied to a
+   restricted `connections.v1.backup.toml`, validated, and replaced as schema 2.
+   The backup must match if already present; mismatch stops migration. IDs,
+   labels, targets, ciphertext and references are preserved. The revision advances
+   once. No network connection, credential lookup, or command replay occurs.
+2. Schema 2 stores `credential_policy = "ask_on_connect" | "system_secure"`
+   per connection. The retained file-level storage field is legacy backend
+   provenance, never a global policy switch. The host uses its current native
+   DPAPI/Secret Service adapter regardless of a legacy `session_only` setting.
+   Mixed policies coexist. Cross-platform protected descriptors remain intact;
+   only an explicit replacement/clear changes the selected profile.
+3. `save` accepts `CredentialChange::{Keep,Clear,Set}`. Metadata edits preserve
+   stored credentials. Keep cannot silently reuse a secret after host, port,
+   username, authentication method or private-key path changes. Set writes a new
+   protected item before committing its reference; Clear removes only that
+   profile's current reference. Orphan cleanup is deferred because protected
+   backups and uncertain commits may still reference an item. Delete likewise
+   removes only metadata/current references, never key files, trust or history.
+   Failed/uncertain writes must be reread, never automatically retried.
+   Authentication accepts an optional one-attempt value tied to exact profile ID
+   and revision; it bypasses an unavailable provider without changing any stored
+   reference. The host neither caches it nor returns it in status. New encrypted
+   private-key attempts preflight the private file and prompt only when required.
+   Old global-downgrade IPC is retired and cannot mutate any profile.
 4. `KnownHostsStore::check(host,port,fingerprint)` returns Trusted or a single-use
    exact-target challenge, with prior fingerprint for changed keys. Only the
    dedicated user trust-confirmation path calls `accept_from_trust_ui`. Neither
@@ -64,7 +77,7 @@ or sudden power loss.
 
 The storage tests cover strict/unknown schema fields, platform mismatch,
 profile/purpose and task ownership binding, bounded input, no-secret listings,
-session lifetime, task snapshots, final-dispatch guards, native backend absence,
+single-attempt credential lifetime, versioned migration/backup failure and concurrent migration, mixed policies, identity-change rejection, task snapshots, final-dispatch guards, native backend absence,
 permissions/links, host trust and separate-process revision conflicts. Windows
 private-file adapter tests additionally cover ACLs, rename failures/uncertain
 commit, pinned directory handles and stable locks.
@@ -89,9 +102,9 @@ cancel prompts still need dedicated isolated fault-provider runtime coverage.
 
 SQLite reviewed-chat persistence is integrated separately in `history`/`persistence`.
 The host selects APPDATA or XDG_CONFIG_HOME/HOME platform configuration roots;
-history uses LOCALAPPDATA or XDG_STATE_HOME/HOME state roots. Credential-mode
-migration supports explicit whole-file downgrade to session-only, never automatic
-fallback or per-profile mixing. A user-confirmed single-line task-secret input
+history uses LOCALAPPDATA or XDG_STATE_HOME/HOME state roots. Credential migration preserves the protected legacy backup and supports
+per-profile recovery from old session-only metadata. There is no global downgrade
+or plaintext fallback. A user-confirmed single-line task-secret input
 adapter is integrated via `task_secrets` and the existing one-time execution gate;
 unknown contexts remain manual, and the user must verify the live target prompt.
 Normal-exit history flush is best effort; abrupt termination can lose uncommitted

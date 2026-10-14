@@ -25,16 +25,16 @@ class NativeVersionPhaseTests(unittest.TestCase):
             native.verify_phase_version("preserved", "0.1.1", "other-hash", expected)
 
     def test_upgrade_requires_exact_old_version_and_replaced_executable(self):
-        expected = {"application_version": "0.1.0", "application_sha256": "old-hash"}
-        native.verify_phase_version("upgrade", "0.1.1", "new-hash", expected)
-        for version, digest, record in [("0.1.0", "new-hash", expected), ("0.1.1", "old-hash", expected),
-                ("0.1.2", "new-hash", expected), ("0.1.1", "new-hash", None),
-                ("0.1.1", "new-hash", {"application_version": "0.0.9", "application_sha256": "old-hash"})]:
+        expected = {"application_version": "0.1.1", "application_sha256": "old-hash"}
+        native.verify_phase_version("upgrade", "0.1.2", "new-hash", expected)
+        for version, digest, record in [("0.1.1", "new-hash", expected), ("0.1.2", "old-hash", expected),
+                ("0.1.3", "new-hash", expected), ("0.1.2", "new-hash", None),
+                ("0.1.2", "new-hash", {"application_version": "0.1.0", "application_sha256": "old-hash"})]:
             with self.assertRaises(ValueError):
                 native.verify_phase_version("upgrade", version, digest, record)
 
     def test_invalid_version_or_phase_rejected(self):
-        for phase, version in [("seed", "latest"), ("seed", "0.1.1\\nextra"), ("other", "0.1.1")]:
+        for phase, version in [("seed", "latest"), ("seed", "0.1.1\\nextra"), ("seed", "0.1.3"), ("other", "0.1.1")]:
             with self.assertRaises(ValueError):
                 native.verify_phase_version(phase, version, "hash", None)
 
@@ -251,7 +251,7 @@ class WebDriverTransportTests(unittest.TestCase):
 class NativeHelperTests(unittest.TestCase):
     def setUp(self):
         self.server = native.http.server.ThreadingHTTPServer(("127.0.0.1", 0), native.ModelFixture)
-        self.server.requests, self.server.invalid_requests = [], 0
+        self.server.requests, self.server.test_requests, self.server.invalid_requests = [], [], 0
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -278,6 +278,16 @@ class NativeHelperTests(unittest.TestCase):
         self.assertEqual(len(self.server.requests), 1)
         self.assertEqual(self.server.invalid_requests, 0)
 
+    def test_minimal_settings_probe_is_separate_and_has_no_history(self):
+        body = {"model": "native-fixture-model", "stream": True,
+                "messages": [{"role": "user", "content": "Reply with OK."}]}
+        self.assertIn('"content": "OK"', self.post(body))
+        self.assertEqual(len(self.server.test_requests), 1)
+        self.assertEqual(self.server.requests, [])
+        body["messages"].insert(0, {"role": "system", "content": "unexpected history"})
+        with self.assertRaises(urllib.error.HTTPError):
+            self.post(body)
+
     def test_fixture_rejects_unexpected_auth(self):
         with self.assertRaises(urllib.error.HTTPError):
             self.post(token="wrong-synthetic-token")
@@ -303,6 +313,40 @@ class NativeHelperTests(unittest.TestCase):
                 connection.execute("INSERT INTO chats VALUES (?,?,?)", ("chat-b", "task-b", native.PROMPT + native.REPLY))
             with self.assertRaises(AssertionError):
                 native.stored_identity(root)
+
+    def test_upgrade_compares_old_history_rows_not_database_file_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with sqlite3.connect(root / "history.sqlite3") as connection:
+                connection.execute("CREATE TABLE chats (chat_id TEXT,task_id TEXT,revision INTEGER,listed INTEGER,updated_ms INTEGER,payload TEXT)")
+                connection.execute("INSERT INTO chats VALUES ('old-chat','old-task',3,1,12,'synthetic')")
+                connection.execute("PRAGMA user_version=1")
+            _, rows = native.history_rows(root)
+            with sqlite3.connect(root / "history.sqlite3") as connection:
+                connection.execute("PRAGMA user_version=2")
+                connection.execute("INSERT INTO chats VALUES ('new-empty-chat','new-task',4,1,13,'empty')")
+            native.verify_history_upgrade(root, rows)
+            with sqlite3.connect(root / "history.sqlite3") as connection:
+                connection.execute("UPDATE chats SET payload='changed' WHERE chat_id='old-chat'")
+            with self.assertRaisesRegex(AssertionError, "preexisting history row"):
+                native.verify_history_upgrade(root, rows)
+
+    @unittest.skipIf(native.os.name == "nt", "Unix permission fixture")
+    def test_profile_backup_requires_exact_bytes_and_owner_only_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            backup = root / "connections.v1.backup.toml"
+            backup.write_bytes(b"synthetic-v1-profile")
+            backup.chmod(0o600)
+            digest = native.hashlib.sha256(backup.read_bytes()).hexdigest()
+            native.verify_profile_backup(root, digest)
+            backup.chmod(0o644)
+            with self.assertRaisesRegex(AssertionError, "owner-only"):
+                native.verify_profile_backup(root, digest)
+            backup.chmod(0o600)
+            backup.write_bytes(b"changed")
+            with self.assertRaisesRegex(AssertionError, "baseline bytes"):
+                native.verify_profile_backup(root, digest)
 
     def test_wait_is_bounded_and_retries_transient_errors(self):
         values = iter([False, True])

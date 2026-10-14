@@ -4,19 +4,21 @@ import userEvent from '@testing-library/user-event';
 import { ShellLogDialog } from './ShellLogDialog';
 import { shellLogBridge } from '../lib/shellLogBridge';
 import type { ShellLogEntry, ShellLogPage, ShellLogStatus } from '../lib/shellLogBridge';
+import type { IntegrationStatus } from '../lib/integrationBridge';
 import type { SessionSnapshot } from '../lib/types';
 vi.mock('../lib/shellLogBridge', () => ({ shellLogBridge: { status: vi.fn(), start: vi.fn(), pause: vi.fn(), query: vi.fn(), export: vi.fn(), listen: vi.fn() } }));
 const session = { session_id: 's', generation: '1' };
 const snapshot: SessionSnapshot = { state: 'connected', session };
+const integration: IntegrationStatus = { session, phase: 'ready', sequence: 0, revision: 1, shadowed_commands: [] };
 const status: ShellLogStatus = { enabled: false, available: true, plaintext: true, revision: '1', state: 'disabled', session: null, reason: null, error: null };
 const page: ShellLogPage = { entries: [], next_before_seq: null, snapshot_max_seq: '90071992547409999' };
 const entry: ShellLogEntry = { id: 'e', sequence: '20', session_id: 's', generation: '1', shell_id: 'sh', shell_sequence: '1', host: 'host', port: 22, username: 'user', started_at_ms: 1, finished_at_ms: null, remote_started_at: '1700', command: '<img src=x onerror=alert(1)>\n=SUM(1)', cwd: '/a b', status: 'running', exit_code: null, redacted: false };
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
-const open = () => render(<ShellLogDialog native snapshot={snapshot} onClose={vi.fn()} />);
+const open = () => render(<ShellLogDialog native snapshot={snapshot} integration={integration} onClose={vi.fn()} />);
 async function consent() { await waitFor(() => expect((screen.getAllByRole('checkbox')[0] as HTMLInputElement).disabled).toBe(false)); for (const checkbox of screen.getAllByRole('checkbox')) fireEvent.click(checkbox); }
 describe('independent shell log dialog', () => {
   beforeEach(() => { vi.resetAllMocks(); vi.mocked(shellLogBridge.status).mockResolvedValue(status); vi.mocked(shellLogBridge.listen).mockResolvedValue(vi.fn()); vi.mocked(shellLogBridge.query).mockResolvedValue(page); });
-  it('requires both explicit confirmations and prevents duplicate start clicks without a model', async () => {
+  it('requires verified readiness and explicit plaintext consent while preventing duplicate start clicks', async () => {
     const pending = deferred<ShellLogStatus>(); vi.mocked(shellLogBridge.start).mockReturnValue(pending.promise);
     open(); await consent(); const button = screen.getByRole('button', { name: '启动终端日志' });
     fireEvent.click(button); fireEvent.click(button); expect(shellLogBridge.start).toHaveBeenCalledExactlyOnceWith(session);
@@ -98,7 +100,7 @@ describe('independent shell log dialog', () => {
   });
   it('requires SSH reconnection after the integrated shell exits on the same generation', async () => {
     vi.mocked(shellLogBridge.status).mockResolvedValue({ ...status, state: 'disconnected', session });
-    open(); await screen.findByText(/日志子 shell 已退出/);
+    open(); await screen.findByText(/命令状态识别已断开/);
     expect((screen.getByRole('button', { name: '启动终端日志' }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getAllByRole('checkbox')[0] as HTMLInputElement).disabled).toBe(true); expect(shellLogBridge.start).not.toHaveBeenCalled();
   });
@@ -106,5 +108,78 @@ describe('independent shell log dialog', () => {
     render(<ShellLogDialog native={false} snapshot={snapshot} onClose={vi.fn()} />);
     for (const method of Object.values(shellLogBridge)) expect(method).not.toHaveBeenCalled();
     expect((screen.getByRole('button', { name: '启动终端日志' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe('v0.1.2 log ranges and nonmodal access', () => {
+  beforeEach(() => { vi.resetAllMocks(); vi.mocked(shellLogBridge.status).mockResolvedValue(status); vi.mocked(shellLogBridge.listen).mockResolvedValue(vi.fn()); vi.mocked(shellLogBridge.query).mockResolvedValue(page); });
+  it('opens the current session range and exports its whole fixed snapshot', async () => {
+    vi.mocked(shellLogBridge.export).mockResolvedValue({ path: '/private/current.json', records: 91, bytes: 900, format: 'json' });
+    render(<ShellLogDialog native snapshot={snapshot} initialScope={{kind:'current'}} onClose={vi.fn()} />);
+    await screen.findByText('当前筛选下暂无日志。');
+    expect(shellLogBridge.query).toHaveBeenCalledExactlyOnceWith({limit:50,session_id:'s'});
+    fireEvent.click(screen.getByRole('button',{name:'导出 JSON'}));
+    await waitFor(() => expect(shellLogBridge.export).toHaveBeenCalledWith({limit:null,session_id:'s',snapshot_max_seq:page.snapshot_max_seq,before_seq:null},'json'));
+    expect(shellLogBridge.start).not.toHaveBeenCalled();
+  });
+  it('opens saved profile logs offline without inferring old row association', async () => {
+    vi.mocked(shellLogBridge.query).mockResolvedValue({...page,entries:[entry]});
+    render(<ShellLogDialog native snapshot={{state:'disconnected',session:null}} initialScope={{kind:'profile',id:'profile-uuid',label:'Renamed label'}} onClose={vi.fn()} />);
+    await screen.findByText(/档案关联未知/);
+    expect(shellLogBridge.query).toHaveBeenCalledExactlyOnceWith({limit:50,profile_id:'profile-uuid'});
+    expect(screen.getByText(/user@host:22/)).toBeDefined();
+    expect(screen.getByLabelText('当前日志范围').textContent).toContain('Renamed label');
+    expect(shellLogBridge.start).not.toHaveBeenCalled();
+  });
+  it('scope switching never changes capture and exposes server filters for old records', async () => {
+    render(<ShellLogDialog native snapshot={snapshot} initialScope={{kind:'profile',id:'p',label:'Connection'}} onClose={vi.fn()} />);
+    await screen.findByText('当前筛选下暂无日志。');
+    fireEvent.change(screen.getByRole('combobox',{name:'日志查看范围'}),{target:{value:'all'}});
+    fireEvent.change(screen.getByRole('textbox',{name:'日志原主机'}),{target:{value:'old.host'}});
+    fireEvent.change(screen.getByRole('textbox',{name:'日志原账号'}),{target:{value:'root'}});
+    fireEvent.click(screen.getByRole('button',{name:'筛选 / 刷新'}));
+    await waitFor(() => expect(shellLogBridge.query).toHaveBeenLastCalledWith({limit:50,contains:null,host:'old.host',username:'root'}));
+    expect(shellLogBridge.start).not.toHaveBeenCalled(); expect(shellLogBridge.pause).not.toHaveBeenCalled();
+  });
+  it('does not silently query all records when no current session exists', () => {
+    render(<ShellLogDialog native snapshot={{state:'disconnected',session:null}} initialScope={{kind:'current'}} onClose={vi.fn()} />);
+    expect(shellLogBridge.query).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('当前日志范围').textContent).toContain('尚无会话');
+  });
+  it('never traps or steals terminal focus when status or results update', async () => {
+    const outside=document.createElement('button'); outside.textContent='Terminal focus';document.body.append(outside);outside.focus();
+    const view=render(<ShellLogDialog native snapshot={snapshot} onClose={vi.fn()} />);
+    await screen.findByText('当前筛选下暂无日志。');
+    expect(screen.getByRole('dialog').getAttribute('aria-modal')).toBe('false');
+    expect(document.activeElement).toBe(outside);
+    fireEvent.keyDown(screen.getByRole('button',{name:'下一页'}),{key:'Tab'});
+    expect(document.activeElement).toBe(outside);
+    view.unmount();outside.remove();
+  });
+});
+
+describe('log startup requires independent command recognition', () => {
+  beforeEach(() => { vi.resetAllMocks(); vi.mocked(shellLogBridge.status).mockResolvedValue(status); vi.mocked(shellLogBridge.listen).mockResolvedValue(vi.fn()); vi.mocked(shellLogBridge.query).mockResolvedValue(page); });
+  it('blocks an unintegrated or wrong-session start without invoking native startup', async () => {
+    const view=render(<ShellLogDialog native snapshot={snapshot} integration={{...integration,phase:'unintegrated'}} onClose={vi.fn()}/>);
+    await screen.findByText(/请先通过工具栏/);
+    expect(screen.getAllByRole('checkbox')).toHaveLength(1);
+    expect((screen.getByRole('checkbox') as HTMLInputElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button',{name:'启动终端日志'}));expect(shellLogBridge.start).not.toHaveBeenCalled();
+    view.rerender(<ShellLogDialog native snapshot={snapshot} integration={{...integration,session:{session_id:'other',generation:'2'}}} onClose={vi.fn()}/>);
+    expect((screen.getByRole('button',{name:'启动终端日志'}) as HTMLButtonElement).disabled).toBe(true);
+    view.rerender(<ShellLogDialog native snapshot={snapshot} integration={integration} onClose={vi.fn()}/>);
+    expect((screen.getByRole('checkbox') as HTMLInputElement).disabled).toBe(false);
+    expect((screen.getByRole('button',{name:'启动终端日志'}) as HTMLButtonElement).disabled).toBe(true);
+    expect(shellLogBridge.start).not.toHaveBeenCalled();
+  });
+  it('a native readiness preflight rejection clears consent without latching an uncertain write or retrying', async () => {
+    vi.mocked(shellLogBridge.start).mockRejectedValue({code:'SHELL_NOT_READY',safe_message:'Terminal is no longer ready.'});
+    open();await consent();fireEvent.click(screen.getByRole('button',{name:'启动终端日志'}));
+    await screen.findByText('Terminal is no longer ready.');
+    expect(screen.queryByText(/启动结果不确定/)).toBeNull();
+    expect((screen.getByRole('checkbox') as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByRole('checkbox') as HTMLInputElement).disabled).toBe(false);
+    expect(shellLogBridge.start).toHaveBeenCalledOnce();
   });
 });

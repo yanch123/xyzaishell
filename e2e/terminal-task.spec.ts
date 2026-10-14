@@ -29,6 +29,10 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
         if (cmd === 'plugin:event|unlisten') { unlisten(String(args.event), Number(args.eventId)); return; }
         if (cmd === 'get_session_snapshot') return { session, state: 'connected', revision: '1', host: 'synthetic-server.invalid', username: 'synthetic-user', port: 22 };
         if (cmd === 'resize_terminal' || cmd === 'ack_terminal_output' || cmd === 'send_user_input') return;
+        if (cmd === 'get_window_launch_target') return { profile_id: null, new_connection: false };
+        if (cmd === 'get_history_status') return { enabled: false, manageable: false, available: true, plaintext: true, revision: '1', error: null };
+        if (cmd === 'get_shell_integration_status') return { session, phase: 'ready', shell_id: 'synthetic-shell', revision: 1, sequence: 0, shadowed_commands: [] };
+        if (cmd === 'create_chat') return structuredClone(chat);
         if (cmd === 'get_model_config_status') return structuredClone(config);
         if (cmd === 'list_chats') return [structuredClone(chat)];
         if (cmd === 'get_chat') return structuredClone(chat);
@@ -68,6 +72,7 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
     };
   });
   await page.goto('/');
+  await expect(page.getByRole('button', { name: '命令识别已就绪', exact: true })).toBeVisible();
   await page.getByRole('tab', { name: '执行终端任务' }).click();
   await page.getByRole('textbox', { name: '终端任务指令' }).fill('执行合成检查任务，不连接真实服务器。');
   await page.getByRole('button', { name: '核对并开始执行' }).click();
@@ -75,8 +80,10 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
   await expect(dialog.getByText('https://provider.example.invalid/v1/chat/completions')).toBeVisible();
   const launch = dialog.getByRole('button', { name: '同意并开始本次任务' });
   await expect(launch).toBeDisabled();
-  await dialog.getByRole('checkbox').nth(0).check(); await expect(launch).toBeDisabled();
-  await dialog.getByRole('checkbox').nth(1).check();
+  await expect(dialog.getByRole('checkbox')).toHaveCount(1);
+  await expect(dialog.getByText('命令状态识别已确认当前终端可接收命令。执行期间请避免手动输入与 AI 输入冲突。')).toBeVisible();
+  await dialog.getByRole('checkbox').check();
+  await expect(launch).toBeEnabled();
   await page.screenshot({ path: testInfo.outputPath('synthetic-task-consent.png'), fullPage: true });
   await launch.click(); await expect(dialog).toBeHidden();
   const card = page.getByRole('group', { name: '精确终端命令' });

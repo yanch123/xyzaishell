@@ -8,7 +8,9 @@
 # Dependencies: sshd, ssh-keygen, Python 3, setsid, Rust/Cargo. Installation is
 # deliberately outside this script. Never run --disposable-user on a real host.
 # Unprivileged mode also needs usable /dev/pts and an unlocked current account;
-# restricted containers may authenticate but refuse OS PTY allocation. That is
+# Current-shell integration acceptance specifically needs Bash 5.1/5.2; other shells
+# remain manual-only in the application. Disposable CI creates a Bash account.
+# Restricted containers may authenticate but refuse OS PTY allocation. That is
 # a failure, not a skip. Its shell uses the current account's normal login setup.
 set -euo pipefail
 umask 077
@@ -100,6 +102,17 @@ mkdir "$fixture/client" "$fixture/server"
 ssh-keygen -q -t ed25519 -N '' -C 'xyzaishell-ephemeral-client' -f "$fixture/client/key"
 ssh-keygen -q -t ed25519 -N '' -C 'xyzaishell-ephemeral-host' -f "$fixture/server/host_key"
 username=$(id -un)
+if [[ "$mode" == --current-user ]]; then
+  login_shell=$(getent passwd "$username" | cut -d: -f7)
+  [[ "$login_shell" == /bin/bash || "$login_shell" == /usr/bin/bash ]] || {
+    echo 'Current-shell acceptance requires the current account to use Bash 5.1/5.2; no login-shell setting will be changed.' >&2
+    exit 1
+  }
+fi
+/bin/bash -c '[[ ${BASH_VERSINFO[0]} == 5 && ( ${BASH_VERSINFO[1]} == 1 || ${BASH_VERSINFO[1]} == 2 ) ]]' || {
+  echo 'Current-shell acceptance requires Bash 5.1/5.2; unsupported shells are manual-only and are not a passing integration test.' >&2
+  exit 1
+}
 authorized_keys="$fixture/client/authorized_keys"
 cp "$fixture/client/key.pub" "$authorized_keys"
 if [[ "$mode" == --disposable-user ]]; then
@@ -110,7 +123,7 @@ if [[ "$mode" == --disposable-user ]]; then
   # to /etc/default/useradd and is not a valid --key login.defs override.
   "${as_root[@]}" useradd --system --no-log-init --no-create-home --no-user-group \
     --home-dir "$fixture/home" \
-    --shell /bin/sh --password '*' "$username"
+    --shell /bin/bash --password '*' "$username"
   fixture_user=$username
   fixture_uid=$(id -u "$username")
   "${as_root[@]}" install -d -m 700 -o "$fixture_uid" "$fixture/home" "$fixture/home/.ssh"

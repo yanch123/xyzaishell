@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-test('browser preview: split layout, honest capabilities, isolated drafts and modal focus', async ({ page }, testInfo) => {
+test('browser preview: split layout, honest capabilities, isolated drafts and nonmodal settings', async ({ page }, testInfo) => {
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
@@ -27,17 +27,20 @@ test('browser preview: split layout, honest capabilities, isolated drafts and mo
   await page.getByRole('button', { name: '打开设置', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '工作空间设置' });
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole('button', { name: '重新加载模型配置' })).toBeDisabled();
-  await expect(dialog.getByText(/请勿把 API Key、SSH 密码/)).toBeVisible();
-  const close = dialog.getByRole('button', { name: '关闭对话框', exact: true });
-  await expect(close).toBeFocused();
-  await close.press('Shift+Tab');
-  await expect(dialog.getByRole('button', { name: '关闭设置', exact: true })).toBeFocused();
-  await page.keyboard.press('Tab'); await expect(close).toBeFocused();
+  await expect(dialog).toHaveAttribute('aria-modal', 'false');
+  await expect(dialog.getByLabel('Base URL', { exact: false })).toBeDisabled();
+  await expect(dialog.getByRole('button', { name: '保存', exact: true })).toBeDisabled();
+  expect(await page.locator('.app-shell').evaluate(element => element.hasAttribute('inert'))).toBe(false);
+  await expect(page.locator('.modal-backdrop')).toHaveCount(0);
+  await page.getByRole('button', { name: '打开设置', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: '工作空间设置' })).toHaveCount(1);
   await page.screenshot({ path: testInfo.outputPath('browser-preview-settings.png'), fullPage: true });
-  await page.keyboard.press('Escape');
+  await dialog.getByRole('button', { name: '关闭设置', exact: true }).click();
   await expect(dialog).toBeHidden();
-  await expect(page.getByRole('button', { name: '打开设置', exact: true })).toBeFocused();
+  await page.getByRole('button', { name: '打开设置', exact: true }).click();
+  await dialog.getByRole('button', { name: '通用', exact: true }).click();
+  await dialog.getByRole('button', { name: '通用', exact: true }).press('Escape');
+  await expect(dialog).toBeHidden();
   expect(errors).toEqual([]);
 });
 
@@ -65,6 +68,9 @@ test('synthetic IPC mock: explicit recipient consent and escaped streamed text',
         if (cmd === 'plugin:event|listen') { const name = String(args.event); if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name)!.add(Number(args.handler)); return args.handler; }
         if (cmd === 'plugin:event|unlisten') { unlisten(String(args.event), Number(args.eventId)); return; }
         if (cmd === 'get_session_snapshot') return { session: null, state: 'disconnected', revision: '1' };
+        if (cmd === 'get_window_launch_target') return { profile_id: null, new_connection: false };
+        if (cmd === 'get_history_status') return { enabled: false, manageable: false, available: true, plaintext: true, revision: '1', error: null };
+        if (cmd === 'list_terminal_tasks') return [];
         if (cmd === 'get_model_config_status') return structuredClone(config);
         if (cmd === 'list_chats') return [structuredClone(chat)];
         if (cmd === 'get_chat') return structuredClone(chat);

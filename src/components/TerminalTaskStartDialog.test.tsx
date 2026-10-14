@@ -23,7 +23,7 @@ describe('terminal task consent and readiness', () => {
     const view = render(<TerminalTaskStartDialog {...props} onConfirm={onConfirm} onClose={vi.fn()} />);
     for (const box of screen.getAllByRole('checkbox')) await user.click(box);
     view.rerender(<TerminalTaskStartDialog {...props} changed onConfirm={onConfirm} onClose={vi.fn()} />);
-    expect(screen.getByRole('alert').textContent).toContain('模型配置或 SSH 连接已变化');
+    expect(screen.getByRole('alert').textContent).toContain('模型配置、SSH 连接或终端就绪状态已变化');
     await user.click(screen.getByRole('button', { name: '同意并开始本次任务' }));
     expect(onConfirm).not.toHaveBeenCalled();
   });
@@ -34,4 +34,13 @@ describe('terminal task consent and readiness', () => {
     view.rerender(<TerminalTaskStartDialog {...props} busy onConfirm={confirm} onClose={close} />);
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' }); expect(close).toHaveBeenCalledOnce(); expect(confirm).not.toHaveBeenCalled();
   });
+});
+
+it('uses verified current-shell readiness without repeating the per-task idle checkbox', () => {
+  const confirm=vi.fn();const view=render(<TerminalTaskStartDialog {...props} integrationReady onConfirm={confirm} onClose={vi.fn()}/>);
+  expect(screen.getAllByRole('checkbox')).toHaveLength(1);
+  fireEvent.click(screen.getByRole('checkbox'));
+  expect((screen.getByRole('button',{name:'同意并开始本次任务'}) as HTMLButtonElement).disabled).toBe(false);
+  view.rerender(<TerminalTaskStartDialog {...props} integrationReady changed onConfirm={confirm} onClose={vi.fn()}/>);
+  fireEvent.click(screen.getByRole('button',{name:'同意并开始本次任务'}));expect(confirm).not.toHaveBeenCalled();
 });

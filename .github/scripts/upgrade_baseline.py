@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
-"""Fetch/verify the immutable v0.1.0 upgrade baseline; never install or publish."""
+"""Fetch/verify the digest-pinned public v0.1.1 prerelease upgrade baseline; never install or publish."""
 import argparse
 from pathlib import Path
 import urllib.request
 
 import artifacts
 
-BASE_VERSION = "0.1.0"
-TARGET_VERSION = "0.1.1"
-BASE_COMMIT = "73c040217d27c002201a8ed593511d198af2dc0e"
-BASE_RUN = "38545541374"
-RELEASE_URL = "https://github.com/yanch123/xyzaishell/releases/download/v0.1.0/"
-# Downloaded and independently verified from the actual public Release, not an
-# earlier candidate artifact. Changing the baseline requires a reviewed update.
+BASE_VERSION = "0.1.1"
+TARGET_VERSION = "0.1.2"
+BASE_COMMIT = "18eba0cf02a2c265862e957ba86f1cb24e4bedde"
+BASE_RUN = "38561359264"
+RELEASE_URL = "https://github.com/yanch123/xyzaishell/releases/download/v0.1.1/"
+# Public prerelease v0.1.1 (release 412688104), reverified against the GitHub
+# release/tag API on 2026-10-14. All asset sizes/SHA256 match the public release.
+# Installed binary hashes match the exact-source native acceptance runs; the
+# Linux hash also matches an independently extracted DEB. The upstream release
+# is not immutable: these fail-closed pins, not the tag alone, bind the baseline.
+# Changing the baseline requires a reviewed update.
 PINS = {
     "linux-x64": {
-        "package": ("xyzaishell-0.1.0-linux-x64.deb", 11470160, "ee4adf0c58deaf6da45d3598786e3bffb876e600e9148242777c41bba62b98e3"),
-        "manifest": ("build-linux-x64.json", 1107, "4093b34c9698fa92b3c7f54b4474f4c3be1a296ce11a99eeb267d2189f4f5c87"),
-        "application_sha256": "0781bb5ac16896e629c9040e1db26e0042c3b9a59f8516d6173ef4536f42094a",
+        "package": ("xyzaishell-0.1.1-linux-x64.deb", 11674174, "801bcd2690531f5e97e6e7d0b4942bf47e003e6e74aaea0b410c8d349fa34d2f"),
+        "manifest": ("build-linux-x64.json", 1107, "b0e28f5ce58a6fac050c0d1db816edec08e949f437f9055a97ecbfbb953facc0"),
+        "application_sha256": "c791c94868c68ff280a279170c3ec70a0e352a152d727e638b40f78b330e931b",
     },
     "windows-x64": {
-        "package": ("xyzaishell-0.1.0-windows-x64.exe", 6265736, "e3198880b99aa7666558be7ca5a3902ea6087461fa99378678252b21a4f591e3"),
-        "manifest": ("build-windows-x64.json", 1132, "49fa0981c104db6cad49ec12e6baec1d646bbc0f47faa3e12bfd9b3f98392e4b"),
-        "application_sha256": "943a29f9b4bea87e9bc61613d47acb23fd76bcbf4fe08b11ccd724177fafda73",
+        "package": ("xyzaishell-0.1.1-windows-x64.exe", 6410915, "4b184c98334be48fe8018087c6fe579cea9cfaac905285fc74030579034e7ed7"),
+        "manifest": ("build-windows-x64.json", 1132, "052fd6f450cc08190c27444298163c762e3a56a5fb399c19ce2dbabf5521d5e1"),
+        "application_sha256": "369b98e1fab0c1ff8b3d8cea88224249b121914945f65dc21cdf19f50817f013",
     },
 }
 
@@ -63,7 +67,7 @@ def verify(directory, platform, target_version, application=None):
     if application is not None:
         application = Path(application)
         require(application.is_file() and not application.is_symlink()
-                and artifacts.sha256(application) == pins["application_sha256"], "Installed baseline executable differs from verified v0.1.0")
+                and artifacts.sha256(application) == pins["application_sha256"], "Installed baseline executable differs from verified v0.1.1")
     return directory / pins["package"][0]
 
 

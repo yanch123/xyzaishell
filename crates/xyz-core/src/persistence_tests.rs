@@ -28,6 +28,8 @@ fn id() -> String {
 }
 fn snapshot() -> ChatSnapshot {
     ChatSnapshot {
+        source: None,
+        restored_read_only: false,
         chat_id: id(),
         task_id: id(),
         title: "Synthetic task".into(),
@@ -1215,4 +1217,93 @@ fn late_counter_corruption_cannot_erase_revision_history() {
         .query_row("SELECT count(*) FROM chats", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[test]
+fn source_is_redacted_preserved_and_restore_is_read_only() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let mut source = snapshot();
+    source.source = Some(ChatSource {
+        host: "host-synthetic-source-secret".into(),
+        port: 22,
+        username: "user-synthetic-source-secret".into(),
+        session_id: id(),
+        generation: "3".into(),
+    });
+    let prepared = RedactedChat::from_snapshot(&source, |text| {
+        text.replace("synthetic-source-secret", "[redacted]")
+    })
+    .unwrap();
+    let saved = store.create(&prepared).unwrap();
+    let restored = saved.to_snapshot();
+    assert!(restored.restored_read_only);
+    assert_eq!(restored.source.as_ref().unwrap().generation, "3");
+    assert_eq!(restored.source.as_ref().unwrap().host, "host-[redacted]");
+    assert_eq!(
+        restored.source.as_ref().unwrap().username,
+        "user-[redacted]"
+    );
+    assert!(
+        !String::from_utf8_lossy(&fs::read(fixture.database()).unwrap())
+            .contains("synthetic-source-secret")
+    );
+    source.source.as_mut().unwrap().session_id = "not-an-authenticated-session-id".into();
+    assert!(RedactedChat::from_snapshot(&source, str::to_owned).is_err());
+}
+
+#[test]
+fn version_one_archive_migrates_without_inventing_chat_source() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let source = snapshot();
+    let saved = store
+        .create(&RedactedChat::from_snapshot(&source, str::to_owned).unwrap())
+        .unwrap();
+    store
+        .connection
+        .pragma_update(None, "user_version", 1)
+        .unwrap();
+    drop(store);
+    let migrated = fixture.open();
+    let version: i64 = migrated
+        .connection
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    let restored = migrated.read(&saved.chat.chat_id).unwrap().to_snapshot();
+    assert!(restored.source.is_none());
+    assert!(restored.restored_read_only);
+    assert_eq!(restored.chat_id, source.chat_id);
+}
+
+#[test]
+fn legacy_archive_with_unknown_payload_fields_is_not_upgraded() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let source = snapshot();
+    store
+        .create(&RedactedChat::from_snapshot(&source, str::to_owned).unwrap())
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE chats SET payload=json_set(payload,'$.future_field',1)",
+            [],
+        )
+        .unwrap();
+    store
+        .connection
+        .pragma_update(None, "user_version", 1)
+        .unwrap();
+    drop(store);
+    let bytes = fs::read(fixture.database()).unwrap();
+    assert_eq!(
+        error(HistoryStore::open(
+            &fixture.path,
+            HistoryPreference::SaveRedactedText
+        )),
+        HistoryError::UnsupportedSchema
+    );
+    assert_eq!(fs::read(fixture.database()).unwrap(), bytes);
 }

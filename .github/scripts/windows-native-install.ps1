@@ -96,11 +96,11 @@ try {
         $baseline = & python (Join-Path $repo '.github/scripts/upgrade_baseline.py') verify --platform windows-x64 --directory $env:UPGRADE_BASELINE_DIR
         if ($LASTEXITCODE -ne 0 -or @($baseline).Count -ne 1) { throw 'Pinned upgrade baseline verification failed' }
         Invoke-Installer $baseline "/S /D=$install"
-        Assert-InstalledVersion '0.1.0'
+        Assert-InstalledVersion '0.1.1'
         & python (Join-Path $repo '.github/scripts/upgrade_baseline.py') verify --platform windows-x64 --directory $env:UPGRADE_BASELINE_DIR --application $application
-        if ($LASTEXITCODE -ne 0) { throw 'Installed baseline executable is not the verified v0.1.0' }
+        if ($LASTEXITCODE -ne 0) { throw 'Installed baseline executable is not the verified v0.1.1' }
         & (Join-Path $repo '.github/scripts/install-webview-driver.ps1') -Evidence $evidence
-        Invoke-NativeUi 'seed' 'baseline-v0.1.0-install-and-restart' '0.1.0'
+        Invoke-NativeUi 'seed' 'baseline-v0.1.1-install-and-restart' '0.1.1'
         $beforeUpgrade = Get-ConfigFingerprint
     }
     # NSIS /D is last; no uninstall/data reset between the old and new installer.
@@ -119,7 +119,7 @@ try {
     # exact matching signed driver rather than assuming the runner has it.
     & (Join-Path $repo '.github/scripts/install-webview-driver.ps1') -Evidence $evidence
     if ($upgrade) {
-        Invoke-NativeUi 'upgrade' 'upgraded-v0.1.1' $candidateVersion
+        Invoke-NativeUi 'upgrade' 'upgraded-v0.1.2' $candidateVersion
     } else {
     Invoke-NativeUi 'seed' 'first-install-and-restart' $candidateVersion
     $before = Get-ConfigFingerprint
@@ -140,7 +140,7 @@ try {
     }
     $finalFingerprint = Get-ConfigFingerprint
     if ($upgrade) {
-        'PASS: pinned v0.1.0 installed and seeded through real UI; direct v0.1.1 upgrade retained profile/history hashes, text and stable IDs.' | Set-Content -LiteralPath (Join-Path $evidence 'result.txt') -Encoding utf8
+        'PASS: pinned v0.1.1 installed and seeded through real UI; direct v0.1.2 upgrade retained profile/history hashes, text and stable IDs.' | Set-Content -LiteralPath (Join-Path $evidence 'result.txt') -Encoding utf8
     } else {
     @(
         'PASS: actual NSIS install and native UI/IPC synthetic profile/chat persistence.'

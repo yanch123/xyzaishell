@@ -90,3 +90,25 @@ describe('M2 model chat UI', () => {
     expect(mocks.send).not.toHaveBeenCalled(); expect(mocks.list).not.toHaveBeenCalled();
   });
 });
+
+describe('v0.1.2 immutable chat provenance', () => {
+  it('shows restored source identity and keeps historical text read-only', async () => {
+    mocks.list.mockResolvedValue([{ ...chat(), source: { host: 'old.example', port: 2222, username: 'original', session_id: 'old-session', generation: '8' }, restored_read_only: true }]);
+    await ready();
+    expect(screen.getByLabelText('聊天来源').textContent).toContain('original@old.example:2222');
+    expect(screen.getByLabelText('聊天来源').textContent).toContain('old-session / 8');
+    expect(screen.getByLabelText('聊天来源').textContent).toContain('仅供阅读');
+    expect((screen.getByRole('textbox', {name:'聊天消息'}) as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByRole('button',{name:'发送'}) as HTMLButtonElement).disabled).toBe(true);
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('always separates the live target from a different chat source', async () => {
+    mocks.list.mockResolvedValue([{ ...chat(), source: { host: 'old.example', port: 22, username: 'old-user', session_id: 'old-session', generation: '1' } }]);
+    function TargetHarness() { const model=useModelChat(); return <ChatPane model={model} showHistory={false} onToggleHistory={vi.fn()} onSettings={vi.fn()} onConsent={consent} session={{state:'connected',session:{session_id:'new-session',generation:'2'},host:'current.example',port:22,username:'new-user'}}/>; }
+    render(<TargetHarness/>);
+    await waitFor(()=>expect(screen.getByLabelText('聊天来源').textContent).toContain('old-user@old.example:22'));
+    expect(screen.getByLabelText('当前 AI 执行目标').textContent).toContain('new-user@current.example:22');
+    expect(screen.getByLabelText('聊天来源').textContent).toContain('非当前目标');
+    expect((screen.getByRole('textbox',{name:'聊天消息'}) as HTMLTextAreaElement).disabled).toBe(true);
+  });
+});

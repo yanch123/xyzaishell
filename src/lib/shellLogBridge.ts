@@ -8,11 +8,12 @@ export type CaptureState = 'disabled' | 'starting' | 'recording' | 'paused' | 'g
 export type ExportFormat = 'json' | 'csv';
 export type ShellLogEntry = {
   id: string; sequence: string; session_id: string; generation: string; shell_id: string;
-  shell_sequence: string; host: string; port: number; username: string;
+  shell_sequence: string; profile_id?: string | null; host: string; port: number; username: string;
   started_at_ms: number; finished_at_ms: number | null; remote_started_at: string | null;
   command: string; cwd: string; status: CommandStatus; exit_code: number | null; redacted: boolean;
 };
 export type ShellLogQuery = {
+  profile_id?: string | null; host?: string | null; port?: number | null; username?: string | null;
   session_id?: string | null; from_ms?: number | null; to_ms?: number | null;
   contains?: string | null; before_seq?: string | null; snapshot_max_seq?: string | null; limit?: number | null;
 };
@@ -24,7 +25,7 @@ export type ShellLogStatus = {
 };
 export const shellLogBridge = {
   status: () => invoke<ShellLogStatus>('get_shell_log_status'),
-  start: (session: SessionRef) => invoke<ShellLogStatus>('start_shell_log', { session, consent: true, readinessConfirmed: true }),
+  start: (session: SessionRef) => invoke<ShellLogStatus>('start_shell_log', { session, consent: true }),
   pause: (paused: boolean) => invoke<ShellLogStatus>('set_shell_log_paused', { paused }),
   query: (query: ShellLogQuery) => invoke<ShellLogPage>('query_shell_log', { query }),
   export: (query: ShellLogQuery, format: ExportFormat) => invoke<ShellLogExport>('export_shell_log', { query, format }),

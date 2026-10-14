@@ -31,6 +31,7 @@ pub enum StorageError {
     CredentialAccessDenied,
     CredentialMissing,
     CredentialInvalid,
+    CredentialTargetChanged,
     SessionModeRequired,
     SessionCredentialUpdateRequired,
     TaskMismatch,

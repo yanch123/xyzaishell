@@ -346,6 +346,10 @@ impl Worker {
                     }
                     let mut chat = row.to_snapshot();
                     chat.title = self.redactor.redact_prose(&chat.title);
+                    if let Some(source) = &mut chat.source {
+                        source.host = self.redactor.redact_prose(&source.host);
+                        source.username = self.redactor.redact_prose(&source.username);
+                    }
                     for message in &mut chat.messages {
                         message.text = self.redactor.redact_prose(&message.text);
                     }

@@ -186,6 +186,8 @@ pub enum SessionState {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionSnapshot {
+    #[serde(default)]
+    pub profile_id: Option<String>,
     pub revision: String,
     pub session: Option<SessionRef>,
     pub state: SessionState,
@@ -233,6 +235,9 @@ pub struct WriteReceipt {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
+// Public event variants retain their stable Rust shape as well as JSON shape.
+// The bounded terminal-output window limits the dominant queued payload.
+#[allow(clippy::large_enum_variant)]
 pub enum SshEvent {
     #[serde(rename = "session.state")]
     State { snapshot: SessionSnapshot },
@@ -262,6 +267,7 @@ struct Inner {
     sink: EventSink,
     observation: crate::observation::ObservationBuffer,
     shell_log: Mutex<Option<crate::shell_log::ShellLogService>>,
+    shell_integration: crate::shell_integration::ShellIntegrationService,
     trust: Result<Option<Arc<crate::storage::trust::KnownHostsStore>>, ApiError>,
 }
 struct ManagerState {
@@ -281,7 +287,7 @@ struct LiveSession {
 }
 enum Command {
     AiWrite {
-        permit: crate::execution::DispatchPermit,
+        permit: Box<crate::execution::DispatchPermit>,
         reply: oneshot::Sender<Result<WriteReceipt, ApiError>>,
     },
     Write {
@@ -316,8 +322,10 @@ impl SessionManager {
                 trust,
                 observation: crate::observation::ObservationBuffer::default(),
                 shell_log: Mutex::new(None),
+                shell_integration: crate::shell_integration::ShellIntegrationService::new(),
                 state: Mutex::new(ManagerState {
                     snapshot: SessionSnapshot {
+                        profile_id: None,
                         revision: "0".into(),
                         session: None,
                         state: SessionState::Disconnected,
@@ -341,6 +349,7 @@ impl SessionManager {
     }
     /// Attach once during host initialization, before a connection is opened.
     pub fn attach_shell_log(&self, service: crate::shell_log::ShellLogService) {
+        self.inner.shell_integration.attach_log(service.clone());
         *self
             .inner
             .shell_log
@@ -353,6 +362,36 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+    pub fn shell_integration(&self) -> crate::shell_integration::ShellIntegrationService {
+        self.inner.shell_integration.clone()
+    }
+    pub async fn install_shell_integration(
+        &self,
+        session: &SessionRef,
+        readiness_confirmed: bool,
+    ) -> Result<crate::shell_integration::IntegrationStatus, ApiError> {
+        let snapshot = {
+            let state = self.lock();
+            require_connected(&state, session)?;
+            state.snapshot.clone()
+        };
+        if let Some(bootstrap) = self
+            .inner
+            .shell_integration
+            .confirm_install(snapshot, readiness_confirmed)?
+        {
+            if let Err(error) = self
+                .write(session, &STANDARD.encode(bootstrap.as_bytes()))
+                .await
+            {
+                self.inner
+                    .shell_integration
+                    .fail_install(session, error.clone());
+                return Err(error);
+            }
+        }
+        Ok(self.inner.shell_integration.status())
     }
     pub fn observation(&self) -> crate::observation::ObservationBuffer {
         self.inner.observation.clone()
@@ -386,6 +425,22 @@ impl SessionManager {
         }
     }
     pub fn connect(&self, request: ConnectRequest) -> Result<SessionSnapshot, ApiError> {
+        self.connect_with_profile(request, None)
+    }
+    /// The host calls this only after resolving a saved profile; raw connect IPC
+    /// cannot assign the immutable connection/profile association.
+    pub fn connect_profile(
+        &self,
+        request: ConnectRequest,
+        profile_id: String,
+    ) -> Result<SessionSnapshot, ApiError> {
+        self.connect_with_profile(request, Some(profile_id))
+    }
+    fn connect_with_profile(
+        &self,
+        request: ConnectRequest,
+        profile_id: Option<String>,
+    ) -> Result<SessionSnapshot, ApiError> {
         request.validate()?;
         if let Err(error) = &self.inner.trust {
             return Err(error.clone());
@@ -425,6 +480,7 @@ impl SessionManager {
                 unacked: VecDeque::new(),
             });
             state.snapshot = SessionSnapshot {
+                profile_id,
                 revision: state.revision.to_string(),
                 session: Some(session),
                 state: SessionState::Connecting,
@@ -558,7 +614,7 @@ impl SessionManager {
             let live = require_connected(&state, session)?;
             live.commands
                 .try_send(Command::AiWrite {
-                    permit,
+                    permit: Box::new(permit),
                     reply: sender,
                 })
                 .map_err(queue_error)?;
@@ -630,12 +686,8 @@ impl SessionManager {
             }
             // Metadata is passive and must not become an AI observation. Keep the
             // original bytes/seq for the visible terminal and its backpressure ACK.
-            if let Some(log) = self.shell_log() {
-                let visible = log.ingest(session, chunk);
-                self.inner.observation.push(session, &visible);
-            } else {
-                self.inner.observation.push(session, chunk);
-            }
+            let visible = self.inner.shell_integration.ingest(session, chunk);
+            self.inner.observation.push(session, &visible);
             self.emit(SshEvent::Output {
                 session: session.clone(),
                 seq: seq.to_string(),
@@ -694,6 +746,7 @@ impl SessionManager {
             state.snapshot.host_key = None;
             state.snapshot.clone()
         };
+        self.inner.shell_integration.disconnect(&session);
         if let Some(log) = self.shell_log() {
             log.disconnect(&session);
         }
@@ -1021,7 +1074,7 @@ fn decode_input(encoded: &str) -> Result<Zeroizing<Vec<u8>>, ApiError> {
     Ok(bytes)
 }
 
-fn read_private_key(
+pub(crate) fn read_private_key(
     path: &str,
     passphrase: Option<&str>,
 ) -> Result<russh::keys::PrivateKey, ApiError> {
@@ -1074,7 +1127,16 @@ fn read_private_key(
         }
         text
     };
-    russh::keys::decode_secret_key(&text, passphrase).map_err(|_| {
+    russh::keys::decode_secret_key(&text, passphrase).map_err(|error| {
+        if passphrase.is_none()
+            && (matches!(error, russh::keys::Error::KeyIsEncrypted)
+                || text.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----"))
+        {
+            return ApiError::new(
+                "CREDENTIAL_PASSPHRASE_REQUIRED",
+                "This private key is encrypted. Enter its passphrase for this connection.",
+            );
+        }
         ApiError::new(
             "SSH_KEY_FAILED",
             "Unable to decode the private key. Check its format and passphrase.",
@@ -1529,7 +1591,7 @@ mod tests {
                 session: session.clone(),
             };
             gate.acquire(owner.clone(), true).unwrap();
-            let action = gate.prepare(&owner, "pwd").unwrap();
+            let action = gate.prepare(&owner, "pwd", &[]).unwrap();
             gate.acknowledge(&owner, &action.action_id, "1").unwrap();
             let permit = gate.queue(&owner).unwrap();
             let writer = manager.clone();

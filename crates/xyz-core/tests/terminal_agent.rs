@@ -119,6 +119,16 @@ impl Fixture {
             .session
             .unwrap();
         tokio::time::timeout(WAIT, done).await.unwrap().unwrap();
+        // This protocol fixture does not launch an OS shell. Establish the
+        // same bounded current-shell handshake used by the real PTY tests.
+        let integration = ssh.shell_integration();
+        integration.confirm_install(ssh.snapshot(), true).unwrap();
+        let nonce = integration.status().shell_id.unwrap();
+        integration.ingest(
+            &session,
+            format!("\x1b]777;xyzlog;2;{nonce};H;5.2.15\x07\x1b]777;xyzlog;2;{nonce};R;0;123;\x07")
+                .as_bytes(),
+        );
         let agent = AgentManager::new(
             config.clone(),
             chats.clone(),
@@ -136,6 +146,35 @@ impl Fixture {
             output_seq,
             output_bytes,
         }
+    }
+    fn metadata(&self, body: &str) -> Vec<u8> {
+        let nonce = self.ssh.shell_integration().status().shell_id.unwrap();
+        format!("\x1b]777;xyzlog;2;{nonce};{body}\x07").into_bytes()
+    }
+    async fn foreground_return(&self, server: &LoopbackServer, command: &str, code: u8) -> u64 {
+        let status = self.ssh.shell_integration().status();
+        let sequence = status.sequence + 1;
+        let command = xyz_core::shell_integration::correlated_command(
+            status.active_action_id.as_ref().unwrap(),
+            command,
+        )
+        .unwrap();
+        server
+            .send_output(self.metadata(&format!(
+                "B;{sequence};123;{};{}",
+                STANDARD.encode("/tmp"),
+                STANDARD.encode(command)
+            )))
+            .await;
+        server
+            .send_output(self.metadata(&format!("E;{sequence};124;{code}")))
+            .await;
+        sequence
+    }
+    async fn shell_ready(&self, server: &LoopbackServer, sequence: u64) {
+        server
+            .send_output(self.metadata(&format!("R;{sequence};125;")))
+            .await;
     }
     fn request(&self, chat_id: &str) -> StartTerminalTask {
         let s = self.config.status();
@@ -278,14 +317,21 @@ async fn real_model_command_waits_for_finished_stream_and_visible_preview_then_s
     assert_eq!(prepared.action.as_ref().unwrap().command_text, "pwd");
     assert!(!prepared.action.as_ref().unwrap().displayed);
     ack(&f.agent, &prepared);
-    let sent = phase(&f.agent, &t.task_id, "needs_user").await;
+    let sent = phase(&f.agent, &t.task_id, "awaiting_completion").await;
     assert_eq!(sent.remote_outcome, "unknown");
     assert!(!sent.terminal_ready);
     assert_eq!(sent.action.unwrap().delivery, "write_accepted");
     let trace = ssh_server
         .wait_for("AI input", |t| t.input.len() == 2)
         .await;
-    assert_eq!(trace.input[1].1, b"pwd\r");
+    assert_eq!(
+        trace.input[1].1,
+        format!(
+            "pwd # xyz-action:{}\r",
+            prepared.action.as_ref().unwrap().action_id
+        )
+        .as_bytes()
+    );
     assert_eq!(trace.input[0].0, trace.input[1].0);
     assert_eq!(trace.channels.len(), 1);
     assert_eq!(trace.exec_requests, 0);
@@ -298,7 +344,7 @@ async fn real_model_command_waits_for_finished_stream_and_visible_preview_then_s
     let c = f.chats.create_chat("Second task").unwrap();
     assert_eq!(
         f.agent.start(f.request(&c.chat_id)).unwrap_err().code,
-        "AI_OWNER_BUSY"
+        "SHELL_NOT_READY"
     );
     f.agent
         .cancel(TaskRunRequest {
@@ -308,7 +354,7 @@ async fn real_model_command_waits_for_finished_stream_and_visible_preview_then_s
         .unwrap();
     assert_eq!(
         f.agent.start(f.request(&c.chat_id)).unwrap_err().code,
-        "TERMINAL_OUTCOME_UNKNOWN"
+        "SHELL_NOT_READY"
     );
     let resolved = f
         .agent
@@ -380,11 +426,14 @@ async fn destructive_command_requires_exact_single_use_approval_and_same_chat_is
     assert!(server.trace().input.is_empty());
     f.agent.decide(request()).unwrap();
     assert!(f.agent.decide(request()).is_err());
-    phase(&f.agent, &t.task_id, "needs_user").await;
+    phase(&f.agent, &t.task_id, "awaiting_completion").await;
     let trace = server
         .wait_for("approved command", |t| !t.input.is_empty())
         .await;
-    assert_eq!(trace.input[0].1, b"rm -rf /tmp/fixture\r");
+    assert_eq!(
+        trace.input[0].1,
+        format!("rm -rf /tmp/fixture # xyz-action:{}\r", a.action_id).as_bytes()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -475,12 +524,19 @@ async fn queued_ai_cancellation_is_revalidated_after_real_ssh_backpressure() {
     f.ssh
         .ack_output(&f.session, &f.output_seq.load(Ordering::SeqCst).to_string())
         .unwrap();
-    phase(&f.agent, &second.task_id, "needs_user").await;
+    phase(&f.agent, &second.task_id, "awaiting_completion").await;
     let trace = server
         .wait_for("second queued action", |t| !t.input.is_empty())
         .await;
     assert_eq!(trace.input.len(), 1);
-    assert_eq!(trace.input[0].1, b"id\r");
+    assert_eq!(
+        trace.input[0].1,
+        format!(
+            "id # xyz-action:{}\r",
+            second.action.as_ref().unwrap().action_id
+        )
+        .as_bytes()
+    );
     tokio::time::timeout(WAIT, async {
         loop {
             let t = f.agent.get(&first.task_id).unwrap();
@@ -496,7 +552,7 @@ async fn queued_ai_cancellation_is_revalidated_after_real_ssh_backpressure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_continue_sends_only_sanitized_new_output_and_preserves_unknown_result() {
+async fn independent_ready_automatically_continues_with_sanitized_observation() {
     let server = LoopbackServer::start(Behavior::default()).await;
     let (http, base) = listener().await;
     let f = Fixture::new(&server, &base).await;
@@ -521,7 +577,7 @@ async fn explicit_continue_sends_only_sanitized_new_output_and_preserves_unknown
     let t = f.start();
     let p = phase(&f.agent, &t.task_id, "awaiting_display").await;
     ack(&f.agent, &p);
-    phase(&f.agent, &t.task_id, "needs_user").await;
+    phase(&f.agent, &t.task_id, "awaiting_completion").await;
     let before = f.output_bytes.load(Ordering::SeqCst);
     let output = format!(
         "\x1b]52;c;HIDDEN-CLIPBOARD\x07visible {} synthetic-model-credential \x1b[31mred\x1b[0m\n",
@@ -535,15 +591,16 @@ async fn explicit_continue_sends_only_sanitized_new_output_and_preserves_unknown
     })
     .await
     .unwrap();
-    f.agent
-        .continue_task(ContinueTerminalTask {
-            task_id: t.task_id.clone(),
-            run_id: t.run_id.clone(),
-            readiness_confirmed: true,
-        })
-        .unwrap();
+    let sequence = f.foreground_return(&server, "pwd", 0).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let returned = f.agent.get(&t.task_id).unwrap();
+    assert_eq!(returned.phase, "awaiting_completion");
+    assert!(returned.action.as_ref().unwrap().command_completed);
+    assert!(!returned.terminal_ready);
+    // end is NOT ready: no next model request until the independent marker.
+    f.shell_ready(&server, sequence).await;
     let done = phase(&f.agent, &t.task_id, "completed").await;
-    assert_eq!(done.remote_outcome, "unknown");
+    assert_eq!(done.remote_outcome, "foreground_returned");
     assert_eq!(done.actions.len(), 1);
     assert!(done.terminal_ready);
     assert!(!done.owner);
@@ -554,7 +611,8 @@ async fn explicit_continue_sends_only_sanitized_new_output_and_preserves_unknown
     assert!(!body.contains("HIDDEN-CLIPBOARD"));
     assert!(body.contains("[REDACTED]"));
     assert!(body.contains("visible"));
-    assert!(body.contains("unknown"));
+    assert!(body.contains("command_completed"));
+    assert!(!body.contains("xyzlog"));
     assert_eq!(server.trace().input.len(), 1);
 }
 
@@ -815,4 +873,143 @@ async fn edited_secret_after_preview_fails_not_sent_and_releases_the_task() {
         })
         .unwrap();
     responder.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multiple_normal_steps_continue_automatically_but_dangerous_step_needs_one_exact_approval()
+{
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    let responder = tokio::spawn(async move {
+        for command in ["pwd", "ls -la /tmp", "rm -f /tmp/fixture"] {
+            let (mut socket, _) = http.accept().await.unwrap();
+            read_request(&mut socket).await;
+            seen.fetch_add(1, Ordering::SeqCst);
+            reply(
+                &mut socket,
+                &tool_body(
+                    "terminal_action",
+                    &serde_json::json!({"command_text":command}).to_string(),
+                    "tool_calls",
+                ),
+            )
+            .await;
+        }
+        let (mut socket, _) = http.accept().await.unwrap();
+        let final_request = read_request(&mut socket).await;
+        seen.fetch_add(1, Ordering::SeqCst);
+        let body = chunk(
+            serde_json::json!({"role":"assistant","content":"The three foreground commands returned. Verify the requested goal separately."}),
+            serde_json::Value::Null,
+        ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+            + "data: [DONE]\n\n";
+        reply(&mut socket, &body).await;
+        final_request
+    });
+    let started = fixture.start();
+    for (index, command) in ["pwd", "ls -la /tmp", "rm -f /tmp/fixture"]
+        .into_iter()
+        .enumerate()
+    {
+        let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
+        assert_eq!(preview.action.as_ref().unwrap().command_text, command);
+        ack(&fixture.agent, &preview);
+        if index == 2 {
+            let waiting = phase(&fixture.agent, &started.task_id, "waiting_approval").await;
+            assert_eq!(server.trace().input.len(), 2);
+            assert_eq!(waiting.action.as_ref().unwrap().risk, "dangerous");
+            let action = waiting.action.as_ref().unwrap();
+            let request = || DecideTerminalAction {
+                task_id: started.task_id.clone(),
+                run_id: started.run_id.clone(),
+                action_id: action.action_id.clone(),
+                approval_id: action.approval_id.clone().unwrap(),
+                decision: "approve".into(),
+            };
+            fixture.agent.decide(request()).unwrap();
+            assert!(fixture.agent.decide(request()).is_err());
+        } else {
+            assert_eq!(preview.action.as_ref().unwrap().risk, "normal");
+            assert!(preview.action.as_ref().unwrap().approval_id.is_none());
+        }
+        phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+        let sequence = fixture.foreground_return(&server, command, 0).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            index + 1,
+            "end alone cannot trigger another round"
+        );
+        assert_eq!(
+            fixture.agent.get(&started.task_id).unwrap().phase,
+            "awaiting_completion"
+        );
+        fixture.shell_ready(&server, sequence).await;
+    }
+    let done = phase(&fixture.agent, &started.task_id, "completed").await;
+    assert_eq!(done.actions.len(), 3);
+    assert!(done
+        .actions
+        .iter()
+        .all(|action| action.command_completed && action.exit_code == Some(0)));
+    assert_eq!(done.remote_outcome, "foreground_returned");
+    assert!(!done.owner);
+    assert_eq!(server.trace().input.len(), 3);
+    assert_eq!(server.trace().channels.len(), 1);
+    assert_eq!(server.trace().exec_requests, 0);
+    let request = responder.await.unwrap();
+    assert!(request.contains("command_completed"));
+    assert!(!request.contains("xyzlog"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_or_stale_end_and_disconnect_pause_without_resending_or_another_model_round() {
+    for disconnect in [false, true] {
+        let server = LoopbackServer::start(Behavior::default()).await;
+        let (http, base) = listener().await;
+        let fixture = Fixture::new(&server, &base).await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let responder = tokio::spawn(async move {
+            let (mut socket, _) = http.accept().await.unwrap();
+            read_request(&mut socket).await;
+            seen.fetch_add(1, Ordering::SeqCst);
+            reply(
+                &mut socket,
+                &tool_body("terminal_action", r#"{"command_text":"pwd"}"#, "tool_calls"),
+            )
+            .await;
+            if tokio::time::timeout(Duration::from_millis(250), http.accept())
+                .await
+                .is_ok()
+            {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let started = fixture.start();
+        let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
+        ack(&fixture.agent, &preview);
+        phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+        if disconnect {
+            fixture.ssh.disconnect(&fixture.session).unwrap();
+        } else {
+            // Ordinary output pretending to be a success and an unmatched end
+            // cannot substitute for the expected begin/end/ready sequence.
+            server
+                .send_output(b"command succeeded; shell ready\n".to_vec())
+                .await;
+            server.send_output(fixture.metadata("E;999;125;0")).await;
+        }
+        let paused = phase(&fixture.agent, &started.task_id, "needs_user").await;
+        assert_eq!(paused.remote_outcome, "unknown");
+        assert!(!paused.terminal_ready);
+        assert!(!paused.action.as_ref().unwrap().command_completed);
+        assert!(paused.error.is_some());
+        responder.await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(server.trace().input.len(), 1);
+    }
 }

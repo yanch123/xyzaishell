@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatSnapshot, ModelEvent } from '../lib/model';
 import { chat, modelConfig, stream } from '../test/modelFixtures';
 
-const mocks = vi.hoisted(() => ({ native: vi.fn(), listen: vi.fn(), config: vi.fn(), list: vi.fn(), create: vi.fn(), get: vi.fn(), send: vi.fn(), cancel: vi.fn(), reload: vi.fn(), confirm: vi.fn(), probe: vi.fn() }));
+const mocks = vi.hoisted(() => ({ native: vi.fn(), listen: vi.fn(), config: vi.fn(), list: vi.fn(), create: vi.fn(), get: vi.fn(), send: vi.fn(), cancel: vi.fn(), reload: vi.fn(), confirm: vi.fn(), probe: vi.fn(), save: vi.fn(), testSaved: vi.fn(), cancelTest: vi.fn() }));
 vi.mock('../lib/bridge', () => ({ desktopAvailable: mocks.native }));
 vi.mock('../lib/modelBridge', () => ({ modelBridge: mocks }));
 import { useModelChat } from './useModelChat';
@@ -166,5 +166,65 @@ describe('read-only recovery', () => {
     act(() => result.current.retryLoad());
     await waitFor(() => expect(result.current.ready).toBe(true));
     expect(result.current.error).toBeNull(); expect(mocks.send).not.toHaveBeenCalled();
+  });
+});
+
+describe('saved settings and immutable chat provenance', () => {
+  const target = { state: 'connected' as const, host: 'first.example', port: 22, username: 'user', session: { session_id: 'first-session', generation: '1' } };
+  it('creates a blank bound conversation on target changes, but preserves same-target reconnect text', async () => {
+    mocks.create.mockImplementation(async (_title, source) => ({ ...chat(source.session_id), source: { ...source, host: source.session_id === 'second-session' ? 'second.example' : 'first.example', port: 22, username: 'user' } }));
+    const { result, rerender } = renderHook((props: { target: typeof target | undefined }) => useModelChat(props.target), { initialProps: { target: undefined as typeof target | undefined } });
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    rerender({ target }); await waitFor(() => expect(result.current.current.chat_id).toBe('first-session'));
+    expect(mocks.create).toHaveBeenCalledExactlyOnceWith('新任务', target.session);
+    rerender({ target: { ...target, session: { session_id: 'reconnected-session', generation: '2' } } });
+    await act(async () => {}); expect(mocks.create).toHaveBeenCalledOnce();
+    rerender({ target: { ...target, host: 'second.example', session: { session_id: 'second-session', generation: '3' } } });
+    await waitFor(() => expect(result.current.current.chat_id).toBe('second-session'));
+    expect(mocks.create).toHaveBeenCalledTimes(2); expect(result.current.current.messages).toHaveLength(0);
+    expect(mocks.send).not.toHaveBeenCalled(); expect(mocks.cancel).not.toHaveBeenCalled();
+  });
+  it('reconciles an existing live target chat on first load without creating a duplicate', async () => {
+    const source = { ...target.session, host: target.host, port: target.port, username: target.username };
+    mocks.list.mockResolvedValue([{ ...chat('already-bound'), source }]);
+    const { result } = renderHook(() => useModelChat(target));
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    expect(result.current.current.chat_id).toBe('already-bound'); expect(mocks.create).not.toHaveBeenCalled();
+  });
+  it('never transmits restored or different-target context', async () => {
+    mocks.list.mockResolvedValue([{ ...chat('restored'), restored_read_only: true }, { ...chat('other-target'), source: { ...target.session, host: 'other.example', port: 22, username: 'user' } }]);
+    const { result } = await ready();
+    act(() => { result.current.updateDraft('restored', 'no replay'); result.current.updateDraft('other-target', 'wrong server'); });
+    await act(async () => { expect(await result.current.send('restored')).toBe(false); expect(await result.current.send('other-target')).toBe(false); });
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('fences a late first-target creation after the connected target changed', async () => {
+    let first!: (value: ChatSnapshot) => void;
+    mocks.create.mockImplementationOnce(() => new Promise(resolve => { first = resolve; })).mockResolvedValueOnce(chat('second-new'));
+    const { result, rerender } = renderHook((props: { target: typeof target }) => useModelChat(props.target), { initialProps: { target } });
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledOnce());
+    rerender({ target: { ...target, host: 'second.example', session: { session_id: 'second-session', generation: '2' } } });
+    await act(async () => { first(chat('old-target-late')); });
+    await waitFor(() => expect(result.current.current.chat_id).toBe('second-new'));
+    expect(result.current.chats.some(value => value.chat_id === 'old-target-late')).toBe(true);
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('blocks repeat saves and tests after an unknown commit until explicit reload', async () => {
+    mocks.save.mockRejectedValue(new Error('synthetic-private-provider-diagnostic'));
+    const { result } = await ready();
+    const request = { expected_file_revision: 'saved-file-1', base_url: 'https://example.com/v1', model: 'new', key_update: { kind: 'keep' as const }, reuse_key_for_destination: null };
+    await act(async () => { expect(await result.current.saveConfig(request)).toBeNull(); });
+    expect(result.current.configWriteBlocked).toBe(true); expect(result.current.error).not.toContain('synthetic');
+    await act(async () => { expect(await result.current.saveConfig(request)).toBeNull(); expect(await result.current.testSaved(result.current.config)).toBeNull(); });
+    expect(mocks.save).toHaveBeenCalledOnce(); expect(mocks.testSaved).not.toHaveBeenCalled();
+    await act(async () => { await result.current.reloadConfig(); }); expect(result.current.configWriteBlocked).toBe(false);
+  });
+  it('tests only an explicit saved version without creating or selecting a diagnostic chat', async () => {
+    mocks.testSaved.mockImplementation(async request => ({ ...request, success: true, error: null }));
+    const { result } = await ready();
+    await act(async () => { await result.current.testSaved(result.current.config); });
+    expect(mocks.testSaved).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ file_revision: modelConfig.file_revision, destination: modelConfig.destination, model: modelConfig.model, consent: true }));
+    expect(result.current.current.chat_id).toBe('chat-a'); expect(result.current.configTest?.success).toBe(true);
+    expect(mocks.probe).not.toHaveBeenCalled(); expect(mocks.create).not.toHaveBeenCalled(); expect(mocks.send).not.toHaveBeenCalled();
   });
 });

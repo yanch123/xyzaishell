@@ -9,6 +9,7 @@ use tokio::{
 };
 use uuid::Uuid;
 use xyz_core::{
+    shell_integration::IntegrationPhase,
     shell_log::ShellLogService,
     shell_log_types::{CaptureState, CommandStatus, ExportFormat, ShellLogEntry, ShellLogQuery},
     ssh::{
@@ -112,7 +113,7 @@ impl Terminal {
         self.output.clear();
         self.write(
             &session,
-            "stty -echo; printf '%s%s\\n' XYZ_LOG_READY_ ACK\n",
+            "stty -echo; HISTCONTROL=ignoreboth; HISTIGNORE=; HISTSIZE=1000; shopt -s cmdhist promptvars; shopt -s lithist; PS1='XYZ_OPENSSH> '; alias ll='ls -l'; xyz_fixture_function(){ return 23; }; printf '%s%s\\n' XYZ_LOG_READY_ ACK\n",
         )
         .await;
         self.until(|t| {
@@ -121,10 +122,20 @@ impl Terminal {
                 .any(|s| s == b"XYZ_LOG_READY_ACK\r\n")
         })
         .await;
-        let bootstrap = self.service.start(self.manager.snapshot(), true).unwrap();
-        self.write(&session, &bootstrap).await;
-        self.until(|t| t.service.status().state == CaptureState::Recording)
+        self.manager
+            .install_shell_integration(&session, true)
+            .await
+            .unwrap();
+        self.until(|t| t.manager.shell_integration().status().phase == IntegrationPhase::Ready)
             .await;
+        let ready = self
+            .manager
+            .shell_integration()
+            .ready_snapshot(&session)
+            .unwrap();
+        self.service
+            .start_shared(self.manager.snapshot(), true, ready.shell_id, true)
+            .unwrap();
         session
     }
     async fn write(&self, session: &SessionRef, command: &str) {
@@ -160,7 +171,9 @@ impl Terminal {
             .unwrap()
     }
     async fn disconnect(&mut self, session: &SessionRef) {
-        self.manager.disconnect(session).unwrap();
+        if self.manager.snapshot().state != SessionState::Disconnected {
+            self.manager.disconnect(session).unwrap();
+        }
         self.until(|t| t.manager.snapshot().state == SessionState::Disconnected)
             .await;
         self.service.flush().unwrap();

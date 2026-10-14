@@ -28,8 +28,8 @@ use crate::{
     ssh::ApiError,
     storage::{private_files::PrivateDirectory, StorageError},
     tasks::{
-        ChatMessage, ChatSnapshot, MessageRole, MessageState, MAX_ASSISTANT_BYTES, MAX_CHATS,
-        MAX_MESSAGES, MAX_MESSAGE_BYTES, MAX_TRANSCRIPT_BYTES,
+        ChatMessage, ChatSnapshot, ChatSource, MessageRole, MessageState, MAX_ASSISTANT_BYTES,
+        MAX_CHATS, MAX_MESSAGES, MAX_MESSAGE_BYTES, MAX_TRANSCRIPT_BYTES,
     },
 };
 use rusqlite::{
@@ -51,7 +51,9 @@ const MAX_JOURNAL_BYTES: usize = MAX_DATABASE_BYTES + 1024 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 const PAGE_SIZE: usize = 4096;
 const APPLICATION_ID: i64 = 0x58595a48;
-const SCHEMA_VERSION: i64 = 1;
+// v2 persists immutable chat source. v1 readers must refuse the archive rather
+// than misread new payloads. The table layout is unchanged and v1 rows migrate.
+const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 // Keep the original startup lock name so initialization and every subsequent
 // operation participate in one protocol. Never replace/delete this lock file.
@@ -147,6 +149,8 @@ pub struct ArchivedMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArchivedChat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ChatSource>,
     pub chat_id: String,
     pub task_id: String,
     pub title: String,
@@ -166,6 +170,7 @@ impl RedactedChat {
     ) -> Result<Self> {
         let mut chat = self.0.clone();
         chat.title = redact_known_secrets(&chat.title);
+        redact_source(&mut chat.source, &mut redact_known_secrets);
         for message in &mut chat.messages {
             message.text = redact_known_secrets(&message.text);
         }
@@ -210,7 +215,10 @@ impl RedactedChat {
                 },
             });
         }
+        let mut source = snapshot.source.clone();
+        redact_source(&mut source, &mut redact_known_secrets);
         let chat = ArchivedChat {
+            source,
             chat_id: snapshot.chat_id.clone(),
             task_id: snapshot.task_id.clone(),
             title: redact_known_secrets(&snapshot.title),
@@ -234,6 +242,8 @@ impl StoredChat {
     /// permit, cancellation sender, terminal owner and approval map afresh.
     pub fn to_snapshot(&self) -> ChatSnapshot {
         ChatSnapshot {
+            source: self.chat.source.clone(),
+            restored_read_only: true,
             chat_id: self.chat.chat_id.clone(), task_id: self.chat.task_id.clone(),
             title: self.chat.title.clone(), active_run_id: None,
             revision: self.revision.to_string(),
@@ -385,6 +395,31 @@ impl HistoryStore {
             tx.execute_batch(METADATA_SCHEMA)?;
             tx.execute("INSERT INTO metadata(id,revision) VALUES(1,0)", [])?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else if version == 1 && app == APPLICATION_ID {
+            // Verify the complete old layout and every row before changing its
+            // format marker. Invalid/future archives are left untouched.
+            verify_schema(&tx)?;
+            {
+                let mut statement = tx.prepare(
+                    "SELECT chat_id,task_id,revision,listed,updated_ms,payload FROM chats",
+                )?;
+                let rows = statement.query_map([], raw_chat)?;
+                for row in rows {
+                    let row = row?;
+                    let value: serde_json::Value =
+                        serde_json::from_str(&row.5).map_err(|_| HistoryError::Corrupt)?;
+                    let fields = value.as_object().ok_or(HistoryError::Corrupt)?;
+                    if fields.len() != 4
+                        || fields.keys().any(|key| {
+                            !["chat_id", "task_id", "title", "messages"].contains(&key.as_str())
+                        })
+                    {
+                        return Err(HistoryError::UnsupportedSchema);
+                    }
+                    decode(row)?;
+                }
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if version != SCHEMA_VERSION || app != APPLICATION_ID {
             return Err(if version == 0 && app == 0 {
@@ -888,7 +923,29 @@ fn text_limit(role: &MessageRole) -> usize {
         MessageRole::Assistant => MAX_ASSISTANT_BYTES,
     }
 }
+fn redact_source(source: &mut Option<ChatSource>, redact: &mut impl FnMut(&str) -> String) {
+    if let Some(source) = source {
+        source.host = redact(&source.host);
+        source.username = redact(&source.username);
+    }
+}
 fn validate_chat(chat: &ArchivedChat) -> Result<()> {
+    if let Some(source) = &chat.source {
+        if source.host.is_empty()
+            || source.host.len() > 253
+            || source.host.chars().any(char::is_control)
+            || source.username.is_empty()
+            || source.username.len() > 128
+            || source.username.chars().any(char::is_control)
+            || source.port == 0
+            || require_id(&source.session_id).is_err()
+            || source.generation.is_empty()
+            || source.generation.len() > 32
+            || !source.generation.bytes().all(|c| c.is_ascii_digit())
+        {
+            return Err(HistoryError::InvalidRecord);
+        }
+    }
     require_id(&chat.chat_id)?;
     require_id(&chat.task_id)?;
     if chat.title.trim().is_empty()

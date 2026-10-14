@@ -1,5 +1,6 @@
 //! Host-owned single-writer authority. A queued AI frame is revalidated by the
 //! SSH actor immediately before its first write; UI/model text grants no power.
+use crate::risk::{classify, Risk};
 use crate::ssh::{ApiError, SessionRef};
 use crate::task_secrets::SecretInput;
 use serde::{Deserialize, Serialize};
@@ -14,10 +15,6 @@ use zeroize::Zeroizing;
 
 const ACTION_TTL: Duration = Duration::from_secs(120);
 pub const MAX_COMMAND_BYTES: usize = 8192;
-const AUTO_READ_COMMANDS: &[&str] = &[
-    "pwd", "whoami", "id", "uname", "uname -a", "ls", "ls -la", "hostname", "uptime", "date",
-    "df -h", "free -h",
-];
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreparedAction {
     #[serde(default = "command_kind")]
@@ -30,6 +27,14 @@ pub struct PreparedAction {
     pub append_enter: bool,
     pub digest: String,
     pub policy: String,
+    #[serde(default)]
+    pub risk: String,
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub command_completed: bool,
     pub reason: String,
     pub approval_id: Option<String>,
     pub expires_at_unix_ms: u64,
@@ -81,6 +86,7 @@ pub(crate) struct DispatchPermit {
     pub(crate) bytes: Zeroizing<Vec<u8>>,
     pub(crate) started: Arc<AtomicBool>,
     pub(crate) on_started: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    pub(crate) on_validate: Option<Arc<dyn Fn() -> Result<(), ApiError> + Send + Sync>>,
     disk_validate: Option<Arc<dyn Fn() -> Result<(), ApiError> + Send + Sync>>,
     disk_validated: AtomicBool,
 }
@@ -130,25 +136,62 @@ impl ExecutionGate {
         });
         Ok(())
     }
-    pub(crate) fn prepare(&self, owner: &Owner, command: &str) -> Result<PreparedAction, ApiError> {
+    pub(crate) fn prepare(
+        &self,
+        owner: &Owner,
+        command: &str,
+        shadowed: &[String],
+    ) -> Result<PreparedAction, ApiError> {
         validate_command(command)?;
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let l = lease(&mut s, owner)?;
         if l.cancelled || !l.ready || l.pending.is_some() {
             return Err(stale());
         }
-        let auto = AUTO_READ_COMMANDS.contains(&command);
-        let mut bytes = command.as_bytes().to_vec();
+        let assessment = classify(command, shadowed);
+        let auto = assessment.risk == Risk::Normal;
+        let action_id = Uuid::new_v4().to_string();
+        let transport = if assessment.executable {
+            crate::shell_integration::correlated_command(&action_id, command)?
+        } else {
+            command.to_owned()
+        };
+        let mut bytes = transport.into_bytes();
         bytes.push(b'\r');
         let action = PreparedAction {
-            kind: "command".into(), secret_field: None,
-            action_id: Uuid::new_v4().to_string(), display_revision: "1".into(), command_text: command.into(), append_enter: true,
+            kind: "command".into(),
+            secret_field: None,
+            action_id,
+            display_revision: "1".into(),
+            command_text: command.into(),
+            append_enter: true,
             digest: format!("{:x}", Sha256::digest(&bytes)),
-            policy: if auto { "auto_read_only" } else { "require_approval" }.into(),
-            reason: if auto { "Exact small read-only command allowlist; shell aliases and manual interference remain possible." } else { "Command effects are not established as read-only. Review its full effect, current terminal, and target before allowing this one command." }.into(),
-            approval_id: (!auto).then(|| Uuid::new_v4().to_string()),
-            expires_at_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 + ACTION_TTL.as_millis() as u64,
-            displayed: false, delivery: "not_sent".into(),
+            policy: if auto {
+                "auto_normal"
+            } else if assessment.executable {
+                "require_approval"
+            } else {
+                "manual_only"
+            }
+            .into(),
+            risk: match assessment.risk {
+                Risk::Normal => "normal",
+                Risk::Dangerous => "dangerous",
+                Risk::Unknown => "unknown",
+            }
+            .into(),
+            blocked: !assessment.executable,
+            exit_code: None,
+            command_completed: false,
+            reason: assessment.reason.into(),
+            approval_id: (!auto && assessment.executable).then(|| Uuid::new_v4().to_string()),
+            expires_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+                + ACTION_TTL.as_millis() as u64,
+            displayed: false,
+            delivery: "not_sent".into(),
         };
         l.pending = Some(Pending {
             action: action.clone(),
@@ -186,6 +229,7 @@ impl ExecutionGate {
             command_text: format!("[Secret input: {field}]"), append_enter: true,
             // Random opaque identity, not a password hash/guessing oracle.
             digest: Uuid::new_v4().to_string(), policy: "require_approval".into(),
+            risk: "dangerous".into(), blocked: false, exit_code: None, command_completed: false,
             reason: format!("Send field {field} for: {purpose}. Confirm the visible remote program is waiting for this secret. The remote host receives the value and may echo, record, or misuse it. One Enter is appended. This never verifies remote echo settings or completion."),
             approval_id: Some(Uuid::new_v4().to_string()),
             expires_at_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 + ACTION_TTL.as_millis() as u64,
@@ -257,6 +301,7 @@ impl ExecutionGate {
             .as_mut()
             .filter(|p| {
                 p.stage == Stage::Prepared
+                    && !p.action.blocked
                     && p.action.displayed
                     && (p.action.approval_id.is_none() || p.approved)
                     && Instant::now() < p.deadline
@@ -268,7 +313,13 @@ impl ExecutionGate {
             }
             secret.bytes.clone()
         } else {
-            let mut bytes = Zeroizing::new(p.action.command_text.as_bytes().to_vec());
+            let mut bytes = Zeroizing::new(
+                crate::shell_integration::correlated_command(
+                    &p.action.action_id,
+                    &p.action.command_text,
+                )?
+                .into_bytes(),
+            );
             bytes.push(b'\r');
             bytes
         };
@@ -281,6 +332,7 @@ impl ExecutionGate {
             digest: p.action.digest.clone(),
             bytes,
             on_started: None,
+            on_validate: None,
             disk_validate: p.secret.as_ref().map(|secret| secret.validate.clone()),
             disk_validated: AtomicBool::new(false),
             started: Arc::new(AtomicBool::new(false)),
@@ -327,6 +379,39 @@ impl ExecutionGate {
         if cancelled {
             s.lease = None;
         }
+    }
+    /// Only a matching integrated end followed by independent ready evidence
+    /// may clear an in-flight command. A local write receipt cannot call this.
+    pub(crate) fn complete_ready(
+        &self,
+        owner: &Owner,
+        action_id: &str,
+        exit_code: i32,
+    ) -> Result<PreparedAction, ApiError> {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let l = lease(&mut s, owner)?;
+        if l.cancelled {
+            return Err(stale());
+        }
+        let p = l
+            .pending
+            .as_ref()
+            .filter(|p| {
+                p.action.action_id == action_id
+                    && p.stage == Stage::Settled
+                    && p.action.delivery == "write_accepted"
+                    && p.secret.is_none()
+            })
+            .ok_or_else(stale)?;
+        let mut action = p.action.clone();
+        action.command_completed = true;
+        action.exit_code = Some(exit_code);
+        l.pending = None;
+        l.ready = true;
+        if s.uncertain.as_ref() == Some(owner) {
+            s.uncertain = None;
+        }
+        Ok(action)
     }
     pub(crate) fn is_owner(&self, owner: &Owner) -> bool {
         self.state
@@ -407,6 +492,9 @@ impl DispatchPermit {
                 return Err(stale());
             }
         }
+        if let Some(validate) = &self.on_validate {
+            validate()?;
+        }
         p.approved = false;
         p.stage = Stage::Started;
         p.action.delivery = "unknown".into();
@@ -450,7 +538,7 @@ mod tests {
         let g = ExecutionGate::default();
         let o = owner();
         g.acquire(o.clone(), true).unwrap();
-        let a = g.prepare(&o, command).unwrap();
+        let a = g.prepare(&o, command, &[]).unwrap();
         (g, o, a)
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -529,9 +617,9 @@ mod tests {
         p.begin(&o.session).unwrap();
         assert!(p.begin(&o.session).is_err());
         g.settle(&o, "write_accepted");
-        assert!(g.prepare(&o, "pwd").is_err());
+        assert!(g.prepare(&o, "pwd", &[]).is_err());
         g.confirm_ready(&o).unwrap();
-        assert!(g.prepare(&o, "pwd").is_ok());
+        assert!(g.prepare(&o, "pwd", &[]).is_ok());
     }
     #[test]
     fn queued_cancel_is_not_sent_and_unknown_survives_owner_release() {
@@ -541,7 +629,7 @@ mod tests {
         assert!(!g.cancel(&o));
         assert!(p.begin(&o.session).is_err());
         g.acquire(o.clone(), true).unwrap();
-        let a = g.prepare(&o, "pwd").unwrap();
+        let a = g.prepare(&o, "pwd", &[]).unwrap();
         g.acknowledge(&o, &a.action_id, "1").unwrap();
         let p = g.queue(&o).unwrap();
         p.begin(&o.session).unwrap();
@@ -577,25 +665,48 @@ mod tests {
         assert!(p.begin(&o.session).is_err());
     }
     #[test]
-    fn allowlist_is_exact_and_control_injection_rejected() {
-        for command in ["pwd; rm /tmp/x", "pwd\n", "echo $(id)", "ls -l", "sudo id"] {
-            if command.contains('\n') {
-                assert!(validate_command(command).is_err());
-            } else {
-                assert_eq!(prepared(command).2.policy, "require_approval");
-            }
+    fn normal_policy_has_arguments_and_unknown_actions_cannot_queue() {
+        for command in ["pwd", "ls -lah /tmp", "head -n 10 /etc/os-release"] {
+            assert_eq!(prepared(command).2.policy, "auto_normal");
         }
-        for command in AUTO_READ_COMMANDS {
-            assert_eq!(prepared(command).2.policy, "auto_read_only");
-            for modified in [
-                format!("{command}; id"),
-                format!("{command} $(id)"),
-                format!("{command} > out"),
-                format!("{command} "),
-            ] {
-                assert_eq!(prepared(&modified).2.policy, "require_approval");
-            }
-        }
+        let (gate, owner, action) = prepared("ls $(pwd)");
+        assert_eq!(action.risk, "unknown");
+        assert!(action.blocked);
+        gate.acknowledge(&owner, &action.action_id, &action.display_revision)
+            .unwrap();
+        assert!(gate.queue(&owner).is_err());
+    }
+    #[test]
+    fn integrated_completion_is_exact_and_allows_the_next_action_once() {
+        let (gate, owner, action) = prepared("ls -lah /tmp");
+        gate.acknowledge(&owner, &action.action_id, &action.display_revision)
+            .unwrap();
+        let permit = gate.queue(&owner).unwrap();
+        permit.begin(&owner.session).unwrap();
+        assert!(gate.complete_ready(&owner, &action.action_id, 0).is_err());
+        gate.settle(&owner, "write_accepted");
+        assert!(gate.complete_ready(&owner, "stale-action", 0).is_err());
+        let completed = gate.complete_ready(&owner, &action.action_id, 7).unwrap();
+        assert!(completed.command_completed);
+        assert_eq!(completed.exit_code, Some(7));
+        assert!(gate.complete_ready(&owner, &action.action_id, 0).is_err());
+        assert!(gate.prepare(&owner, "pwd", &[]).is_ok());
+    }
+    #[test]
+    fn changed_shell_binding_blocks_before_bytes_and_consumes_no_authority() {
+        let (gate, owner, action) = prepared("rm -rf /tmp/example");
+        gate.acknowledge(&owner, &action.action_id, &action.display_revision)
+            .unwrap();
+        gate.approve(
+            &owner,
+            &action.action_id,
+            action.approval_id.as_ref().unwrap(),
+        )
+        .unwrap();
+        let mut permit = gate.queue(&owner).unwrap();
+        permit.on_validate = Some(Arc::new(|| Err(stale())));
+        assert!(permit.begin(&owner.session).is_err());
+        assert!(!permit.started.load(Ordering::Acquire));
     }
     #[test]
     fn old_cancelled_readiness_cannot_clear_another_runs_unknown() {
@@ -608,7 +719,7 @@ mod tests {
         let mut second = first.clone();
         second.run_id = "second".into();
         g.acquire(second.clone(), true).unwrap();
-        let a = g.prepare(&second, "pwd").unwrap();
+        let a = g.prepare(&second, "pwd", &[]).unwrap();
         g.acknowledge(&second, &a.action_id, "1").unwrap();
         g.queue(&second).unwrap().begin(&second.session).unwrap();
         g.cancel(&second);
@@ -654,5 +765,52 @@ mod tests {
                 .sum::<usize>(),
             1
         );
+    }
+    #[test]
+    fn preview_digest_binds_literal_hash_and_exact_correlation_bytes() {
+        let (gate, owner, action) = prepared("printf '%s' 'literal # content'");
+        gate.acknowledge(&owner, &action.action_id, &action.display_revision)
+            .unwrap();
+        let mut permit = gate.queue(&owner).unwrap();
+        let expected = format!(
+            "printf '%s' 'literal # content' # xyz-action:{}\r",
+            action.action_id
+        );
+        assert_eq!(permit.bytes.as_slice(), expected.as_bytes());
+        assert_eq!(
+            action.digest,
+            format!("{:x}", Sha256::digest(expected.as_bytes()))
+        );
+        permit.bytes[0] = b'x';
+        assert!(permit.begin(&owner.session).is_err());
+        assert!(!permit.started.load(Ordering::Acquire));
+    }
+    #[test]
+    fn identical_dangerous_command_needs_fresh_action_approval() {
+        let (gate, owner, first) = prepared("rm -f /tmp/fixture");
+        gate.acknowledge(&owner, &first.action_id, &first.display_revision)
+            .unwrap();
+        gate.approve(
+            &owner,
+            &first.action_id,
+            first.approval_id.as_ref().unwrap(),
+        )
+        .unwrap();
+        gate.queue(&owner).unwrap().begin(&owner.session).unwrap();
+        gate.settle(&owner, "write_accepted");
+        gate.complete_ready(&owner, &first.action_id, 0).unwrap();
+        let second = gate.prepare(&owner, "rm -f /tmp/fixture", &[]).unwrap();
+        assert_ne!(first.digest, second.digest);
+        assert_ne!(first.approval_id, second.approval_id);
+        gate.acknowledge(&owner, &second.action_id, &second.display_revision)
+            .unwrap();
+        assert!(gate
+            .approve(
+                &owner,
+                &second.action_id,
+                first.approval_id.as_ref().unwrap()
+            )
+            .is_err());
+        assert!(gate.queue(&owner).is_err());
     }
 }

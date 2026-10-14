@@ -24,13 +24,26 @@ pub fn storage_error(error: StorageError) -> ApiError {
         StorageError::CredentialAccessDenied => "CREDENTIAL_ACCESS_DENIED",
         StorageError::CredentialUnavailable => "CREDENTIAL_UNAVAILABLE",
         StorageError::CredentialMissing => "CREDENTIAL_MISSING",
+        StorageError::CredentialTargetChanged => "CREDENTIAL_TARGET_CHANGED",
         StorageError::BackendMismatch => "CREDENTIAL_BACKEND_MISMATCH",
         StorageError::SessionModeRequired => "SESSION_MODE_REQUIRED",
         StorageError::SessionCredentialUpdateRequired => "SESSION_CREDENTIAL_UPDATE_REQUIRED",
         StorageError::SnapshotStale => "SECRET_SNAPSHOT_STALE",
         _ => "STORAGE_REJECTED",
     };
-    ApiError::new(code, "Secure storage could not complete this operation. Reload its status; never retry an uncertain save automatically or move credentials to plaintext storage.")
+    let message = match error {
+        StorageError::Conflict => "连接资料已被其他窗口修改。请重新读取并核对后再操作。",
+        StorageError::SaveUncertain => "保存结果尚未确定。请重新读取核对，不能自动重试或继续连接。",
+        StorageError::CredentialLocked => "系统凭据存储已锁定。请先解锁，或明确选择仅本次输入连接；原凭据引用保留。",
+        StorageError::CredentialUnavailable => "系统凭据存储不可用。仍可保存连接资料并临时认证；不会回退为明文。",
+        StorageError::CredentialAccessDenied => "系统拒绝访问凭据。请检查权限，或明确选择本次临时输入；原凭据引用保留。",
+        StorageError::CredentialMissing => "此连接没有可用的已保存凭据，请输入本次密码或口令。",
+        StorageError::CredentialTargetChanged => "认证目标已改变，不能自动复用原凭据。请为新目标输入凭据，或明确移除原引用。",
+        StorageError::BackendMismatch => "此凭据由不同的平台保护。请在当前电脑重新输入；原引用会保留。",
+        StorageError::UnsupportedSchema => "连接文件版本不受支持。原文件未覆盖，请核对版本和受限备份。",
+        _ => "Secure storage could not complete this operation. Reload its status; never retry an uncertain save automatically or move credentials to plaintext storage.",
+    };
+    ApiError::new(code, message)
 }
 pub fn resolve_storage_root() -> Result<PathBuf, ApiError> {
     #[cfg(windows)]
@@ -152,8 +165,8 @@ impl HostStorage {
                 Ok(()) | Err(StorageError::Conflict) => {}
                 Err(error) => return Err(storage_error(error)),
             }
-            let mode = profiles.mode().map_err(storage_error)?;
-            let credentials = CredentialStore::new(mode).map_err(storage_error)?;
+            profiles.migrate().map_err(storage_error)?;
+            let credentials = CredentialStore::new(native_mode()).map_err(storage_error)?;
             Ok(Storage {
                 root,
                 profiles,
@@ -228,13 +241,16 @@ impl HostStorage {
     }
     pub fn set_mode(
         &self,
-        expected_revision: &str,
-        mode: CredentialMode,
+        _expected_revision: &str,
+        _mode: CredentialMode,
     ) -> Result<ProfileStatus, ApiError> {
+        Err(ApiError::new("CREDENTIAL_GLOBAL_MODE_RETIRED", "Credential choices now apply to individual profiles. Edit the intended profile; other profiles are never downgraded."))
+    }
+    pub fn delete(&self, id: &str, expected_revision: &str) -> Result<ProfileStatus, ApiError> {
         self.with(|s| {
-            if mode != CredentialMode::SessionOnly { return Err(ApiError::new("CREDENTIAL_MODE_MIGRATION_UNSUPPORTED", "Only explicit migration to session-only credentials is supported. Re-enter credentials after switching.")); }
-            s.profiles.switch_to_session_only(revision(expected_revision)?).map_err(storage_error)?;
-            s.credentials = CredentialStore::new(mode).map_err(storage_error)?;
+            s.profiles
+                .delete(id, revision(expected_revision)?)
+                .map_err(storage_error)?;
             status(s)
         })
     }
@@ -244,11 +260,78 @@ impl HostStorage {
         expected_revision: &str,
         size: TerminalSize,
     ) -> Result<ConnectRequest, ApiError> {
+        self.connection_with_credential(id, expected_revision, size, None, false)
+    }
+    /// Temporary input is bound to this exact saved revision and is never
+    /// cached for another attempt. Persistent storage is an explicit choice.
+    pub fn connection_with_credential(
+        &self,
+        id: &str,
+        expected_revision: &str,
+        size: TerminalSize,
+        temporary: Option<CredentialText>,
+        remember: bool,
+    ) -> Result<ConnectRequest, ApiError> {
         self.with(|s| {
-            let resolved = s
-                .profiles
-                .resolve_for_authentication(id, revision(expected_revision)?, &s.credentials)
-                .map_err(storage_error)?;
+            let expected = revision(expected_revision)?;
+            let mut applied_revision = expected;
+            let resolved = if let Some(mut value) = temporary {
+                let profile = s
+                    .profiles
+                    .draft_for_authentication(id, expected)
+                    .map_err(storage_error)?;
+                let credential = SecretValue::new(value.take_bytes()).map_err(storage_error)?;
+                if profile.auth_kind == AuthKind::PrivateKey {
+                    let path = profile
+                        .private_key_path
+                        .as_ref()
+                        .and_then(|p| p.to_str())
+                        .ok_or_else(|| storage_error(StorageError::InvalidPath))?;
+                    let passphrase = std::str::from_utf8(credential.expose())
+                        .map_err(|_| storage_error(StorageError::CredentialInvalid))?;
+                    crate::ssh::read_private_key(path, Some(passphrase))?;
+                }
+                if remember {
+                    applied_revision = s
+                        .profiles
+                        .save(
+                            expected,
+                            profile.clone(),
+                            CredentialChange::Set(
+                                SecretValue::new(credential.expose().to_vec())
+                                    .map_err(storage_error)?,
+                            ),
+                            &s.credentials,
+                        )
+                        .map_err(storage_error)?;
+                }
+                crate::storage::profiles::ResolvedProfile {
+                    profile,
+                    credential: Some(credential),
+                }
+            } else {
+                if remember {
+                    return Err(storage_error(StorageError::CredentialMissing));
+                }
+                s.profiles
+                    .resolve_for_authentication(id, expected, &s.credentials)
+                    .map_err(storage_error)?
+            };
+            if resolved.profile.auth_kind == AuthKind::PrivateKey {
+                let path = resolved
+                    .profile
+                    .private_key_path
+                    .as_ref()
+                    .and_then(|p| p.to_str())
+                    .ok_or_else(|| storage_error(StorageError::InvalidPath))?;
+                let passphrase = resolved
+                    .credential
+                    .as_ref()
+                    .map(|v| std::str::from_utf8(v.expose()))
+                    .transpose()
+                    .map_err(|_| storage_error(StorageError::CredentialInvalid))?;
+                crate::ssh::read_private_key(path, passphrase)?;
+            }
             let secret = resolved
                 .credential
                 .map(|value| {
@@ -273,6 +356,10 @@ impl HostStorage {
                     passphrase: secret,
                 },
             };
+            // Detect a cross-process edit during slow keyring/key operations.
+            s.profiles
+                .draft_for_authentication(id, applied_revision)
+                .map_err(storage_error)?;
             // Resolved copies live only for this connection authentication. The
             // dedicated saved-profile path, not IPC, constructs this request.
             Ok(ConnectRequest {
@@ -326,70 +413,64 @@ mod tests {
         }
     }
     #[test]
-    fn explicit_session_profile_is_persisted_without_credential_and_restart_forgets_secret() {
+    fn temporary_credentials_are_single_attempt_and_never_persist() {
         let (root, host) = fixture();
-        let listing = host
+        let saved = host
             .save(SaveProfileRequest {
                 expected_revision: "0".into(),
                 profile: draft(),
                 credential_update: CredentialUpdate::Keep,
             })
-            .unwrap()
-            .listing;
-        let id = &listing.connections[0].id;
-        assert!(uuid::Uuid::parse_str(id).is_ok());
-        host.set_session(id, "1", Some("synthetic-private-password".into()))
             .unwrap();
-        let status = host.status().unwrap();
-        assert!(status.listing.connections[0].credential_present);
-        let json = serde_json::to_string(&status).unwrap();
-        assert!(!json.contains("synthetic-private-password"));
-        let disk = std::fs::read_to_string(root.join("connections.toml")).unwrap();
-        assert!(!disk.contains("synthetic-private-password"));
-        assert!(host
-            .connection(id, "1", TerminalSize { cols: 80, rows: 24 })
-            .is_ok());
+        let id = &saved.listing.connections[0].id;
+        assert!(uuid::Uuid::parse_str(id).is_ok());
         assert_eq!(
-            host.connection(id, "0", TerminalSize { cols: 80, rows: 24 })
-                .err()
-                .unwrap()
-                .code,
-            "CONFIG_CONFLICT"
+            saved.listing.connections[0].credential_policy,
+            crate::storage::profiles::CredentialPolicy::AskOnConnect
         );
-        let reopened = HostStorage::from_root(Ok(root.clone()));
-        assert!(!reopened.status().unwrap().listing.connections[0].credential_present);
+        assert!(host
+            .connection_with_credential(
+                id,
+                "1",
+                TerminalSize { cols: 80, rows: 24 },
+                Some("synthetic-one-attempt".into()),
+                false
+            )
+            .is_ok());
+        assert!(!host.status().unwrap().listing.connections[0].credential_present);
         assert_eq!(
-            reopened
-                .connection(id, "1", TerminalSize { cols: 80, rows: 24 })
+            host.connection(id, "1", TerminalSize { cols: 80, rows: 24 })
                 .err()
                 .unwrap()
                 .code,
             "CREDENTIAL_MISSING"
         );
+        let disk = std::fs::read_to_string(root.join("connections.toml")).unwrap();
+        assert!(!disk.contains("synthetic-one-attempt"));
+        let serialized = serde_json::to_string(&host.status().unwrap()).unwrap();
+        assert!(!serialized.contains("synthetic-one-attempt"));
+        let reopened = HostStorage::from_root(Ok(root.clone()));
+        assert_eq!(reopened.status().unwrap().listing.connections[0].id, *id);
+        assert_eq!(
+            host.set_mode("1", CredentialMode::SessionOnly)
+                .err()
+                .unwrap()
+                .code,
+            "CREDENTIAL_GLOBAL_MODE_RETIRED"
+        );
         drop((host, reopened));
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn session_profile_save_does_not_silently_store_secret_or_accept_revision_conflict() {
+    fn rejected_revision_does_not_store_temporary_or_persistent_input() {
         let (root, host) = fixture();
-        assert_eq!(
-            host.save(SaveProfileRequest {
-                expected_revision: "0".into(),
-                profile: draft(),
-                credential_update: CredentialUpdate::Set {
-                    value: "synthetic".into()
-                }
-            })
-            .err()
-            .unwrap()
-            .code,
-            "SESSION_CREDENTIAL_UPDATE_REQUIRED"
-        );
         assert_eq!(
             host.save(SaveProfileRequest {
                 expected_revision: "99".into(),
                 profile: draft(),
-                credential_update: CredentialUpdate::Keep
+                credential_update: CredentialUpdate::Set {
+                    value: "synthetic-rejected-secret".into()
+                }
             })
             .err()
             .unwrap()
@@ -436,7 +517,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn session_credential_update_rejects_cross_instance_profile_revision_change() {
+    fn temporary_credential_rejects_cross_instance_target_change() {
         let (root, host) = fixture();
         let first = host
             .save(SaveProfileRequest {
@@ -458,21 +539,116 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            host.set_session(&id, "1", Some("synthetic-not-for-changed-target".into()))
-                .err()
-                .unwrap()
-                .code,
+            host.connection_with_credential(
+                &id,
+                "1",
+                TerminalSize { cols: 80, rows: 24 },
+                Some("synthetic-not-for-new-target".into()),
+                false
+            )
+            .err()
+            .unwrap()
+            .code,
             "CONFIG_CONFLICT"
         );
         assert!(!host.status().unwrap().listing.connections[0].credential_present);
-        host.set_session(&id, "2", Some("synthetic-explicit-current-target".into()))
+        assert!(host
+            .connection_with_credential(
+                &id,
+                "2",
+                TerminalSize { cols: 80, rows: 24 },
+                Some("synthetic-current-target".into()),
+                false
+            )
+            .is_ok());
+        drop((host, other));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn delete_is_revision_checked_and_does_not_remove_other_profiles() {
+        let (root, host) = fixture();
+        let first = host
+            .save(SaveProfileRequest {
+                expected_revision: "0".into(),
+                profile: draft(),
+                credential_update: CredentialUpdate::Keep,
+            })
+            .unwrap();
+        let id = first.listing.connections[0].id.clone();
+        host.save(SaveProfileRequest {
+            expected_revision: "1".into(),
+            profile: draft(),
+            credential_update: CredentialUpdate::Keep,
+        })
+        .unwrap();
+        assert_eq!(host.delete(&id, "1").err().unwrap().code, "CONFIG_CONFLICT");
+        let remaining = host.delete(&id, "2").unwrap();
+        assert_eq!(remaining.listing.connections.len(), 1);
+        assert_ne!(remaining.listing.connections[0].id, id);
+        drop(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn encrypted_key_prompts_only_when_needed_and_temporary_passphrase_is_not_saved() {
+        let (root, host) = fixture();
+        let directory =
+            crate::storage::private_files::PrivateDirectory::open_or_create(&root).unwrap();
+        let key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let clear = key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap();
+        directory
+            .update("fixture-key", 1024 * 1024, |_| {
+                Ok(((), Some(Zeroizing::new(clear.as_bytes().to_vec()))))
+            })
+            .unwrap();
+        let mut input = draft();
+        input.auth_kind = AuthKind::PrivateKey;
+        input.private_key_path = Some(root.join("fixture-key"));
+        let saved = host
+            .save(SaveProfileRequest {
+                expected_revision: "0".into(),
+                profile: input,
+                credential_update: CredentialUpdate::Keep,
+            })
+            .unwrap();
+        let id = &saved.listing.connections[0].id;
+        assert!(host
+            .connection(id, "1", TerminalSize { cols: 80, rows: 24 })
+            .is_ok());
+        let encrypted = key
+            .encrypt(&mut rand::rng(), "synthetic-key-passphrase")
+            .unwrap()
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap();
+        directory
+            .update("fixture-key", 1024 * 1024, |_| {
+                Ok(((), Some(Zeroizing::new(encrypted.as_bytes().to_vec()))))
+            })
             .unwrap();
         assert_eq!(
-            host.set_session(&id, "1", None).err().unwrap().code,
-            "CONFIG_CONFLICT"
+            host.connection(id, "1", TerminalSize { cols: 80, rows: 24 })
+                .err()
+                .unwrap()
+                .code,
+            "CREDENTIAL_PASSPHRASE_REQUIRED"
         );
-        assert!(host.status().unwrap().listing.connections[0].credential_present);
-        drop((host, other));
+        assert!(host
+            .connection_with_credential(
+                id,
+                "1",
+                TerminalSize { cols: 80, rows: 24 },
+                Some("synthetic-key-passphrase".into()),
+                false
+            )
+            .is_ok());
+        assert!(!host.status().unwrap().listing.connections[0].credential_present);
+        assert!(!std::fs::read_to_string(root.join("connections.toml"))
+            .unwrap()
+            .contains("synthetic-key-passphrase"));
+        drop((host, directory));
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

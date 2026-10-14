@@ -11,7 +11,7 @@ import { MAX_DRAFT_LENGTH, MAX_MESSAGE_BYTES, utf8Length } from '../lib/chats';
 
 // These native start errors are returned strictly before a run is inserted or
 // launched. Every other failure remains ambiguous and must not be resubmitted.
-const START_PREFLIGHT_ERRORS = new Set(['TASK_INPUT_INVALID', 'MODEL_CONFIG_CHANGED', 'MODEL_CONFIG_UNAVAILABLE', 'SESSION_STALE', 'CHAT_BUSY', 'CHAT_NOT_FOUND', 'AI_OWNER_BUSY', 'TERMINAL_OUTCOME_UNKNOWN', 'TERMINAL_READINESS_REQUIRED']);
+const START_PREFLIGHT_ERRORS = new Set(['TASK_INPUT_INVALID', 'MODEL_CONFIG_CHANGED', 'MODEL_CONFIG_UNAVAILABLE', 'SESSION_STALE', 'CHAT_BUSY', 'CHAT_NOT_FOUND', 'AI_OWNER_BUSY', 'TERMINAL_OUTCOME_UNKNOWN', 'TERMINAL_READINESS_REQUIRED', 'SHELL_INTEGRATION_REQUIRED', 'SHELL_NOT_READY', 'SHELL_INTEGRATION_UNAVAILABLE', 'CHAT_RESTORED_READ_ONLY', 'CHAT_TARGET_MISMATCH']);
 type Pending = 'starting' | 'acknowledging' | 'deciding' | 'cancelling' | 'continuing' | 'preparing_secret';
 export function useTerminalAgent(config: ModelConfigStatus, session: SessionSnapshot) {
   const native = desktopAvailable();
@@ -145,6 +145,33 @@ export function useTerminalAgent(config: ModelConfigStatus, session: SessionSnap
     if (!task || !task.owner || task.phase !== 'awaiting_display' || task.action?.displayed || !connected(task)) return;
     await mutate(task.task_id, `ack:${identity.run_id}:${identity.action_id}:${identity.display_revision}`, 'acknowledging', () => agentBridge.ack(identity));
   };
+  // Ordinary actions are observable in the in-process task timeline even when
+  // another chat or a nonmodal settings panel is selected. A mounted, visible
+  // webview must first commit that snapshot; this is not disk-history consent.
+  // Dangerous/unknown actions still use the exact visible card's ACK below.
+  useEffect(() => {
+    if (!native || !ready) return;
+    let stopped = false;
+    let first = 0;
+    let second = 0;
+    const acceptOrdinary = () => {
+      if (stopped || document.visibilityState !== 'visible') return;
+      cancelAnimationFrame(first); cancelAnimationFrame(second);
+      first = requestAnimationFrame(() => {
+        second = requestAnimationFrame(() => {
+          if (stopped || !alive.current || document.visibilityState !== 'visible') return;
+          for (const task of Object.values(tasksRef.current)) {
+            if (task.phase !== 'awaiting_display' || task.action?.displayed || task.action?.blocked || task.action?.policy !== 'auto_normal') continue;
+            const identity = actionIdentity(task);
+            if (identity) void acknowledge(identity);
+          }
+        });
+      });
+    };
+    acceptOrdinary();
+    document.addEventListener('visibilitychange', acceptOrdinary);
+    return () => { stopped = true; cancelAnimationFrame(first); cancelAnimationFrame(second); document.removeEventListener('visibilitychange', acceptOrdinary); };
+  }, [tasks, pending, uncertain, native, ready, session.state, session.session?.session_id, session.session?.generation]);
   const decide = async (identity: ActionIdentity, approvalId: string, decision: 'approve' | 'deny') => {
     const task = matches(identity);
     if (!task || !task.owner || task.phase !== 'waiting_approval' || !task.action?.displayed || task.action.approval_id !== approvalId || !connected(task)) return;

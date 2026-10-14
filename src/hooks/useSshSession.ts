@@ -1,4 +1,5 @@
 import { storageBridge } from '../lib/storageBridge';
+import type { ProfileConnectOptions } from '../lib/storageBridge';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { desktopAvailable, sshBridge } from '../lib/bridge';
 import { INITIAL_SESSION, sameSession, safeError } from '../lib/types';
@@ -59,11 +60,15 @@ export function useSshSession() {
     catch (failure) { if (alive.current) setError(safeError(failure)); return false; }
     finally { operation.current = false; }
   };
-  const connectSaved = async (connectionId: string, profileRevision: string): Promise<boolean> => {
+  const connectSaved = async (connectionId: string, profileRevision: string, options?: ProfileConnectOptions): Promise<boolean> => {
     if (!ready || operation.current) return false;
     operation.current = true; setError(null); setHistoryUnavailable(false);
-    try { const next = await storageBridge.connectProfile(connectionId, profileRevision, size.current); if (alive.current) acceptSnapshot(next); return true; }
-    catch (failure) { if (alive.current) setError(safeError(failure)); return false; }
+    try { const next = await storageBridge.connectProfile(connectionId, profileRevision, size.current, options); if (alive.current) acceptSnapshot(next); return true; }
+    catch (failure) {
+      if (alive.current) setError(safeError(failure));
+      if (failure && typeof failure === 'object' && 'code' in failure && typeof failure.code === 'string' && failure.code.startsWith('CREDENTIAL_')) throw failure;
+      return false;
+    }
     finally { operation.current = false; }
   };
   const disconnect = async (): Promise<void> => {

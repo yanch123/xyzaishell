@@ -66,3 +66,28 @@ describe('terminal task visible workflow', () => {
     expect(screen.queryByRole('checkbox')).toBeNull(); expect(continueTask).not.toHaveBeenCalled();
   });
 });
+
+describe('integrated automatic execution states', () => {
+  it('does not ask for per-command readiness while waiting on real lifecycle evidence', () => {
+    const current = task({ phase: 'awaiting_completion', terminal_ready: false, action: action({ delivery: 'write_accepted', policy: 'auto_normal', risk: 'normal' }) });
+    const continueTask = vi.fn();
+    render(<TerminalTaskPane {...common} agent={controller({ tasks: { 'chat-a': current }, continueTask })} />);
+    expect(screen.getByText('等待命令返回与 Shell 就绪')).toBeDefined();
+    expect(screen.queryByRole('checkbox')).toBeNull();
+    expect(continueTask).not.toHaveBeenCalled();
+  });
+  it('keeps foreground return separate from shell readiness and business success', () => {
+    const current = task({ phase: 'awaiting_completion', terminal_ready: false, remote_outcome: 'foreground_returned', action: action({ delivery: 'write_accepted', command_completed: true, exit_code: 0 }) });
+    render(<TerminalTaskPane {...common} agent={controller({ tasks: { 'chat-a': current } })} />);
+    expect(screen.getByText(/仍在等待独立 Shell 就绪证据/)).toBeDefined();
+    expect(screen.getByText(/这不证明业务目标成功或后台工作结束/)).toBeDefined();
+    expect(screen.queryByRole('checkbox')).toBeNull();
+  });
+  it('shows unknown unsupported actions without offering a false safe approval', () => {
+    const current = task({ phase: 'unsupported_action', action: action({ policy: 'manual_only', risk: 'unknown', blocked: true, approval_id: null }) });
+    render(<TerminalTaskPane {...common} agent={controller({ tasks: { 'chat-a': current } })} />);
+    expect(screen.getByText('未知风险 · 仅手动处理')).toBeDefined();
+    expect(screen.queryByRole('button', { name: '仅批准这条命令' })).toBeNull();
+    expect(screen.getByRole('button', { name: '停止 AI 任务' })).toBeDefined();
+  });
+});

@@ -12,6 +12,7 @@ pub mod agent;
 pub mod decision;
 mod execution;
 pub mod observation;
+mod risk;
 
 pub mod host_storage;
 pub mod storage;
@@ -24,3 +25,5 @@ pub mod shell_log;
 pub mod shell_log_protocol;
 pub mod shell_log_store;
 pub mod shell_log_types;
+
+pub mod shell_integration;

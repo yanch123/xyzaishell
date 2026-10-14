@@ -46,23 +46,23 @@ class UpgradeBaselineTests(unittest.TestCase):
             directory = self.fixture(platform)
             app = self.root / (platform + "-app")
             app.write_bytes(b"baseline executable")
-            self.assertEqual(baseline.verify(directory, platform, "0.1.1", app).name, self.pins[platform]["package"][0])
+            self.assertEqual(baseline.verify(directory, platform, "0.1.2", app).name, self.pins[platform]["package"][0])
             app.write_bytes(b"other executable")
             with self.assertRaises(ValueError):
-                baseline.verify(directory, platform, "0.1.1", app)
+                baseline.verify(directory, platform, "0.1.2", app)
 
     def test_unknown_target_missing_or_changed_assets_fail(self):
         directory = self.fixture("linux-x64")
-        for version in ("0.1.0", "0.1.2", "latest"):
+        for version in ("0.1.0", "0.1.1", "0.1.3", "latest"):
             with self.assertRaises(ValueError):
                 baseline.verify(directory, "linux-x64", version)
         package = directory / self.pins["linux-x64"]["package"][0]
         package.write_bytes(b"changed")
         with self.assertRaises(ValueError):
-            baseline.verify(directory, "linux-x64", "0.1.1")
+            baseline.verify(directory, "linux-x64", "0.1.2")
         package.unlink()
         with self.assertRaises(ValueError):
-            baseline.verify(directory, "linux-x64", "0.1.1")
+            baseline.verify(directory, "linux-x64", "0.1.2")
 
     def test_symlink_asset_rejected(self):
         directory = self.fixture("linux-x64")
@@ -71,7 +71,7 @@ class UpgradeBaselineTests(unittest.TestCase):
         path.rename(target)
         path.symlink_to(target)
         with self.assertRaises(ValueError):
-            baseline.verify(directory, "linux-x64", "0.1.1")
+            baseline.verify(directory, "linux-x64", "0.1.2")
 
     def test_manifest_fields_are_bound_even_if_manifest_pin_is_updated(self):
         directory = self.fixture("linux-x64")
@@ -81,7 +81,7 @@ class UpgradeBaselineTests(unittest.TestCase):
         body = json.dumps(data).encode();path.write_bytes(body)
         self.pins["linux-x64"]["manifest"] = (path.name, len(body), hashlib.sha256(body).hexdigest())
         with self.assertRaises(ValueError):
-            baseline.verify(directory, "linux-x64", "0.1.1")
+            baseline.verify(directory, "linux-x64", "0.1.2")
 
     def test_download_is_bounded_and_never_overwrites_output(self):
         def response(request, timeout):
@@ -93,10 +93,10 @@ class UpgradeBaselineTests(unittest.TestCase):
             return stream
         directory = self.root / "downloaded"
         with patch.object(baseline, "open_https", side_effect=response) as opened:
-            baseline.download(directory, "windows-x64", "0.1.1")
+            baseline.download(directory, "windows-x64", "0.1.2")
             self.assertEqual(opened.call_count, 2)
             with self.assertRaises(FileExistsError):
-                baseline.download(directory, "windows-x64", "0.1.1")
+                baseline.download(directory, "windows-x64", "0.1.2")
             self.assertEqual(opened.call_count, 2)
 
     def test_http_redirect_is_rejected_before_following_it(self):
@@ -113,7 +113,7 @@ class UpgradeBaselineTests(unittest.TestCase):
                 return stream
             with patch.object(baseline, "open_https", side_effect=response):
                 with self.assertRaises(ValueError):
-                    baseline.download(self.root / kind, "linux-x64", "0.1.1")
+                    baseline.download(self.root / kind, "linux-x64", "0.1.2")
 
 
 if __name__ == "__main__":

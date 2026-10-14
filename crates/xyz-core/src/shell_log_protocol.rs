@@ -11,6 +11,14 @@ const SCRIPT: &str = include_str!("shell_log_bootstrap.bash");
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WireEvent {
     Closed,
+    Unsupported {
+        reason: String,
+    },
+    Ready {
+        sequence: u64,
+        remote_time_s: u64,
+        shadowed_commands: Vec<String>,
+    },
     Malformed {
         reason: String,
     },
@@ -49,17 +57,14 @@ fn valid_nonce(s: &str) -> bool {
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
-/// Send only after explicit user approval at an idle POSIX-family shell prompt.
-/// Fish/csh and input owned by an application are not supported. Never auto-retry.
+/// Install TEMPORARY hooks in the already idle, explicitly confirmed current Bash.
+/// No child shell, startup-file changes, hidden SSH channel, or automatic retry.
 pub fn bootstrap_command(nonce: &str) -> Result<String, ProtocolError> {
     if !valid_nonce(nonce) {
         return Err(ProtocolError("invalid integration nonce"));
     }
     let script = SCRIPT.replace("@NONCE@", nonce);
-    // Process substitution is parsed by the inner Bash, not the user's /bin/sh.
-    // The temporary rc is a pipe FD, never a persistent remote file.
-    let launcher = r#"if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then printf '%s\n' 'xyzaishell: Bash 4.4 or newer is required'; exit 1; fi; command -v base64 >/dev/null && command -v tr >/dev/null || { printf '%s\n' 'xyzaishell: base64 and tr are required'; exit 1; }; exec bash --noprofile --rcfile <(builtin printf '%s' "$1") -i"#;
-    let command = format!("env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS bash --noprofile --norc -c {} xyzaishell {}\n", quote(launcher), quote(&script));
+    let command = format!("if builtin shopt -q interactive_comments; then builtin eval {}; else builtin printf '\\033]777;xyzlog;2;{nonce};U;unsupported_options\\007'; fi\n", quote(&script));
     if command.len() > 16 * 1024 {
         return Err(ProtocolError("bootstrap exceeds SSH input frame limit"));
     }
@@ -196,11 +201,37 @@ fn parse_frame(nonce: &str, frame: &[u8]) -> Option<WireEvent> {
 fn parse_valid_frame(nonce: &str, frame: &[u8]) -> Option<WireEvent> {
     let text = std::str::from_utf8(frame).ok()?;
     let fields: Vec<_> = text.split(';').take(9).collect();
-    if fields.len() < 3 || fields[0] != "1" || fields[1] != nonce {
+    if fields.len() < 3 || !matches!(fields[0], "1" | "2") || fields[1] != nonce {
         return None;
     }
     match fields[2] {
         "X" if fields.len() == 3 => Some(WireEvent::Closed),
+        "U" if fields.len() == 4
+            && fields[3].len() <= 64
+            && fields[3]
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'_') =>
+        {
+            Some(WireEvent::Unsupported {
+                reason: fields[3].into(),
+            })
+        }
+        "R" if fields.len() == 6 && fields[0] == "2" => {
+            let names = decoded(fields[5], 8192).ok()?;
+            let shadowed_commands = names.lines().map(str::to_owned).collect::<Vec<_>>();
+            if shadowed_commands.len() > 512
+                || shadowed_commands.iter().any(|name| {
+                    name.is_empty() || name.len() > 256 || name.chars().any(char::is_control)
+                })
+            {
+                return None;
+            }
+            Some(WireEvent::Ready {
+                sequence: number(fields[3])?,
+                remote_time_s: timestamp(fields[4])?,
+                shadowed_commands,
+            })
+        }
         "H" if fields.len() == 4
             && !fields[3].is_empty()
             && fields[3].len() <= 64
@@ -242,11 +273,15 @@ fn parse_valid_frame(nonce: &str, frame: &[u8]) -> Option<WireEvent> {
         "G" if fields.len() == 5
             && matches!(
                 fields[4],
-                "history_settings" | "history_missing" | "cwd_unavailable" | "oversize"
+                "history_settings"
+                    | "history_missing"
+                    | "cwd_unavailable"
+                    | "oversize"
+                    | "hooks_changed"
             ) =>
         {
             Some(WireEvent::Gap {
-                sequence: sequence(fields[3])?,
+                sequence: number(fields[3])?,
                 reason: fields[4].into(),
             })
         }

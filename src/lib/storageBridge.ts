@@ -1,15 +1,17 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { SessionSnapshot, TerminalSize } from './types';
-export type SavedProfile = { id: string; label: string; host: string; port: number; username: string; auth_kind: 'password' | 'private_key'; private_key_path: string | null; credential_present: boolean };
+export type CredentialPolicy = 'ask_on_connect' | 'system_secure';
+export type SavedProfile = { id: string; label: string; host: string; port: number; username: string; auth_kind: 'password' | 'private_key'; private_key_path: string | null; credential_present: boolean; credential_policy: CredentialPolicy };
 export type ProfileStatus = { platform: string; path_warning?: string | null; configuration_root: string | null; credentials: { credential_backend: 'dpapi_current_user' | 'linux_secret_service' | 'session_only'; credential_availability: 'available' | 'locked' | 'unavailable' | 'access_denied'; persistent_credentials: boolean }; listing: { revision: string; mode: string; connections: SavedProfile[] } };
-export type SaveProfile = { expected_revision: string; profile: Omit<SavedProfile, 'credential_present' | 'id'> & { id: string | null }; credential_update: { kind: 'keep' | 'clear' | 'set'; value?: string } };
+export type SaveProfile = { expected_revision: string; profile: Omit<SavedProfile, 'credential_present' | 'credential_policy' | 'id'> & { id: string | null }; credential_update: { kind: 'keep' | 'clear' | 'set'; value?: string } };
+export type ProfileConnectOptions = { temporaryCredential?: string; rememberCredential?: boolean };
+export type ConnectSavedProfile = (id: string, revision: string, options?: ProfileConnectOptions) => Promise<boolean>;
 export const storageBridge = {
   profiles: () => invoke<ProfileStatus>('get_profile_status'),
   saveProfile: (request: SaveProfile) => invoke<ProfileStatus>('save_connection_profile', { request }),
-  sessionCredential: (connectionId: string, expectedRevision: string, value: string | null) => invoke<ProfileStatus>('set_session_credential', { connectionId, expectedRevision, value }),
-  sessionMode: (expectedRevision: string) => invoke<ProfileStatus>('set_credential_mode', { expectedRevision, mode: 'session_only' }),
-  connectProfile: (connectionId: string, profileRevision: string, size: TerminalSize) => invoke<SessionSnapshot>('connect_saved_profile', { connectionId, profileRevision, size }),
+  deleteProfile: (connectionId: string, expectedRevision: string) => invoke<ProfileStatus>('delete_connection_profile', { connectionId, expectedRevision }),
+  connectProfile: (connectionId: string, profileRevision: string, size: TerminalSize, options?: ProfileConnectOptions) => invoke<SessionSnapshot>('connect_saved_profile', { connectionId, profileRevision, size, temporaryCredential: options?.temporaryCredential ?? null, rememberCredential: options?.rememberCredential ?? false }),
 };
 
 export type HistoryStatus = { enabled: boolean; manageable?: boolean; available: boolean; plaintext: true; revision: string; error: import('./types').ApiError | null };

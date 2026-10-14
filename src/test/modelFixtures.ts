@@ -1,7 +1,7 @@
 import type { ChatSnapshot, ModelConfigStatus } from '../lib/model';
 export const modelConfig: ModelConfigStatus = {
-  path: '/home/test/.config/xyzaishell/model.toml', revision: '1', ready: true,
-  destination: 'https://models.example.test/v1/chat/completions', model: 'test-model', consented: true,
+  path: '/home/test/.config/xyzaishell/model.toml', revision: '1', file_revision: 'saved-file-1', base_url: 'https://models.example.test/v1', key_present: true, path_overridden: false, ready: true,
+  destination: 'https://models.example.test/v1', model: 'test-model', consented: true,
   error: null, warning: null, context_policy: 'explicit_chat_only', persistence: 'memory_only',
 };
 export function chat(id = 'chat-a', revision = '1'): ChatSnapshot {

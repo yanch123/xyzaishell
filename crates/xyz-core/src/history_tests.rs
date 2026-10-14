@@ -44,6 +44,8 @@ fn id() -> String {
 }
 fn snapshot() -> ChatSnapshot {
     ChatSnapshot {
+        source: None,
+        restored_read_only: false,
         chat_id: id(),
         task_id: id(),
         title: "Synthetic history".into(),
@@ -175,7 +177,7 @@ fn explicit_restore_preserves_ids_but_no_run_or_approval_and_does_not_replace_op
             .send_message(&entry.chat_id, "Explicit send still needs model setup")
             .unwrap_err()
             .code,
-        "MODEL_CONSENT_REQUIRED"
+        "CHAT_READ_ONLY"
     );
     manager.set_history_enabled(false).unwrap();
 }
@@ -417,7 +419,7 @@ fn model_key_filters_chat_title_without_authorizing_a_model_destination() {
 }
 
 #[tokio::test]
-async fn restored_context_and_new_model_output_filter_shared_task_and_ssh_secrets() {
+async fn restored_context_is_read_only_and_new_chat_filters_shared_task_and_ssh_secrets() {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -463,6 +465,17 @@ async fn restored_context_and_new_model_output_filter_shared_task_and_ssh_secret
             config.destination.as_deref().unwrap(),
         )
         .unwrap();
+    let restored = manager.get_chat(&original.chat_id).unwrap();
+    assert!(restored.restored_read_only);
+    assert!(!restored.messages[0].text.contains("synthetic-task-value"));
+    assert_eq!(
+        manager
+            .send_message(&original.chat_id, "Never send restored context")
+            .unwrap_err()
+            .code,
+        "CHAT_READ_ONLY"
+    );
+    let fresh = manager.create_chat("Fresh context").unwrap();
     let response_text = "Echo synthetic-task-value synthetic-ssh-value synthetic-model-key";
     let server_task = tokio::spawn(async move {
         let (mut socket, _) = server.accept().await.unwrap();
@@ -499,13 +512,13 @@ async fn restored_context_and_new_model_output_filter_shared_task_and_ssh_secret
     });
     manager
         .send_message(
-            &original.chat_id,
+            &fresh.chat_id,
             "New synthetic-task-value synthetic-ssh-value",
         )
         .unwrap();
     let complete = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let chat = manager.get_chat(&original.chat_id).unwrap();
+            let chat = manager.get_chat(&fresh.chat_id).unwrap();
             if chat.active_run_id.is_none() {
                 break chat;
             }
@@ -515,7 +528,7 @@ async fn restored_context_and_new_model_output_filter_shared_task_and_ssh_secret
     .await
     .unwrap();
     let body = server_task.await.unwrap();
-    assert!(body.contains("Older text"));
+    assert!(!body.contains("Older text"));
     for secret in [
         "synthetic-task-value",
         "synthetic-ssh-value",
@@ -526,14 +539,24 @@ async fn restored_context_and_new_model_output_filter_shared_task_and_ssh_secret
     }
     manager.flush_history().unwrap();
     manager.set_history_enabled(false).unwrap();
-    let data = fs::read(fixture.path.join(DATABASE_NAME)).unwrap();
+    let stored = HistoryStore::open(&fixture.path, HistoryPreference::SaveRedactedText).unwrap();
+    let fresh_row = stored.read(&fresh.chat_id).unwrap();
+    let fresh_payload = serde_json::to_string(&fresh_row.chat).unwrap();
     for secret in [
         "synthetic-task-value",
         "synthetic-ssh-value",
         "synthetic-model-key",
     ] {
+        assert!(!fresh_payload.contains(secret));
+    }
+    drop(stored);
+    let data = fs::read(fixture.path.join(DATABASE_NAME)).unwrap();
+    for secret in ["synthetic-ssh-value", "synthetic-model-key"] {
         assert!(!String::from_utf8_lossy(&data).contains(secret));
     }
+    // Restore is read-only: a secret not known when an old row was saved may
+    // remain on disk. Learning it redacts reads/new writes, not past disk copies.
+    assert!(String::from_utf8_lossy(&data).contains("synthetic-task-value"));
 }
 
 #[test]

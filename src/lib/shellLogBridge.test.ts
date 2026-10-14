@@ -8,7 +8,7 @@ describe('shell log IPC contract', () => {
   it('uses dedicated native commands and explicit consent', async () => {
     const session = { session_id: 's', generation: '2' };
     await shellLogBridge.status(); expect(invoke).toHaveBeenLastCalledWith('get_shell_log_status');
-    await shellLogBridge.start(session); expect(invoke).toHaveBeenLastCalledWith('start_shell_log', { session, consent: true, readinessConfirmed: true });
+    await shellLogBridge.start(session); expect(invoke).toHaveBeenLastCalledWith('start_shell_log', { session, consent: true });
     await shellLogBridge.pause(true); expect(invoke).toHaveBeenLastCalledWith('set_shell_log_paused', { paused: true });
     const query = { contains: 'x', snapshot_max_seq: '999999999999999999' };
     await shellLogBridge.query(query); expect(invoke).toHaveBeenLastCalledWith('query_shell_log', { query });

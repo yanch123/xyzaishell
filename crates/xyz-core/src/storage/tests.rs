@@ -368,6 +368,7 @@ fn private_modes_symlinks_hardlinks_and_oversized_files_are_rejected() {
 #[test]
 fn native_dpapi_current_user_roundtrip_and_binding_failure() {
     let store = CredentialStore::new(CredentialMode::DpapiCurrentUser).unwrap();
+    verify_native_profile_recovery(&store);
     let id = Uuid::new_v4().to_string();
     let value = SecretValue::new(b"synthetic-Windows-only-secret".to_vec()).unwrap();
     let descriptor = store
@@ -409,6 +410,7 @@ fn native_secret_service_isolated_roundtrip() {
     );
     assert!(std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok());
     let store = CredentialStore::new(CredentialMode::LinuxSecretService).unwrap();
+    verify_native_profile_recovery(&store);
     let id = Uuid::new_v4().to_string();
     let value = SecretValue::new(b"synthetic-disposable-keyring-secret".to_vec()).unwrap();
     let descriptor = store
@@ -834,4 +836,247 @@ fn database_bridge_accepts_private_inherited_sqlite_sidecar_acl() {
     // Secret TOML reads still insist on explicit protection; only this metadata
     // bridge permits private inheritance for SQLite-managed files.
     assert!(directory.read("history.sqlite3-journal", 1024).is_err());
+}
+
+#[test]
+fn legacy_session_migration_preserves_identity_and_can_use_native_backend_again() {
+    let f = Fixture::new();
+    let id = Uuid::new_v4().to_string();
+    let old = format!("schema_version=1\nrevision=9\n[storage]\nsecret_protection='session_only'\n[[connections]]\nid='{id}'\nlabel='legacy label'\nhost='localhost'\nport=2200\nusername='legacy-user'\n[connections.auth]\nkind='password'\n");
+    edit(&f, "connections.toml", old.as_bytes());
+    let store = ProfileStore::open(&f.path).unwrap();
+    store.migrate().unwrap();
+    store.migrate().unwrap();
+    let mode = if cfg!(windows) {
+        CredentialMode::DpapiCurrentUser
+    } else {
+        CredentialMode::LinuxSecretService
+    };
+    let native = CredentialStore::new(mode).unwrap();
+    let result = store.list(&native).unwrap();
+    assert_eq!(result.revision, "10");
+    assert_eq!(result.connections[0].id, id);
+    assert_eq!(result.connections[0].label, "legacy label");
+    assert_eq!(result.connections[0].port, 2200);
+    assert_eq!(
+        result.connections[0].credential_policy,
+        CredentialPolicy::AskOnConnect
+    );
+    assert!(!result.connections[0].credential_present);
+    assert_eq!(
+        std::fs::read_to_string(f.path.join("connections.v1.backup.toml")).unwrap(),
+        old
+    );
+    let text = std::fs::read_to_string(f.path.join("connections.toml")).unwrap();
+    assert!(text.contains("schema_version = 2"));
+    assert!(!text.contains("protected_password"));
+    assert!(matches!(
+        store.resolve_for_authentication(&id, 10, &native),
+        Err(StorageError::CredentialMissing)
+    ));
+}
+
+#[test]
+fn migration_preserves_native_references_and_per_profile_policies_are_independent() {
+    let f = Fixture::new();
+    let id = Uuid::new_v4().to_string();
+    let other = Uuid::new_v4().to_string();
+    let reference = format!("xyzaishell:v1:{id}:ssh_password:{}", Uuid::new_v4());
+    // A copied Linux profile remains readable even on Windows. Resolving the
+    // foreign protected secret still fails closed at the native adapter.
+    let old = format!("schema_version=1\nrevision=2\n[storage]\nsecret_protection='linux_secret_service'\n[[connections]]\nid='{id}'\nlabel='secure'\nhost='localhost'\nusername='user'\n[connections.auth]\nkind='password'\npassword_secret_ref='{reference}'\n[[connections]]\nid='{other}'\nlabel='ask'\nhost='localhost'\nusername='user'\n[connections.auth]\nkind='password'\n");
+    edit(&f, "connections.toml", old.as_bytes());
+    let store = ProfileStore::open(&f.path).unwrap();
+    store.migrate().unwrap();
+    let credentials = CredentialStore::new(if cfg!(windows) {
+        CredentialMode::DpapiCurrentUser
+    } else {
+        CredentialMode::LinuxSecretService
+    })
+    .unwrap();
+    let listing = store.list(&credentials).unwrap();
+    assert_eq!(
+        listing.connections[0].credential_policy,
+        CredentialPolicy::SystemSecure
+    );
+    assert_eq!(
+        listing.connections[1].credential_policy,
+        CredentialPolicy::AskOnConnect
+    );
+    let mut renamed = store.draft_for_authentication(&other, 3).unwrap();
+    renamed.label = "ask renamed".into();
+    store
+        .save(3, renamed, CredentialChange::Keep, &credentials)
+        .unwrap();
+    assert!(std::fs::read_to_string(f.path.join("connections.toml"))
+        .unwrap()
+        .contains(&reference));
+    let mut changed = store.draft_for_authentication(&id, 4).unwrap();
+    changed.host = "different.example".into();
+    assert_eq!(
+        store.save(4, changed, CredentialChange::Keep, &credentials),
+        Err(StorageError::CredentialTargetChanged)
+    );
+    let original = store.draft_for_authentication(&id, 4).unwrap();
+    store
+        .save(4, original, CredentialChange::Clear, &credentials)
+        .unwrap();
+    let listing = store.list(&credentials).unwrap();
+    assert!(listing
+        .connections
+        .iter()
+        .all(|p| p.credential_policy == CredentialPolicy::AskOnConnect));
+    assert_eq!(listing.connections[1].label, "ask renamed");
+    assert!(
+        std::fs::read_to_string(f.path.join("connections.v1.backup.toml"))
+            .unwrap()
+            .contains(&reference)
+    );
+}
+
+#[test]
+fn failed_migration_never_overwrites_the_only_legacy_file() {
+    let f = Fixture::new();
+    let old = "schema_version=1\nrevision=0\nconnections=[]\n[storage]\nsecret_protection='session_only'\n";
+    edit(&f, "connections.toml", old.as_bytes());
+    edit(
+        &f,
+        "connections.v1.backup.toml",
+        b"different protected recovery data",
+    );
+    let store = ProfileStore::open(&f.path).unwrap();
+    assert_eq!(store.migrate(), Err(StorageError::Conflict));
+    assert_eq!(
+        std::fs::read_to_string(f.path.join("connections.toml")).unwrap(),
+        old
+    );
+    edit(
+        &f,
+        "connections.toml",
+        old.replace("schema_version=1", "schema_version=99")
+            .as_bytes(),
+    );
+    assert_eq!(store.migrate(), Err(StorageError::UnsupportedSchema));
+}
+
+#[test]
+fn concurrent_migration_is_idempotent_and_keeps_the_exact_backup() {
+    let f = Fixture::new();
+    let old = "schema_version=1\nrevision=4\nconnections=[]\n[storage]\nsecret_protection='session_only'\n";
+    edit(&f, "connections.toml", old.as_bytes());
+    let run = || {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "storage::tests::migration_child", "--nocapture"])
+            .env("XYZ_TEST_MIGRATION_ROOT", &f.path)
+            .spawn()
+            .unwrap()
+    };
+    let mut a = run();
+    let mut b = run();
+    assert!(a.wait().unwrap().success());
+    assert!(b.wait().unwrap().success());
+    assert_eq!(
+        ProfileStore::open(&f.path)
+            .unwrap()
+            .list(&session())
+            .unwrap()
+            .revision,
+        "5"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.path.join("connections.v1.backup.toml")).unwrap(),
+        old
+    );
+}
+#[test]
+fn migration_child() {
+    let Some(root) = std::env::var_os("XYZ_TEST_MIGRATION_ROOT") else {
+        return;
+    };
+    ProfileStore::open(&PathBuf::from(root))
+        .unwrap()
+        .migrate()
+        .unwrap();
+}
+
+fn verify_native_profile_recovery(store: &CredentialStore) {
+    let f = Fixture::new();
+    let id = Uuid::new_v4().to_string();
+    let other = Uuid::new_v4().to_string();
+    let old = format!("schema_version=1\nrevision=0\n[storage]\nsecret_protection='session_only'\n[[connections]]\nid='{id}'\nlabel='recover'\nhost='localhost'\nusername='user'\n[connections.auth]\nkind='password'\n[[connections]]\nid='{other}'\nlabel='ask'\nhost='localhost'\nusername='user'\n[connections.auth]\nkind='password'\n");
+    edit(&f, "connections.toml", old.as_bytes());
+    let profiles = ProfileStore::open(&f.path).unwrap();
+    profiles.migrate().unwrap();
+    let first = profiles.draft_for_authentication(&id, 1).unwrap();
+    profiles
+        .save(
+            1,
+            first,
+            CredentialChange::Set(
+                SecretValue::new(b"synthetic-recovered-secret".to_vec()).unwrap(),
+            ),
+            store,
+        )
+        .unwrap();
+    let listing = profiles.list(store).unwrap();
+    assert_eq!(
+        listing.connections[0].credential_policy,
+        CredentialPolicy::SystemSecure
+    );
+    assert_eq!(
+        listing.connections[1].credential_policy,
+        CredentialPolicy::AskOnConnect
+    );
+    assert_eq!(
+        profiles
+            .resolve_for_authentication(&id, 2, store)
+            .unwrap()
+            .credential
+            .unwrap()
+            .expose(),
+        b"synthetic-recovered-secret"
+    );
+    let mut rename = profiles.draft_for_authentication(&other, 2).unwrap();
+    rename.label = "still ask".into();
+    profiles
+        .save(2, rename, CredentialChange::Keep, store)
+        .unwrap();
+    assert_eq!(
+        profiles
+            .resolve_for_authentication(&id, 3, store)
+            .unwrap()
+            .credential
+            .unwrap()
+            .expose(),
+        b"synthetic-recovered-secret"
+    );
+    let disk = std::fs::read_to_string(f.path.join("connections.toml")).unwrap();
+    assert!(!disk.contains("synthetic-recovered-secret"));
+    let document: toml::Value = toml::from_str(&disk).unwrap();
+    let field = if store.mode() == CredentialMode::DpapiCurrentUser {
+        "protected_password"
+    } else {
+        "password_secret_ref"
+    };
+    let descriptor = StoredCredential {
+        mode: store.mode(),
+        encoded: document["connections"][0]["auth"][field]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    };
+    let first = profiles.draft_for_authentication(&id, 3).unwrap();
+    profiles
+        .save(3, first, CredentialChange::Clear, store)
+        .unwrap();
+    assert!(profiles
+        .list(store)
+        .unwrap()
+        .connections
+        .iter()
+        .all(|p| p.credential_policy == CredentialPolicy::AskOnConnect));
+    // Only this isolated test-created entry is removed after its reference was cleared.
+    store
+        .remove(&id, CredentialPurpose::SshPassword, Some(&descriptor))
+        .unwrap();
 }

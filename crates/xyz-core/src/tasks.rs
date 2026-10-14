@@ -2,7 +2,10 @@
 //! inert text and stable task identities; it never restores a live run.
 use crate::{
     history::{HistoryEntry, HistoryService, HistoryStatus},
-    model::{ModelConfigManager, ModelConfigStatus, ModelSnapshot},
+    model::{
+        ModelConfigManager, ModelConfigStatus, ModelSnapshot, ModelTestRequest, ModelTestResult,
+        SaveModelConfigRequest,
+    },
     ssh::ApiError,
 };
 use futures::StreamExt;
@@ -54,11 +57,46 @@ pub struct ChatMessage {
     pub destination: Option<String>,
     pub model: Option<String>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChatSource {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub session_id: String,
+    pub generation: String,
+}
+impl ChatSource {
+    /// Only the host's actual connected snapshot supplies this provenance.
+    pub fn from_session(snapshot: &crate::ssh::SessionSnapshot) -> Option<Self> {
+        if snapshot.state != crate::ssh::SessionState::Connected {
+            return None;
+        }
+        let session = snapshot.session.as_ref()?;
+        Some(Self {
+            host: snapshot.host.clone()?,
+            port: snapshot.port?,
+            username: snapshot.username.clone()?,
+            session_id: session.session_id.clone(),
+            generation: session.generation.clone(),
+        })
+    }
+    pub fn matches_target(&self, snapshot: &crate::ssh::SessionSnapshot) -> bool {
+        snapshot.state == crate::ssh::SessionState::Connected
+            && snapshot.host.as_deref() == Some(self.host.as_str())
+            && snapshot.port == Some(self.port)
+            && snapshot.username.as_deref() == Some(self.username.as_str())
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatSnapshot {
     pub chat_id: String,
     pub task_id: String,
     pub title: String,
+    #[serde(default)]
+    pub source: Option<ChatSource>,
+    #[serde(default)]
+    pub restored_read_only: bool,
     pub messages: Vec<ChatMessage>,
     pub active_run_id: Option<String>,
     pub revision: String,
@@ -208,6 +246,10 @@ impl TaskManager {
         if let Some(history) = &self.history {
             let redactor = history.redactor();
             chat.title = redactor.redact_prose(&chat.title);
+            if let Some(source) = &mut chat.source {
+                source.host = redactor.redact_prose(&source.host);
+                source.username = redactor.redact_prose(&source.username);
+            }
             for message in &mut chat.messages {
                 message.text = redactor.redact_prose(&message.text);
                 message.destination = message
@@ -324,6 +366,12 @@ impl TaskManager {
                 "Finish or stop this chat's current run before starting another.",
             ));
         }
+        if record.snapshot.restored_read_only {
+            return Err(ApiError::new(
+                "CHAT_READ_ONLY",
+                "Restored history cannot resume or start terminal execution.",
+            ));
+        }
         record.terminal_run = Some(run_id.into());
         Ok(record.snapshot.clone())
     }
@@ -361,6 +409,51 @@ impl TaskManager {
         });
         Ok(config)
     }
+    pub fn save_config(
+        &self,
+        request: SaveModelConfigRequest,
+    ) -> Result<ModelConfigStatus, ApiError> {
+        let result = self.config.save(request);
+        if let Some(history) = &self.history {
+            if let Err(error) = self.config.register_history_secrets(history.redactor()) {
+                history.fail(error);
+            }
+        }
+        (self.events)(ModelEvent::ConfigUpdated {
+            config: self.config.status(),
+        });
+        result
+    }
+    pub async fn test_config(
+        &self,
+        request: ModelTestRequest,
+    ) -> Result<ModelTestResult, ApiError> {
+        self.config.test_saved(request).await
+    }
+    pub fn cancel_config_test(&self, test_id: &str) -> Result<(), ApiError> {
+        self.config.cancel_test(test_id)
+    }
+    /// Reading history never grants permission to transmit it or use it as the
+    /// live context of a different server. Same-target reconnection keeps text.
+    pub fn validate_chat_target(
+        &self,
+        chat_id: &str,
+        target: &crate::ssh::SessionSnapshot,
+    ) -> Result<(), ApiError> {
+        let chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        let chat = &chats.get(chat_id).ok_or_else(chat_missing)?.snapshot;
+        if chat.restored_read_only {
+            return Err(ApiError::new("CHAT_READ_ONLY", "Restored history is read-only. Start a new conversation before sending or executing."));
+        }
+        if chat
+            .source
+            .as_ref()
+            .is_some_and(|source| !source.matches_target(target))
+        {
+            return Err(ApiError::new("CHAT_TARGET_CHANGED", "This chat belongs to a different server or account. Start a new conversation for the current target."));
+        }
+        Ok(())
+    }
     pub fn list_chats(&self) -> Vec<ChatSnapshot> {
         let snapshots: Vec<_> = self
             .chats
@@ -385,9 +478,21 @@ impl TaskManager {
         Ok(self.sanitize_snapshot(chat))
     }
     pub fn create_chat(&self, title: &str) -> Result<ChatSnapshot, ApiError> {
-        self.create_chat_inner(title, true)
+        self.create_chat_inner(title, true, None)
     }
-    fn create_chat_inner(&self, title: &str, announce: bool) -> Result<ChatSnapshot, ApiError> {
+    pub fn create_chat_with_source(
+        &self,
+        title: &str,
+        source: Option<ChatSource>,
+    ) -> Result<ChatSnapshot, ApiError> {
+        self.create_chat_inner(title, true, source)
+    }
+    fn create_chat_inner(
+        &self,
+        title: &str,
+        announce: bool,
+        source: Option<ChatSource>,
+    ) -> Result<ChatSnapshot, ApiError> {
         if title.trim().is_empty() || title.len() > 256 || title.chars().any(char::is_control) {
             return Err(ApiError::new(
                 "CHAT_TITLE_INVALID",
@@ -406,6 +511,8 @@ impl TaskManager {
             chat_id: id.clone(),
             task_id: id.clone(),
             title: title.to_owned(),
+            source,
+            restored_read_only: false,
             messages: vec![],
             active_run_id: None,
             revision: "1".into(),
@@ -432,7 +539,7 @@ impl TaskManager {
         // Do not announce a diagnostic chat until a run was accepted. If a
         // capacity/consent race rejects it before sending, release the empty
         // slot. Never remove a chat with an accepted or ambiguous request.
-        let chat = self.create_chat_inner("Connection test", false)?;
+        let chat = self.create_chat_inner("Connection test", false, None)?;
         let result = self.send_message(&chat.chat_id, "Reply with OK.");
         if result.is_err() {
             let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
@@ -449,6 +556,18 @@ impl TaskManager {
             return Err(ApiError::new(
                 "CHAT_INPUT_INVALID",
                 "Enter 1 to 16384 UTF-8 bytes of chat text without NUL characters.",
+            ));
+        }
+        if self
+            .chats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(chat_id)
+            .is_some_and(|record| record.snapshot.restored_read_only)
+        {
+            return Err(ApiError::new(
+                "CHAT_READ_ONLY",
+                "Restored history is read-only. Start a new conversation before sending.",
             ));
         }
         // The immutable snapshot and destination consent are resolved before
@@ -742,4 +861,94 @@ fn chat_missing() -> ApiError {
 }
 fn provider_error() -> ApiError {
     ApiError::new("MODEL_REQUEST_FAILED", "The model request failed or the provider returned invalid, oversized, or interrupted data. Check the destination, credentials, and service availability. Provider diagnostics are hidden to protect private data; no automatic retry occurs.")
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    fn target() -> crate::ssh::SessionSnapshot {
+        serde_json::from_value(serde_json::json!({"revision":"1","state":"connected","session":{"session_id":Uuid::new_v4().to_string(),"generation":"1"},"host":"server.example","port":22,"username":"user"})).unwrap()
+    }
+    fn manager() -> TaskManager {
+        TaskManager::new(
+            ModelConfigManager::from_path(Err(ApiError::new(
+                "SYNTHETIC_NO_MODEL",
+                "No model needed.",
+            ))),
+            Arc::new(|_| true),
+        )
+    }
+    #[test]
+    fn source_never_changes_on_reconnect_and_other_targets_fail_closed() {
+        let manager = manager();
+        let target = target();
+        let source = ChatSource::from_session(&target).unwrap();
+        let chat = manager
+            .create_chat_with_source("Bound conversation", Some(source.clone()))
+            .unwrap();
+        assert!(manager.validate_chat_target(&chat.chat_id, &target).is_ok());
+        let mut reconnected = target.clone();
+        reconnected.session.as_mut().unwrap().generation = "2".into();
+        reconnected.session.as_mut().unwrap().session_id = Uuid::new_v4().to_string();
+        assert!(manager
+            .validate_chat_target(&chat.chat_id, &reconnected)
+            .is_ok());
+        assert_eq!(
+            manager.get_chat(&chat.chat_id).unwrap().source,
+            Some(source)
+        );
+        for field in ["host", "username", "port", "state"] {
+            let mut changed = target.clone();
+            match field {
+                "host" => changed.host = Some("different.example".into()),
+                "username" => changed.username = Some("other-user".into()),
+                "port" => changed.port = Some(2222),
+                _ => changed.state = crate::ssh::SessionState::Disconnected,
+            }
+            assert_eq!(
+                manager
+                    .validate_chat_target(&chat.chat_id, &changed)
+                    .unwrap_err()
+                    .code,
+                "CHAT_TARGET_CHANGED"
+            );
+        }
+    }
+    #[test]
+    fn restored_chat_cannot_send_or_reserve_execution_even_on_same_target() {
+        let manager = manager();
+        let target = target();
+        let chat = manager
+            .create_chat_with_source("History", ChatSource::from_session(&target))
+            .unwrap();
+        manager
+            .chats
+            .lock()
+            .unwrap()
+            .get_mut(&chat.chat_id)
+            .unwrap()
+            .snapshot
+            .restored_read_only = true;
+        assert_eq!(
+            manager
+                .validate_chat_target(&chat.chat_id, &target)
+                .unwrap_err()
+                .code,
+            "CHAT_READ_ONLY"
+        );
+        assert_eq!(
+            manager
+                .send_message(&chat.chat_id, "Do not transmit")
+                .unwrap_err()
+                .code,
+            "CHAT_READ_ONLY"
+        );
+        assert_eq!(
+            manager
+                .reserve_terminal(&chat.chat_id, "new-run")
+                .unwrap_err()
+                .code,
+            "CHAT_READ_ONLY"
+        );
+    }
 }

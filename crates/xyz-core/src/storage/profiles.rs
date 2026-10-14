@@ -15,6 +15,14 @@ use std::{
 use zeroize::Zeroizing;
 const MAX_BYTES: usize = 1024 * 1024;
 const FILE: &str = "connections.toml";
+const LEGACY_BACKUP: &str = "connections.v1.backup.toml";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialPolicy {
+    AskOnConnect,
+    SystemSecure,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +52,7 @@ pub struct ProfileSummary {
     pub auth_kind: AuthKind,
     pub private_key_path: Option<PathBuf>,
     pub credential_present: bool,
+    pub credential_policy: CredentialPolicy,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileListing {
@@ -79,6 +88,8 @@ struct Storage {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Profile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_policy: Option<CredentialPolicy>,
     id: String,
     label: String,
     host: String,
@@ -175,7 +186,7 @@ impl Profile {
             private_key_path: self.auth.private_key_path.clone(),
         })
     }
-    fn descriptor(&self, mode: CredentialMode) -> Result<Option<StoredCredential>> {
+    fn descriptor(&self, legacy_mode: CredentialMode) -> Result<Option<StoredCredential>> {
         let kind = self.auth.kind.ok_or(E::InvalidConfig)?;
         let a = &self.auth;
         if (kind == AuthKind::Password
@@ -197,6 +208,17 @@ impl Profile {
         } else {
             &a.passphrase_secret_ref
         };
+        let mode = if self.credential_policy.is_some() {
+            if protected.is_some() {
+                CredentialMode::DpapiCurrentUser
+            } else if reference.is_some() {
+                CredentialMode::LinuxSecretService
+            } else {
+                legacy_mode
+            }
+        } else {
+            legacy_mode
+        };
         let encoded = match mode {
             CredentialMode::DpapiCurrentUser if reference.is_none() => protected.clone(),
             CredentialMode::LinuxSecretService if protected.is_none() => reference.clone(),
@@ -213,6 +235,7 @@ impl Profile {
         Ok(value)
     }
     fn with_draft(draft: ProfileDraft, descriptor: Option<StoredCredential>) -> Self {
+        let descriptor_present = descriptor.is_some();
         let mut auth = Auth {
             kind: Some(draft.auth_kind),
             private_key_path: draft.private_key_path,
@@ -236,6 +259,11 @@ impl Profile {
             }
         }
         Self {
+            credential_policy: Some(if descriptor_present {
+                CredentialPolicy::SystemSecure
+            } else {
+                CredentialPolicy::AskOnConnect
+            }),
             id: draft.id,
             label: draft.label,
             host: draft.host,
@@ -252,10 +280,9 @@ fn decode(bytes: &[u8]) -> Result<Document> {
     Ok(doc)
 }
 fn validate(doc: &Document) -> Result<()> {
-    if doc.schema_version != 1 {
+    if !matches!(doc.schema_version, 1 | 2) {
         return Err(E::UnsupportedSchema);
     }
-    doc.storage.secret_protection.validate_platform()?;
     if doc.connections.len() > 256 {
         return Err(E::TooLarge);
     }
@@ -265,7 +292,15 @@ fn validate(doc: &Document) -> Result<()> {
         if !ids.insert(&p.id) {
             return Err(E::InvalidConfig);
         }
-        p.descriptor(doc.storage.secret_protection)?;
+        let descriptor = p.descriptor(doc.storage.secret_protection)?;
+        if (doc.schema_version == 1 && p.credential_policy.is_some())
+            || (doc.schema_version == 2
+                && (p.credential_policy.is_none()
+                    || (p.credential_policy == Some(CredentialPolicy::AskOnConnect)
+                        && descriptor.is_some())))
+        {
+            return Err(E::InvalidConfig);
+        }
     }
     Ok(())
 }
@@ -291,13 +326,42 @@ impl ProfileStore {
                 return Err(E::Conflict);
             }
             let document = Document {
-                schema_version: 1,
+                schema_version: 2,
                 revision: 0,
                 storage: Storage {
                     secret_protection: mode,
                 },
                 connections: Vec::new(),
             };
+            Ok(((), Some(encode(&document)?)))
+        })
+    }
+    /// Migrate once under the same stable lock as edits. The protected v1
+    /// backup is committed and verified before the only working file changes.
+    pub fn migrate(&self) -> Result<()> {
+        self.directory.update(FILE, MAX_BYTES, |old| {
+            let old = old.ok_or(E::Unavailable)?;
+            let mut document = decode(old)?;
+            if document.schema_version == 2 {
+                return Ok(((), None));
+            }
+            self.directory
+                .update(LEGACY_BACKUP, MAX_BYTES, |backup| match backup {
+                    Some(bytes) if bytes != old => Err(E::Conflict),
+                    Some(_) => Ok(((), None)),
+                    None => Ok(((), Some(Zeroizing::new(old.to_vec())))),
+                })?;
+            for p in &mut document.connections {
+                p.credential_policy = Some(
+                    if p.descriptor(document.storage.secret_protection)?.is_some() {
+                        CredentialPolicy::SystemSecure
+                    } else {
+                        CredentialPolicy::AskOnConnect
+                    },
+                );
+            }
+            document.schema_version = 2;
+            document.revision = document.revision.checked_add(1).ok_or(E::InvalidConfig)?;
             Ok(((), Some(encode(&document)?)))
         })
     }
@@ -315,7 +379,8 @@ impl ProfileStore {
             .read(FILE, MAX_BYTES)?
             .ok_or(E::Unavailable)?;
         let document = decode(&bytes)?;
-        if credentials.mode() != document.storage.secret_protection {
+        if document.schema_version == 1 && credentials.mode() != document.storage.secret_protection
+        {
             return Err(E::BackendMismatch);
         }
         let mut connections = Vec::new();
@@ -335,6 +400,11 @@ impl ProfileStore {
                 auth_kind: draft.auth_kind,
                 private_key_path: draft.private_key_path,
                 credential_present: present,
+                credential_policy: p.credential_policy.unwrap_or(if present {
+                    CredentialPolicy::SystemSecure
+                } else {
+                    CredentialPolicy::AskOnConnect
+                }),
             });
         }
         Ok(ProfileListing {
@@ -363,16 +433,39 @@ impl ProfileStore {
             if document.revision != expected_revision {
                 return Err(E::Conflict);
             }
-            if document.storage.secret_protection != credentials.mode() {
+            if document.schema_version == 1
+                && document.storage.secret_protection != credentials.mode()
+            {
                 return Err(E::BackendMismatch);
             }
+            if document.schema_version != 2 {
+                return Err(E::UnsupportedSchema);
+            }
+            let keep = matches!(&change, CredentialChange::Keep);
             let existing = document.connections.iter().position(|p| p.id == draft.id);
             let descriptor = match change {
                 CredentialChange::Keep => match existing {
                     Some(index)
                         if document.connections[index].auth.kind == Some(draft.auth_kind) =>
                     {
-                        document.connections[index].descriptor(credentials.mode())?
+                        let old = &document.connections[index];
+                        let descriptor = old.descriptor(document.storage.secret_protection)?;
+                        if descriptor.is_some()
+                            && (old.host != draft.host
+                                || old.port != draft.port
+                                || old.username != draft.username
+                                || old.auth.private_key_path != draft.private_key_path)
+                        {
+                            return Err(E::CredentialTargetChanged);
+                        }
+                        descriptor
+                    }
+                    Some(index)
+                        if document.connections[index]
+                            .descriptor(document.storage.secret_protection)?
+                            .is_some() =>
+                    {
+                        return Err(E::CredentialTargetChanged)
                     }
                     _ => None,
                 },
@@ -381,7 +474,12 @@ impl ProfileStore {
                     Some(credentials.store(&draft.id, purpose(draft.auth_kind), &value)?)
                 }
             };
-            let profile = Profile::with_draft(draft, descriptor);
+            let mut profile = Profile::with_draft(draft, descriptor);
+            if keep {
+                if let Some(index) = existing {
+                    profile.credential_policy = document.connections[index].credential_policy;
+                }
+            }
             profile.descriptor(credentials.mode())?;
             if let Some(index) = existing {
                 document.connections[index] = profile;
@@ -423,21 +521,47 @@ impl ProfileStore {
             Ok(((), None))
         })
     }
-    /// Explicitly clears disk descriptors, retaining old keyring entries.
-    /// Does not silently select this mode in response to a backend error.
-    pub fn switch_to_session_only(&self, expected_revision: u64) -> Result<u64> {
+    /// The v1 global downgrade is deliberately disabled. A caller must clear
+    /// the intended profile explicitly, never change every other profile.
+    pub fn switch_to_session_only(&self, _expected_revision: u64) -> Result<u64> {
+        Err(E::UnsupportedSchema)
+    }
+    pub fn delete(&self, id: &str, expected_revision: u64) -> Result<u64> {
         self.directory.update(FILE, MAX_BYTES, |old| {
             let mut doc = decode(old.ok_or(E::Unavailable)?)?;
             if doc.revision != expected_revision {
                 return Err(E::Conflict);
             }
-            for p in &mut doc.connections {
-                *p = Profile::with_draft(p.draft()?, None);
-            }
-            doc.storage.secret_protection = CredentialMode::SessionOnly;
+            let index = doc
+                .connections
+                .iter()
+                .position(|p| p.id == id)
+                .ok_or(E::InvalidConfig)?;
+            // Retain unreferenced keyring entries: a backup may still reference
+            // them. Never destructively clean up an uncertain cross-store commit.
+            doc.connections.remove(index);
             doc.revision = doc.revision.checked_add(1).ok_or(E::InvalidConfig)?;
             Ok((doc.revision, Some(encode(&doc)?)))
         })
+    }
+    pub fn draft_for_authentication(
+        &self,
+        id: &str,
+        expected_revision: u64,
+    ) -> Result<ProfileDraft> {
+        let bytes = self
+            .directory
+            .read(FILE, MAX_BYTES)?
+            .ok_or(E::Unavailable)?;
+        let doc = decode(&bytes)?;
+        if doc.revision != expected_revision {
+            return Err(E::Conflict);
+        }
+        doc.connections
+            .iter()
+            .find(|p| p.id == id)
+            .ok_or(E::InvalidConfig)?
+            .draft()
     }
     /// Authentication-only boundary. Must not be registered as a model tool.
     pub fn resolve_for_authentication(
@@ -454,7 +578,7 @@ impl ProfileStore {
         if doc.revision != expected_revision {
             return Err(E::Conflict);
         }
-        if credentials.mode() != doc.storage.secret_protection {
+        if doc.schema_version == 1 && credentials.mode() != doc.storage.secret_protection {
             return Err(E::BackendMismatch);
         }
         let p = doc
@@ -463,7 +587,7 @@ impl ProfileStore {
             .find(|p| p.id == id)
             .ok_or(E::InvalidConfig)?;
         let profile = p.draft()?;
-        let descriptor = p.descriptor(credentials.mode())?;
+        let descriptor = p.descriptor(doc.storage.secret_protection)?;
         let credential = if profile.auth_kind == AuthKind::Password
             || descriptor.is_some()
             || credentials.session_present(id, purpose(profile.auth_kind))

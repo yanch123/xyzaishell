@@ -18,7 +18,13 @@ WebView2 user-data folder. It does not alter machine browser/registry settings.
   exact MPL-covered `option-ext` source archive are present and nonempty.
 - Native WebKitGTK/WebView2 renders the real packaged frontend. Real DOM
   clicks/keystrokes call the ordinary Tauri IPC and Rust backend.
-- Save and reopen a synthetic nonsecret SSH profile. Do not connect to a host or
+- Configure and save a synthetic model key through the candidate settings UI;
+  verify a separate explicit minimal-test consent and successful real loopback
+  streaming test, with no chat history sent or key echoed. A private fixture
+  file enables loopback HTTP and non-default advanced options before startup;
+  their preservation is checked. This is not missing-file setup coverage.
+- Save and reopen a synthetic nonsecret SSH profile through the shared editor
+  using the explicit save-only action; retain the same profile ID after restart. Do not connect to a host or
   retrieve any real credential.
 - Explicitly enable plaintext history; recipient consent blocks a model request
   until checked. The model is an in-process loopback HTTP fixture that accepts
@@ -27,19 +33,34 @@ WebView2 user-data folder. It does not alter machine browser/registry settings.
 - Close the actual app process and restart. History requires fresh opt-in; read
   the saved profile and restore only text, retain task/chat identity, and observe
   zero new model requests and no SSH connection.
-- On v0.1.1, open and close the real Shell-log dialog while disconnected; consent/start remain disabled, and JSON/CSV export returns the real empty-store error without creating a DB, lock or export file. No synthetic shell events are injected.
+- On the candidate, open and close the real Shell-log view while disconnected; consent/start remain disabled, explicitly select all offline records, and JSON/CSV export returns the real empty-store error without creating a DB, lock or export file. No synthetic shell events are injected.
 - Same-version installer reinstallation, then uninstall/reinstall. Configuration
   hashes remain unchanged during installer operations; the binary disappears on
   uninstall; the restored native UI still reads the synthetic saved state.
 
-A separate fresh private fixture then installs the public v0.1.0 release pinned
+A separate fresh private fixture then installs the public v0.1.1 prerelease pinned
 by installer and manifest SHA256, exact source/run provenance and installed binary
-SHA256. It creates the synthetic profile/history through the old real UI, restarts,
-then directly installs v0.1.1 over it. Before launching the new application it
-checks the installed version and unchanged data-file hashes. The new real UI must
+SHA256. The release itself is not immutable; pinned bytes and provenance fail
+closed if an upstream asset is replaced. It creates the synthetic profile/history
+through the old real UI, restarts,
+then directly installs v0.1.2 over it. Before launching the new application it
+checks the installed version and unchanged data-file hashes before any application
+migration runs. After launch, the intentional schema-version changes are allowed,
+but every old history row must remain exact, the profile ID/target must be
+preserved, the protected v1 profile backup must match the old file bytes, and
+unrelated model settings must retain their exact hash. SQLite sidecars must be
+absent after clean exit. The new real UI must
 restore the same text/task identity with fresh history consent and zero model
 requests, then actually uninstall without deleting the data. This is the reviewed
-0.1.0→0.1.1 upgrade path, not arbitrary upgrades or downgrade support.
+0.1.1→0.1.2 upgrade path, not arbitrary upgrades or downgrade support.
+
+The v0.1.1 baseline is source `18eba0cf02a2c265862e957ba86f1cb24e4bedde`,
+build run `38561359264`, public prerelease `412688104`. Asset size/digests and tag
+were reverified against the public GitHub API on 2026-10-14. Linux executable
+bytes were also extracted and hashed; Windows executable pins come from the
+matching installed-app acceptance evidence. Previous 0.1.0→0.1.1 results do
+not establish 0.1.1→0.1.2 acceptance. Updating these checks is not a claim that
+the new candidate has passed a hosted native run.
 
 Fresh-install and upgrade scenarios do not share HOME/XDG/AppData or WebView
 profiles. Only the native driver download is reused; Windows signature/version
@@ -54,11 +75,13 @@ user profile, keyring, credential or SSH server is involved.
 ## Not established by this suite
 
 Same-version reinstallation is **not a version-upgrade test**; the separate pinned
-0.1.0→0.1.1 fixture is required to establish that specific path. Windows Server
+0.1.1→0.1.2 fixture is required to establish that specific path. Windows Server
 2022 is **not Windows 10 or Windows 11**.
 Xvfb is **not an end-user X11/Wayland desktop session**. These tests do not cover
 IME/clipboard, real-provider compatibility, SSH through the installed UI or
 nonempty Shell-log export through installed UI,
+or an installed-version upgrade of a previously encrypted credential (the native
+upgrade fixture intentionally stores only nonsecret connection metadata),
 SmartScreen/unsigned-publisher UX, or long-running interactive behavior. Keep
 the remaining acceptance matrix and release limits explicit.
 

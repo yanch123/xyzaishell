@@ -108,16 +108,6 @@ jobs:
       - run: npm run build
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
-      - name: Test real OpenSSH PTY interoperability on the disposable Linux runner
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get install --no-install-recommends -y openssh-server python3-pexpect
-          bash .github/scripts/openssh-test.sh --disposable-user
-      - name: Test generated shell-log bootstrap in a real local PTY
-        if: runner.os == 'Linux'
-        timeout-minutes: 5
-        # Use the distro Python matching the distro pexpect package.
-        run: /usr/bin/python3 crates/xyz-core/tests/shell_log_pty.py
       - name: Test native Secret Service in an isolated disposable keyring
         if: runner.os == 'Linux'
         timeout-minutes: 5
@@ -142,6 +132,46 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+
+  openssh-integration:
+    name: Real OpenSSH and current Bash PTY integration (${{ matrix.os }})
+    needs: frontend
+    # Exercise both distro shells and their normal startup defaults. Keep the
+    # distributable DEB build on 22.04 for the older runtime baseline.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
+      - name: Install isolated integration prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y openssh-server python3-pexpect build-essential pkg-config
+          bash --version
+          rustup show
+      - name: Cache locked core dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/registry/src/
+            target/
+          key: cargo-shell-v1-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-shell-v1-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Test real OpenSSH with a disposable Bash account
+        run: bash .github/scripts/openssh-test.sh --disposable-user
+      - name: Test current-shell hooks and lifecycle in a real local PTY
+        timeout-minutes: 5
+        # Use the distro Python matching the distro pexpect package.
+        run: /usr/bin/python3 crates/xyz-core/tests/shell_log_pty.py
 
   native-acceptance:
     name: Installed native UI and installer lifecycle

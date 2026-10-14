@@ -1,54 +1,107 @@
 import { useEffect, useRef, useState } from 'react';
 import { storageBridge } from '../lib/storageBridge';
-import type { ProfileStatus, SavedProfile } from '../lib/storageBridge';
+import type { ConnectSavedProfile, ProfileConnectOptions, ProfileStatus, SavedProfile } from '../lib/storageBridge';
 import { safeError } from '../lib/types';
-import { Modal } from './Modal';
-const blank = { id: null as string | null, label: '', host: '', port: 22, username: '', auth_kind: 'password' as SavedProfile['auth_kind'], private_key_path: null as string | null };
-export function ProfileDialog({ available, onClose, onConnect }: { available: boolean; onClose: () => void; onConnect: (id: string, revision: string) => Promise<boolean> }) {
+import { NonModalPanel } from './NonModalPanel';
+import { ConnectionDialog } from './ConnectionDialog';
+
+type Props = { available: boolean; onClose: () => void; onConnect: ConnectSavedProfile; initialProfileId?: string;
+  activeSession?: boolean; onViewLogs?: (profile: SavedProfile) => void; onConnectInNewWindow?: (id: string) => Promise<unknown> | void;
+  onSwitchCurrent?: ConnectSavedProfile; onNewConnection?: () => void;
+};
+export function ProfileDialog({ available, onClose, onConnect, initialProfileId, activeSession, onViewLogs, onConnectInNewWindow, onSwitchCurrent, onNewConnection }: Props) {
   const [status, setStatus] = useState<ProfileStatus | null>(null);
-  const [profile, setProfile] = useState(blank);
-  const [secret, setSecret] = useState('');
-  const [policy, setPolicy] = useState<'keep' | 'save' | 'session'>('keep');
-  const [busy, setBusy] = useState(false); const locked = useRef(false);
+  const [selected, setSelected] = useState(initialProfileId ?? '');
+  const appliedInitialId = useRef(initialProfileId);
+  const [editing, setEditing] = useState<SavedProfile | null>(null);
+  const [busy, setBusy] = useState(false); const locked = useRef(false); const live = useRef(true);
   const [error, setError] = useState<string | null>(null);
-  const [fallback, setFallback] = useState(false);
-  const [uncertain, setUncertain] = useState(false);
-  useEffect(() => { let live = true; if (available) void storageBridge.profiles().then(value => { if (live) setStatus(value); }).catch(e => { if (live) setError(safeError(e)); }); return () => { live = false; }; }, [available]);
-  const run = async (action: () => Promise<void>) => { if (locked.current) return; locked.current = true; setBusy(true); setError(null); try { await action(); } catch (e) { setError(safeError(e)); setUncertain(true); } finally { setSecret(''); locked.current = false; setBusy(false); } };
-  const pick = (value?: SavedProfile) => { setProfile(value ? { id: value.id, label: value.label, host: value.host, port: value.port, username: value.username, auth_kind: value.auth_kind, private_key_path: value.private_key_path } : blank); setSecret(''); setPolicy('keep'); setError(null); };
-  const savedProfile = status?.listing.connections.find(item => item.id === profile.id);
-  const edited = !savedProfile || (['label', 'host', 'port', 'username', 'auth_kind', 'private_key_path'] as const).some(key => profile[key] !== savedProfile[key]) || policy !== 'keep';
-  const save = () => {
-    if (!status || locked.current || uncertain) return;
-    if (!profile.label.trim() || !profile.host.trim() || /[\s/\\]/u.test(profile.host) || !profile.username.trim() || !Number.isInteger(profile.port) || profile.port < 1 || profile.port > 65535) { setError('请填写档案名称、有效主机、用户名和端口。'); return; }
-    if (profile.auth_kind === 'private_key' && !/^(\/|[a-zA-Z]:[\\/]|\\\\)/u.test(profile.private_key_path ?? '')) { setError('私钥需使用本机绝对路径。'); return; }
-    return run(async () => {
-    const value = secret; setSecret('');
-    const next = await storageBridge.saveProfile({ expected_revision: status.listing.revision, profile: { ...profile, label: profile.label.trim(), host: profile.host.trim(), username: profile.username.trim(), private_key_path: profile.auth_kind === 'private_key' ? profile.private_key_path : null }, credential_update: policy === 'save' ? { kind: 'set', value } : { kind: 'keep' } });
-    setStatus(next);
-    const saved = next.listing.connections.find(item => profile.id ? item.id === profile.id : !status.listing.connections.some(old => old.id === item.id));
-    if (saved) { setProfile({ id: saved.id, label: saved.label, host: saved.host, port: saved.port, username: saved.username, auth_kind: saved.auth_kind, private_key_path: saved.private_key_path }); if (policy === 'session') setStatus(await storageBridge.sessionCredential(saved.id, next.listing.revision, value || null)); }
-    setPolicy('keep');
-    });
+  const [notice, setNotice] = useState('');
+  const [deleting, setDeleting] = useState(false); const [uncertain, setUncertain] = useState(false);
+  const [challenge, setChallenge] = useState<{ profile: SavedProfile; revision: string; switchCurrent: boolean } | null>(null);
+  const [secret, setSecret] = useState(''); const [remember, setRemember] = useState(false);
+  const refresh = async () => { const next = await storageBridge.profiles(); if (live.current) { setStatus(next); setUncertain(false); } return next; };
+  useEffect(() => {
+    live.current = true;
+    if (available) void refresh().catch(e => { if (live.current) setError(safeError(e)); });
+    return () => { live.current = false; };
+  }, [available]);
+  useEffect(() => {
+    if (initialProfileId === appliedInitialId.current || !initialProfileId) return;
+    if (editing || busy) return; // Preserve an active editor/attempt until its guarded close.
+    appliedInitialId.current = initialProfileId;
+    setSelected(initialProfileId); setChallenge(null); setSecret(''); setDeleting(false);
+    if (available) void refresh().catch(e => { if (live.current) setError(safeError(e)); });
+  }, [initialProfileId, editing, busy, available]);
+  const profile = status?.listing.connections.find(item => item.id === selected);
+  const run = async (work: () => Promise<void>) => {
+    if (locked.current) return;
+    locked.current = true; setBusy(true); setError(null);
+    try { await work(); } catch (e) { if (live.current) setError(safeError(e)); }
+    finally { locked.current = false; if (live.current) setBusy(false); }
   };
-  return <Modal title="已保存的 SSH 档案" eyebrow="LOCAL CONNECTION PROFILES" onClose={() => { if (!busy) { setSecret(''); onClose(); } }}>
-    <p className="modal-intro">档案保存主机和用户名。只有明确选择“保存凭据”才持久保存密码或口令；不会发送给模型。临时连接可返回使用“仅本次连接”表单，无需保存档案。</p>
-    {!available && <p className="notice">网页预览不能读取或保存本机档案。</p>}
-    <button className="button secondary" disabled={!available || busy} onClick={() => void run(async () => { const next = await storageBridge.profiles(); setStatus(next); setUncertain(false); pick(); })}>重新读取档案状态</button>
-    {uncertain && <p className="notice warning" role="alert">保存结果可能不确定，已阻止再次提交。请重新读取档案状态并检查是否已保存，再明确选择要编辑的档案。</p>}
+  const invokeConnect = async (item: SavedProfile, revision: string, switchCurrent: boolean, options?: ProfileConnectOptions) => {
+    try {
+      const success = await (switchCurrent && onSwitchCurrent ? onSwitchCurrent : onConnect)(item.id, revision, options);
+      if (!live.current) return;
+      if (success) { setChallenge(null); onClose(); }
+      else setError('连接请求未成功。请核对连接状态后再明确重试。');
+    } catch (e) {
+      const code = e && typeof e === 'object' && 'code' in e ? e.code : '';
+      if (typeof code === 'string' && ['CREDENTIAL_MISSING', 'CREDENTIAL_LOCKED', 'CREDENTIAL_UNAVAILABLE', 'CREDENTIAL_ACCESS_DENIED', 'CREDENTIAL_BACKEND_MISMATCH', 'CREDENTIAL_PASSPHRASE_REQUIRED'].includes(code)) {
+        setChallenge({ profile: item, revision, switchCurrent }); setRemember(false);
+      }
+      setError(safeError(e));
+    }
+  };
+  const connect = (switchCurrent = false) => run(async () => {
+    if (!profile) return;
+    if (activeSession && !switchCurrent && onConnectInNewWindow) { await onConnectInNewWindow(profile.id); return; }
+    const next = await refresh(); const item = next.listing.connections.find(p => p.id === profile.id);
+    if (!item) { setError('此连接已被其他窗口删除，请重新选择。'); return; }
+    if (item.host !== profile.host || item.port !== profile.port || item.username !== profile.username || item.auth_kind !== profile.auth_kind || item.private_key_path !== profile.private_key_path) {
+      setError('此连接的认证目标已被其他窗口修改。请核对当前显示的资料后再次连接。'); return;
+    }
+    if ((item.auth_kind === 'password' && !item.credential_present) || (item.credential_present && next.credentials.credential_availability !== 'available')) {
+      setChallenge({ profile: item, revision: next.listing.revision, switchCurrent }); setRemember(false); setSecret(''); return;
+    }
+    await invokeConnect(item, next.listing.revision, switchCurrent);
+  });
+  const close = () => { if (!locked.current) { setSecret(''); setChallenge(null); onClose(); } };
+  if (editing && status) return <ConnectionDialog profile={editing} status={status} available={available} size={{ cols: 100, rows: 30 }} onConnect={async () => false} onSaved={next => { setStatus(next); setNotice('连接资料已保存。'); }} onClose={() => setEditing(null)} />;
+  return <NonModalPanel title="已保存的 SSH 连接" eyebrow="SAVED CONNECTIONS" onClose={close}>
+    {!available && <p className="notice">网页预览不能读取或保存本机连接。</p>}
+    <div className="button-row"><button className="button secondary" disabled={!available || busy} onClick={() => void run(async () => { await refresh(); setChallenge(null); setSecret(''); })}>重新读取档案状态</button>{onNewConnection && <button className="button secondary" disabled={busy} onClick={onNewConnection}>新建连接</button>}</div>
     {status?.path_warning && <p className="notice warning">{status.path_warning}</p>}
-    {status && <><div className="notice">凭据后端：{status.credentials.credential_backend} · {status.credentials.credential_availability}<br />配置目录：{status.configuration_root ?? '不可用'}</div>
-      <label>选择档案<select aria-label="选择档案" value={profile.id ?? ''} disabled={busy} onChange={e => pick(status.listing.connections.find(item => item.id === e.target.value))}><option value="">新建档案</option>{status.listing.connections.map(item => <option key={item.id} value={item.id}>{item.label} · {item.username}@{item.host}</option>)}</select></label>
-      {savedProfile && <p className="field-hint">凭据状态：{savedProfile.credential_present ? '已提供（不显示内容）' : '未提供，密码认证前需要填写'}</p>}
-      <fieldset disabled={busy}><label>档案名称<input value={profile.label} onChange={e => setProfile({ ...profile, label: e.target.value })} maxLength={128} /></label><div className="form-row"><label className="grow">档案主机<input value={profile.host} onChange={e => setProfile({ ...profile, host: e.target.value })} maxLength={253} /></label><label className="port-field">档案端口<input type="number" min={1} max={65535} value={profile.port} onChange={e => setProfile({ ...profile, port: Number(e.target.value) })} /></label></div><label>档案用户名<input value={profile.username} onChange={e => setProfile({ ...profile, username: e.target.value })} maxLength={128} /></label>
-      <label>档案认证方式<select value={profile.auth_kind} onChange={e => { setProfile({ ...profile, auth_kind: e.target.value as SavedProfile['auth_kind'], private_key_path: null }); setSecret(''); setPolicy('keep'); }}><option value="password">密码</option><option value="private_key">私钥文件</option></select></label>
-      {profile.auth_kind === 'private_key' && <label>私钥绝对路径<input value={profile.private_key_path ?? ''} onChange={e => setProfile({ ...profile, private_key_path: e.target.value })} /></label>}
-      <label>凭据处理<select aria-label="凭据处理" value={policy} onChange={e => { setPolicy(e.target.value as typeof policy); setSecret(''); }}><option value="keep">不更改凭据（新档案不保存）</option>{status.listing.mode === 'session_only' && <option value="session">仅本次进程使用凭据</option>}<option value="save" disabled={!status.credentials.persistent_credentials || status.credentials.credential_availability !== 'available'}>明确保存凭据到系统安全存储</option></select></label>
-      {policy !== 'keep' && <label>{profile.auth_kind === 'password' ? '档案密码' : '档案私钥口令'}<input type="password" autoComplete="new-password" value={secret} onChange={e => setSecret(e.target.value)} maxLength={4096} /></label>}
-      <p className="field-hint">保存失败不会自动退回明文。凭据输入在提交后清除；保存与连接是独立操作。编辑后请先保存，再连接。</p></fieldset>
-      {status.listing.mode !== 'session_only' && <div className="notice warning"><label className="check-field"><input type="checkbox" checked={fallback} disabled={busy} onChange={e => setFallback(e.target.checked)} /><span>将全部 {status.listing.connections.length} 个档案切换为会话内存模式，移除其持久凭据引用，需要重新输入凭据。当前界面不能切回系统安全存储模式，请确认后再切换。</span></label><button className="button secondary" disabled={!fallback || busy || uncertain} onClick={() => void run(async () => { setStatus(await storageBridge.sessionMode(status.listing.revision)); setFallback(false); })}>确认切换全部档案</button></div>}
+    {status && <>
+      <label>选择档案<select aria-label="选择档案" value={selected} disabled={busy} onChange={e => { setSelected(e.target.value); setChallenge(null); setSecret(''); setDeleting(false); setError(null); }}><option value="">请选择连接</option>{status.listing.connections.map(item => <option key={item.id} value={item.id} data-profile-id={item.id}>{item.label} · {item.username}@{item.host}:{item.port}</option>)}</select></label>
+      {profile && <div data-profile-id={profile.id} onDoubleClick={() => { if (!challenge) void connect(); }}><p>{profile.username}@{profile.host}:{profile.port} · {profile.auth_kind === 'password' ? '密码' : '私钥'}</p><p className="field-hint">凭据：{profile.credential_policy === 'system_secure' ? profile.credential_present ? status.credentials.credential_availability === 'available' ? '已保存，连接时读取系统保护凭据' : '已保存，系统存储暂不可用' : '系统保护已选择，但凭据缺失' : '按需询问，不保存密码或口令'}</p></div>}
+      {status.credentials.credential_availability !== 'available' && <p className="notice warning">系统凭据存储：{status.credentials.credential_availability}。原有引用保留，可在连接时明确临时输入；资料编辑仍可用。</p>}
+      <div className="button-row"><button className="button secondary" disabled={!profile || busy || !!challenge} onClick={() => { if (profile) setEditing(profile); }}>编辑 / 重命名</button><button className="button secondary" disabled={!profile || busy || uncertain || !!challenge} onClick={() => setDeleting(true)}>删除连接</button>{onViewLogs && <button className="button secondary" disabled={!profile || busy} onClick={() => { if (profile) onViewLogs(profile); }}>操作日志</button>}</div>
+      {deleting && profile && <div className="notice warning"><p>删除“{profile.label}”的连接资料和当前凭据引用？不会删除私钥文件、主机信任、聊天或操作日志，也不会断开当前会话。系统保险库或受限旧版备份中的孤立条目暂予保留。</p><button className="button secondary" disabled={busy} onClick={() => setDeleting(false)}>取消删除</button><button className="button danger" disabled={busy} onClick={() => void run(async () => { try { const next = await storageBridge.deleteProfile(profile.id, status.listing.revision); setStatus(next); setSelected(''); setDeleting(false); setNotice('连接资料已删除。'); } catch (e) { setUncertain(true); throw e; } })}>确认删除此连接</button></div>}
     </>}
+    {challenge && <form autoComplete="off" onSubmit={event => { event.preventDefault(); if (!secret || locked.current || uncertain) return; const value = secret; setSecret(''); void run(async () => {
+        if (!remember) { await invokeConnect(challenge.profile, challenge.revision, challenge.switchCurrent, { temporaryCredential: value, rememberCredential: false }); return; }
+        try {
+          const { credential_present: _present, credential_policy: _policy, ...draft } = challenge.profile;
+          const next = await storageBridge.saveProfile({ expected_revision: challenge.revision, profile: draft, credential_update: { kind: 'set', value } });
+          setStatus(next); setNotice('此连接的凭据已保存；正在连接。');
+          setChallenge({ ...challenge, revision: next.listing.revision });
+          await invokeConnect(next.listing.connections.find(item => item.id === draft.id) ?? challenge.profile, next.listing.revision, challenge.switchCurrent);
+        } catch (failure) {
+          const code = failure && typeof failure === 'object' && 'code' in failure ? failure.code : null;
+          if (!code || code === 'CONFIG_CONFLICT' || code === 'CONFIG_SAVE_UNCERTAIN') setUncertain(true);
+          throw failure;
+        }
+      }); }}>
+      <p>为 {challenge.profile.username}@{challenge.profile.host}:{challenge.profile.port} 提供本次{challenge.profile.auth_kind === 'password' ? '密码' : '私钥口令'}。</p>
+      <label>{challenge.profile.auth_kind === 'password' ? '本次密码' : '本次私钥口令'}<input type="password" autoComplete="new-password" maxLength={4096} value={secret} onChange={e => setSecret(e.target.value)} disabled={busy} required /></label>
+      <label className="check-field"><input type="checkbox" checked={remember} disabled={busy || status?.credentials.credential_availability !== 'available'} onChange={e => setRemember(e.target.checked)} /><span>为此连接记住凭据，使用本机系统保护</span></label>
+      <button className="button secondary" type="button" disabled={busy} onClick={() => { setChallenge(null); setSecret(''); setError(null); }}>取消认证</button><button className="button primary" type="submit" disabled={busy || !secret || uncertain}>{remember ? '保存凭据并连接' : '仅本次输入连接'}</button>
+    </form>}
+    {notice && <p role="status">{notice}</p>}
     {error && <p className="inline-error" role="alert">{error}</p>}
-    <div className="modal-footer"><button className="button secondary" disabled={busy} onClick={onClose}>返回</button><button className="button secondary" disabled={!status || busy || uncertain} onClick={() => void save()}>保存档案</button><button className="button primary" disabled={!status || !profile.id || busy || uncertain || edited} onClick={() => void run(async () => { if (status && profile.id) { if (await onConnect(profile.id, status.listing.revision)) onClose(); else setError('连接请求未成功。请返回工作区核对连接状态，再明确发起连接。'); } })}>连接已保存档案</button></div>
-  </Modal>;
+    {uncertain && <p className="notice warning">结果需要核对，请重新读取后再操作。</p>}
+    <div className="modal-footer"><button className="button secondary" disabled={busy} onClick={close}>关闭</button>{activeSession && onSwitchCurrent && <button className="button secondary" disabled={!profile || busy || !!challenge} onClick={() => void connect(true)}>在当前窗口切换</button>}<button className="button primary" disabled={!profile || busy || !!challenge} onClick={() => void connect()}>{activeSession ? '在新窗口连接' : '连接已保存档案'}</button></div>
+  </NonModalPanel>;
 }

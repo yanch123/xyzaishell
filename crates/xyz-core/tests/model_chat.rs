@@ -645,3 +645,154 @@ async fn split_key_echo_is_redacted_with_original_snapshot_across_reload_and_can
             .contains("synthetic-private-"));
     }
 }
+
+fn settings_test_request(manager: &TaskManager) -> xyz_core::model::ModelTestRequest {
+    let config = manager.config_status();
+    xyz_core::model::ModelTestRequest {
+        test_id: uuid::Uuid::new_v4().to_string(),
+        file_revision: config.file_revision.unwrap(),
+        destination: config.destination.unwrap(),
+        model: config.model.unwrap(),
+        consent: true,
+    }
+}
+
+#[tokio::test]
+async fn saved_settings_test_is_minimal_has_no_history_and_does_not_authorize_chat() {
+    let (server, base) = listener().await;
+    let fixture = Fixture::new(&base, "");
+    let manager = fixture.manager();
+    let original = manager
+        .create_chat("Private chat should stay local")
+        .unwrap();
+    let request = settings_test_request(&manager);
+    let expected_version = request.file_revision.clone();
+    let read = tokio::spawn(async move {
+        let (mut socket, _) = server.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        reply(&mut socket, "200 OK", &sse_text("OK", "stop")).await;
+        request
+    });
+    let result = manager.test_config(request).await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.file_revision, expected_version);
+    let sent = read.await.unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(sent.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    assert!(body["messages"][0]["content"]
+        .to_string()
+        .contains("Reply with OK."));
+    assert!(!body.to_string().contains("Private chat"));
+    assert!(!body.to_string().contains("synthetic-private-key"));
+    assert!(!body.to_string().contains("ssh"));
+    assert!(body.get("tools").is_none());
+    assert_eq!(manager.list_chats().len(), 1);
+    assert!(manager
+        .get_chat(&original.chat_id)
+        .unwrap()
+        .messages
+        .is_empty());
+    assert!(!manager.config_status().consented);
+}
+
+#[tokio::test]
+async fn failed_settings_test_preserves_saved_configuration_without_retry() {
+    let (server, base) = listener().await;
+    let fixture = Fixture::new(&base, "");
+    let manager = fixture.manager();
+    let input: xyz_core::model::SaveModelConfigRequest = serde_json::from_value(serde_json::json!({"expected_file_revision":manager.config_status().file_revision,"base_url":base,"model":"saved-model","key_update":{"kind":"keep"},"reuse_key_for_destination":null})).unwrap();
+    let saved = manager.save_config(input).unwrap();
+    let serve = tokio::spawn(async move {
+        let (mut socket, _) = server.accept().await.unwrap();
+        let _ = read_request(&mut socket).await;
+        reply(
+            &mut socket,
+            "401 Unauthorized",
+            "synthetic-private-diagnostic",
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server.accept())
+                .await
+                .is_err()
+        );
+    });
+    let result = manager
+        .test_config(settings_test_request(&manager))
+        .await
+        .unwrap();
+    assert!(!result.success);
+    assert_eq!(result.error.unwrap().code, "MODEL_AUTH_FAILED");
+    assert_eq!(manager.config_status().file_revision, saved.file_revision);
+    assert_eq!(
+        manager.config_status().model.as_deref(),
+        Some("saved-model")
+    );
+    assert!(manager.config_status().ready);
+    assert!(manager.list_chats().is_empty());
+    serve.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_settings_tests_stop_and_never_replay_even_before_start() {
+    let (server, base) = listener().await;
+    let fixture = Fixture::new(&base, "");
+    let manager = fixture.manager();
+    let early = settings_test_request(&manager);
+    manager.cancel_config_test(&early.test_id).unwrap();
+    let cancelled = manager.test_config(early).await.unwrap();
+    assert_eq!(cancelled.error.unwrap().code, "MODEL_CANCELLED");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), server.accept())
+            .await
+            .is_err()
+    );
+    let request = settings_test_request(&manager);
+    let id = request.test_id.clone();
+    let running = manager.clone();
+    let test = tokio::spawn(async move { running.test_config(request).await.unwrap() });
+    let (mut socket, _) = server.accept().await.unwrap();
+    let _ = read_request(&mut socket).await;
+    manager.cancel_config_test(&id).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), test)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.error.unwrap().code, "MODEL_CANCELLED");
+    assert!(!result.success);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), server.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn saved_test_keeps_its_snapshot_when_settings_change_during_stream() {
+    let (server, base) = listener().await;
+    let fixture = Fixture::new(&base, "");
+    let manager = fixture.manager();
+    let request = settings_test_request(&manager);
+    let tested_version = request.file_revision.clone();
+    let running = manager.clone();
+    let test = tokio::spawn(async move { running.test_config(request).await.unwrap() });
+    let (mut socket, _) = server.accept().await.unwrap();
+    let sent = read_request(&mut socket).await;
+    assert!(sent
+        .to_ascii_lowercase()
+        .contains("authorization: bearer synthetic-private-key"));
+    let update: xyz_core::model::SaveModelConfigRequest = serde_json::from_value(serde_json::json!({"expected_file_revision":manager.config_status().file_revision,"base_url":base,"model":"changed-model","key_update":{"kind":"clear"},"reuse_key_for_destination":null})).unwrap();
+    let saved = manager.save_config(update).unwrap();
+    assert!(!saved.ready && !saved.key_present);
+    reply(&mut socket, "200 OK", &sse_text("OK", "stop")).await;
+    let completed = test.await.unwrap();
+    assert!(completed.success);
+    assert_eq!(completed.file_revision, tested_version);
+    assert_eq!(completed.model, "mock-model");
+    assert_ne!(Some(completed.file_revision), saved.file_revision);
+    assert_eq!(
+        manager.config_status().model.as_deref(),
+        Some("changed-model")
+    );
+}

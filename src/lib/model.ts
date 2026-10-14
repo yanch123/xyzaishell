@@ -1,9 +1,13 @@
-import type { ApiError } from './types';
+import type { ApiError, SessionRef } from './types';
 
 /** Safe native DTOs. Configuration secrets never cross this boundary. */
 export type ModelConfigStatus = {
   path: string | null;
   revision: string | null;
+  file_revision: string | null;
+  base_url: string | null;
+  key_present: boolean;
+  path_overridden: boolean;
   ready: boolean;
   destination: string | null;
   model: string | null;
@@ -23,17 +27,30 @@ export type ChatMessage = {
   destination?: string | null;
   model?: string | null;
 };
+export type ModelKeyUpdate = { kind: 'keep' } | { kind: 'replace'; value: string } | { kind: 'clear' };
+export type SaveModelConfigRequest = {
+  expected_file_revision: string;
+  base_url: string;
+  model: string;
+  key_update: ModelKeyUpdate;
+  reuse_key_for_destination: string | null;
+};
+export type ModelTestRequest = { test_id: string; file_revision: string; destination: string; model: string; consent: boolean };
+export type ModelTestResult = { test_id: string; file_revision: string; destination: string; model: string; success: boolean; error: ApiError | null };
+export type ChatSource = SessionRef & { host: string; port: number; username: string };
 export type ChatSnapshot = {
   chat_id: string;
   task_id: string;
   title: string;
+  source?: ChatSource | null;
+  restored_read_only?: boolean;
   messages: ChatMessage[];
   active_run_id: string | null;
   revision: string;
 };
 export type ModelEvent = { kind: 'chat_updated'; chat: ChatSnapshot } | { kind: 'config_updated'; config: ModelConfigStatus };
 export const INITIAL_MODEL_CONFIG: ModelConfigStatus = {
-  path: null, revision: null, ready: false, destination: null, model: null,
+  path: null, revision: null, file_revision: null, base_url: null, key_present: false, path_overridden: false, ready: false, destination: null, model: null,
   consented: false, error: null, warning: null, context_policy: 'explicit_chat_only', persistence: 'memory_only',
 };
 export const MAX_CONCURRENT_CHATS = 4;

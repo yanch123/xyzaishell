@@ -2,7 +2,7 @@
 //! output are logged, and no model, credential store, or approval system is consulted.
 use crate::{
     observation::ObservationBuffer,
-    shell_log_protocol::{bootstrap_command, ProtocolParser, WireEvent},
+    shell_log_protocol::{ProtocolParser, WireEvent},
     shell_log_store::ShellLogStore,
     shell_log_types::*,
     ssh::{ApiError, SessionRef, SessionSnapshot, SessionState},
@@ -15,12 +15,17 @@ use std::{
         mpsc::{self, SyncSender},
         Arc, Mutex,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
 const QUEUE_CAPACITY: usize = 128;
+#[cfg(test)]
 const MAX_START_ATTEMPTS: usize = 1024;
+#[cfg(test)]
+use crate::shell_log_protocol::bootstrap_command;
+#[cfg(test)]
+use std::time::Duration;
 pub type ShellLogEventSink = Arc<dyn Fn(ShellLogStatus) + Send + Sync>;
 type Reply<T> = mpsc::Sender<Result<T, ApiError>>;
 #[derive(Clone)]
@@ -42,6 +47,7 @@ struct Capture {
     parser: ProtocolParser,
     parser_session: Option<SessionRef>,
     snapshot: Option<SessionSnapshot>,
+    #[cfg(test)]
     attempted: BTreeSet<(String, String)>,
     shell_id: String,
     hello: bool,
@@ -146,6 +152,7 @@ impl ShellLogService {
             parser: ProtocolParser::new(&nonce).expect("UUID nonce"),
             parser_session: None,
             snapshot: None,
+            #[cfg(test)]
             attempted: BTreeSet::new(),
             shell_id: String::new(),
             hello: false,
@@ -175,10 +182,77 @@ impl ShellLogService {
     pub fn status(&self) -> ShellLogStatus {
         self.shared.status()
     }
+    /// Subscribe the optional disk consumer to an already-verified integration.
+    /// Never injects shell input, changes hook ownership, or replays old events.
+    pub fn start_shared(
+        &self,
+        snapshot: SessionSnapshot,
+        plaintext_consent: bool,
+        shell_id: String,
+        handshaken: bool,
+    ) -> Result<(), ApiError> {
+        if !plaintext_consent {
+            return Err(error(
+                "SHELL_LOG_CONSENT",
+                "Explicit consent to local plaintext shell logs is required.",
+            ));
+        }
+        if snapshot.state != SessionState::Connected || !handshaken || shell_id.is_empty() {
+            return Err(error("SHELL_INTEGRATION_REQUIRED", "Enable the current-shell integration at an idle supported Bash prompt before recording."));
+        }
+        let session = snapshot
+            .session
+            .clone()
+            .ok_or_else(|| error("SHELL_LOG_SESSION", "No connected session."))?;
+        if snapshot.host.is_none() || snapshot.port.is_none() || snapshot.username.is_none() {
+            return Err(error(
+                "SHELL_LOG_SESSION",
+                "Connection details are unavailable.",
+            ));
+        }
+        {
+            let _gate = self.shared.commit.lock().unwrap_or_else(|p| p.into_inner());
+            let mut c = self.capture.lock().unwrap_or_else(|p| p.into_inner());
+            if self.status().enabled {
+                return Err(error(
+                    "SHELL_LOG_ALREADY_STARTED",
+                    "Shell recording is already enabled; resume it if paused.",
+                ));
+            }
+            self.shared.epoch.fetch_add(1, Ordering::SeqCst);
+            c.parser_session = Some(session.clone());
+            c.snapshot = Some(snapshot);
+            c.shell_id = shell_id;
+            c.hello = true;
+            c.high_sequence = 0;
+            c.active = None;
+        }
+        self.shared.update(|s| {
+            s.enabled = true;
+            s.state = CaptureState::Recording;
+            s.session = Some(session);
+            s.error = None;
+            s.reason = None;
+        });
+        if let Err(e) = self.request(Work::Open) {
+            self.shared.fail(e.clone());
+            return Err(e);
+        }
+        Ok(())
+    }
+    /// Events arrive from the shared live parser only. Historical files and
+    /// exported metadata cannot call this via IPC or restore execution state.
+    pub(crate) fn ingest_event(&self, session: &SessionRef, event: WireEvent) {
+        let mut c = self.capture.lock().unwrap_or_else(|p| p.into_inner());
+        if self.status().session.as_ref() == Some(session) {
+            self.handle_event(&mut c, event);
+        }
+    }
     /// Explicit consent is required every process. Return this bootstrap for ONE
     /// visible PTY write. Never retry it automatically, even if delivery is unknown.
     /// This control operation can block on the worker; keep it off the SSH loop.
-    pub fn start(
+    #[cfg(test)]
+    fn start(
         &self,
         snapshot: SessionSnapshot,
         plaintext_consent: bool,
@@ -425,6 +499,11 @@ impl ShellLogService {
             return;
         }
         match event {
+            WireEvent::Ready { .. } => {}
+            WireEvent::Unsupported { .. } => {
+                self.finish_active(c, CommandStatus::Unknown, None);
+                self.shared.fail(error("SHELL_LOG_UNSUPPORTED", "Current-shell integration is unsupported; the manual terminal remains available."));
+            }
             WireEvent::Hello { .. } => {
                 if c.hello {
                     return;
@@ -475,8 +554,8 @@ impl ShellLogService {
                     || username_clean != snapshot.username.as_deref().unwrap_or_default();
                 let id = Uuid::new_v4().to_string();
                 let entry = ShellLogEntry {
-                    profile_id: None,
                     id: id.clone(),
+                    profile_id: snapshot.profile_id.clone(),
                     sequence: "0".into(),
                     session_id: session.session_id.clone(),
                     generation: session.generation.clone(),

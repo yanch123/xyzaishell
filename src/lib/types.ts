@@ -9,7 +9,7 @@ export type HostKeyChallenge = {
 };
 export type SessionSnapshot = {
   session: SessionRef | null; state: SessionState; revision?: string; host?: string; port?: number;
-  username?: string; error?: ApiError; host_key?: HostKeyChallenge;
+  username?: string; profile_id?: string | null; error?: ApiError; host_key?: HostKeyChallenge;
 };
 export type ConnectRequest = {
   host: string; port: number; username: string; session_only: true; size: TerminalSize;

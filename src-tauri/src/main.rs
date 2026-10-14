@@ -1,12 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+mod window_launch;
+
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use xyz_core::agent::{
     AckTerminalAction, AgentManager, ContinueTerminalTask, DecideTerminalAction, EnsureTaskSecrets,
     PrepareSecretInput, StartTerminalTask, TaskRunRequest, TaskSecretsView, TerminalTaskSnapshot,
 };
+use xyz_core::shell_integration::IntegrationStatus;
 use xyz_core::shell_log::ShellLogService;
 use xyz_core::shell_log_types::{
     ExportFormat, ShellLogExport, ShellLogPage, ShellLogQuery, ShellLogStatus,
@@ -16,8 +18,11 @@ use xyz_core::ssh::{
     TerminalSize, WriteReceipt,
 };
 use xyz_core::{
-    model::{ModelConfigManager, ModelConfigStatus},
-    tasks::{ChatSnapshot, TaskManager},
+    model::{
+        ModelConfigManager, ModelConfigStatus, ModelTestRequest, ModelTestResult,
+        SaveModelConfigRequest,
+    },
+    tasks::{ChatSnapshot, ChatSource, TaskManager},
 };
 
 use xyz_core::host_storage::{CredentialText, HostStorage, ProfileStatus, SaveProfileRequest};
@@ -76,16 +81,37 @@ async fn connect_saved_profile(
     connection_id: String,
     profile_revision: String,
     size: TerminalSize,
+    temporary_credential: Option<CredentialText>,
+    remember_credential: Option<bool>,
     storage: State<'_, HostStorage>,
     state: State<'_, SessionManager>,
 ) -> Result<SessionSnapshot, ApiError> {
     let storage = storage.inner().clone();
+    let profile_id = connection_id.clone();
     let request = tauri::async_runtime::spawn_blocking(move || {
-        storage.connection(&connection_id, &profile_revision, size)
+        storage.connection_with_credential(
+            &connection_id,
+            &profile_revision,
+            size,
+            temporary_credential,
+            remember_credential.unwrap_or(false),
+        )
     })
     .await
     .map_err(|_| worker_error())??;
-    state.connect(request)
+    state.connect_profile(request, profile_id)
+}
+
+#[tauri::command]
+async fn delete_connection_profile(
+    connection_id: String,
+    expected_revision: String,
+    state: State<'_, HostStorage>,
+) -> Result<ProfileStatus, ApiError> {
+    let storage = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || storage.delete(&connection_id, &expected_revision))
+        .await
+        .map_err(|_| worker_error())?
 }
 
 #[tauri::command]
@@ -161,6 +187,30 @@ async fn reload_model_config(state: State<'_, TaskManager>) -> Result<ModelConfi
     Ok(state.reload_config())
 }
 #[tauri::command]
+async fn save_model_config(
+    request: SaveModelConfigRequest,
+    state: State<'_, TaskManager>,
+) -> Result<ModelConfigStatus, ApiError> {
+    let tasks = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || tasks.save_config(request))
+        .await
+        .map_err(|_| worker_error())?
+}
+#[tauri::command]
+async fn test_model_config(
+    request: ModelTestRequest,
+    state: State<'_, TaskManager>,
+) -> Result<ModelTestResult, ApiError> {
+    state.test_config(request).await
+}
+#[tauri::command]
+fn cancel_model_config_test(
+    test_id: String,
+    state: State<'_, TaskManager>,
+) -> Result<(), ApiError> {
+    state.cancel_config_test(&test_id)
+}
+#[tauri::command]
 fn confirm_model_destination(
     revision: String,
     destination: String,
@@ -173,8 +223,30 @@ fn list_chats(state: State<'_, TaskManager>) -> Vec<ChatSnapshot> {
     state.list_chats()
 }
 #[tauri::command]
-fn create_chat(title: String, state: State<'_, TaskManager>) -> Result<ChatSnapshot, ApiError> {
-    state.create_chat(&title)
+fn create_chat(
+    title: String,
+    source: Option<SessionRef>,
+    state: State<'_, TaskManager>,
+    ssh: State<'_, SessionManager>,
+) -> Result<ChatSnapshot, ApiError> {
+    let snapshot = ssh.snapshot();
+    let source = if let Some(expected) = source {
+        if snapshot.session.as_ref() != Some(&expected) {
+            return Err(ApiError::new(
+                "CHAT_TARGET_CHANGED",
+                "The SSH connection changed. Create a conversation for the current server.",
+            ));
+        }
+        Some(ChatSource::from_session(&snapshot).ok_or_else(|| {
+            ApiError::new(
+                "SESSION_NOT_CONNECTED",
+                "Connect before creating a server conversation.",
+            )
+        })?)
+    } else {
+        None
+    };
+    state.create_chat_with_source(&title, source)
 }
 #[tauri::command]
 fn get_chat(chat_id: String, state: State<'_, TaskManager>) -> Result<ChatSnapshot, ApiError> {
@@ -185,7 +257,9 @@ async fn send_chat_message(
     chat_id: String,
     text: String,
     state: State<'_, TaskManager>,
+    ssh: State<'_, SessionManager>,
 ) -> Result<ChatSnapshot, ApiError> {
+    state.validate_chat_target(&chat_id, &ssh.snapshot())?;
     state.send_message(&chat_id, &text)
 }
 #[tauri::command]
@@ -350,17 +424,31 @@ fn get_shell_log_status(state: State<'_, ShellLogService>) -> ShellLogStatus {
 }
 
 #[tauri::command]
+fn get_shell_integration_status(ssh: State<'_, SessionManager>) -> IntegrationStatus {
+    ssh.shell_integration().status()
+}
+
+#[tauri::command]
+async fn install_shell_integration(
+    session: SessionRef,
+    readiness_confirmed: bool,
+    ssh: State<'_, SessionManager>,
+) -> Result<IntegrationStatus, ApiError> {
+    ssh.install_shell_integration(&session, readiness_confirmed)
+        .await
+}
+
+#[tauri::command]
 async fn start_shell_log(
     session: SessionRef,
     consent: bool,
-    readiness_confirmed: bool,
     state: State<'_, ShellLogService>,
     ssh: State<'_, SessionManager>,
 ) -> Result<ShellLogStatus, ApiError> {
-    if !readiness_confirmed || !consent {
+    if !consent {
         return Err(ApiError::new(
             "SHELL_LOG_CONSENT_REQUIRED",
-            "Confirm local plaintext logging and an idle compatible shell prompt.",
+            "Confirm local plaintext command recording before enabling it.",
         ));
     }
     let snapshot = ssh.snapshot();
@@ -369,20 +457,27 @@ async fn start_shell_log(
     {
         return Err(ApiError::new(
             "SESSION_NOT_CONNECTED",
-            "Reconnect and confirm the current terminal before enabling shell logging.",
+            "Connect before enabling command recording.",
         ));
     }
+    let ready = ssh.shell_integration().ready_snapshot(&session)?;
     let service = state.inner().clone();
-    let bootstrap = tauri::async_runtime::spawn_blocking(move || service.start(snapshot, consent))
-        .await
-        .map_err(|_| worker_error())??;
-    // Explicit user action, same visible PTY; never repeat an uncertain write.
-    if let Err(error) = ssh
-        .write(&session, &STANDARD.encode(bootstrap.as_bytes()))
-        .await
+    tauri::async_runtime::spawn_blocking(move || {
+        service.start_shared(snapshot, consent, ready.shell_id, true)
+    })
+    .await
+    .map_err(|_| worker_error())??;
+    // Opening storage can yield while the connection closes. Never report a
+    // stale capture as active after its disconnect event already passed.
+    let current = ssh.snapshot();
+    if current.session.as_ref() != Some(&session)
+        || current.state != xyz_core::ssh::SessionState::Connected
     {
-        state.fail_start(&session, error.clone());
-        return Err(error);
+        state.disconnect(&session);
+        return Err(ApiError::new(
+            "SESSION_NOT_CONNECTED",
+            "The SSH connection changed while command recording was being enabled.",
+        ));
     }
     Ok(state.status())
 }
@@ -438,6 +533,8 @@ async fn export_shell_log(
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
+            let launch = window_launch::parse_launch_target(std::env::args().skip(1))?;
+            app.manage(launch);
             let handle = app.handle().clone();
             let storage = HostStorage::new();
             let ssh = SessionManager::with_persistent_trust(
@@ -491,6 +588,11 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            window_launch::launch_new_window,
+            window_launch::get_window_launch_target,
+            delete_connection_profile,
+            get_shell_integration_status,
+            install_shell_integration,
             get_shell_log_status,
             start_shell_log,
             set_shell_log_paused,
@@ -516,6 +618,9 @@ fn main() {
             interrupt_remote,
             get_model_config_status,
             reload_model_config,
+            save_model_config,
+            test_model_config,
+            cancel_model_config_test,
             confirm_model_destination,
             list_chats,
             create_chat,

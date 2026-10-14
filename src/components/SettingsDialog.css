@@ -1,0 +1,26 @@
+.settings-categories { display: flex; gap: 6px; padding: 12px 22px; border-bottom: 1px solid var(--border, #dce3ec); }
+.settings-categories button { border: 0; background: transparent; color: var(--muted, #617184); padding: 8px 14px; border-radius: 6px; cursor: pointer; }
+.settings-categories button[aria-current="page"] { background: #eaf0ff; color: #315ec9; font-weight: 600; }
+.settings-model-editor { padding: 20px 24px; }
+.settings-model-editor > p { color: var(--muted, #617184); font-size: 13px; line-height: 1.7; }
+.settings-model-heading { display: flex; align-items: center; gap: 10px; }
+.settings-model-heading h3 { margin: 0; }
+.model-fields { display: grid; gap: 14px; padding: 12px 0; margin: 0; border: 0; min-width: 0; }
+.model-fields .field { display: grid; gap: 7px; font-size: 13px; font-weight: 600; }
+.model-fields .field input { width: 100%; min-width: 0; box-sizing: border-box; padding: 10px 12px; border: 1px solid var(--border, #cfd8e6); border-radius: 6px; background: var(--surface, #fff); color: inherit; }
+.model-fields input[aria-invalid="true"] { border-color: #bc4545; }
+.model-fields .field-hint { font-weight: 400; line-height: 1.6; }
+.model-fields .field-error { color: #b33737; font-weight: 400; line-height: 1.6; }
+.settings-key-actions { display: flex; gap: 8px; margin-top: -4px; }
+.settings-actions { flex-wrap: wrap; }
+.settings-decision { padding: 14px; border: 1px solid #d0dbf2; background: #f6f8fd; border-radius: 8px; margin: 12px 0; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.settings-decision h4 { margin: 0 0 6px; }
+.settings-decision p { margin: 6px 0; }
+.settings-decision > button { margin-right: 8px; }
+.settings-save-status, .settings-test-result { font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; }
+.settings-test-result { padding: 12px 14px; border: 1px solid var(--border, #dce3ec); border-radius: 8px; margin: 12px 0; }
+.settings-test-result p { margin: 5px 0; color: var(--muted, #617184); }
+.model-reuse { align-items: flex-start; line-height: 1.6; overflow-wrap: anywhere; }
+.settings-modal > .settings-decision { margin: 14px 24px; }
+.settings-modal .config-guide { margin-top: 20px; line-height: 1.7; }
+@media (max-width: 640px) { .settings-model-editor { padding: 14px 16px; } .settings-categories { padding: 10px 14px; } }
