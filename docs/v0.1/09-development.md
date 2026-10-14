@@ -138,3 +138,7 @@ M5 提交 `30dc4e42664b308f3f4f2858683f1473b105e5fb` 的 [CI 38529158888](https:
 换行修复 `2e3d6babb247cb8d3186b9079cf6dfdcd066d1ae` 的 [CI 38530020258](https://github.com/yanch123/xyzaishell/actions/runs/38530020258) 已通过两平台测试、Clippy、含通知资源的 NSIS／DEB 打包和 Ubuntu 两版本安装启动检查，随后首次运行真实安装后 WebDriver 验收。三项原生交互均未完成：Windows 档案管理返回存储拒绝；Ubuntu 已实际保存档案，但 WebKit 无法点击滚动区域外的返回按钮；Ubuntu 24 还检测到 session 删除后应用进程未退出。故仍不宣称完整安装生命周期通过。
 
 截图与后端校验复核表明：Windows 测试目录只设置 DACL、未显式设置 owner，存在被安全存储拒绝的可能，旧日志缺少 owner 证据，需下一轮记录确认。改进仅针对全新隔离夹具设置并验证当前用户 owner，生产安全规则不变，另加 Windows descriptor 拒绝错误 owner 的回归。原生测试通过真实键盘导航处理明确不可交互的离屏按钮，退出时先关闭真实窗口并验证进程消失；强制清理不得计为正常退出。Linux 裸测试环境补中文字体以便审查截图。这些修复须由新 CI 再次验证。
+
+`61352514ecf62d16ebfbbfb08f4bbb50c147282f` 的 [CI 38533189264](https://github.com/yanch123/xyzaishell/actions/runs/38533189264) 已在三平台实际安装后完成档案保存、模型接收方授权、真实 Rust HTTP／SSE 中文回复与字面脚本文本显示，并已执行关闭应用和重启流程；重启后的完整状态验证尚未完成。Windows 日志确认新夹具原 owner 为 Administrators，设置为当前 runner 用户后档案保存成功，根因得到验证。Linux 中文字体及离屏按钮处理生效。
+
+后续测试仍失败：Windows／Ubuntu 24 的测试错误地以完整提示词查找历史标题，实际标题为“新任务 · 2 条消息”；Ubuntu 22 在重启后的只读启动检查出现一次 WebDriver 连接中断。修正测试为唯一两消息存档，同时保留恢复完整内容、稳定 chat／task ID 及零自动请求断言；只读传输异常只在原 driver 和精确应用进程仍存活时做有界重试，不重建会话，不自动重试修改状态的指令。完整重装与卸载生命周期仍待下一轮验证。

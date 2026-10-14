@@ -9,6 +9,7 @@ import argparse
 import base64
 import contextlib
 import hashlib
+import http.client
 import http.server
 import json
 import os
@@ -134,6 +135,10 @@ class WebDriverError(RuntimeError):
             self.code = None
 
 
+class NativeTransportFailure(Exception):
+    """Terminal inspection failure; generic readiness waits must not retry it."""
+
+
 class Driver:
     def __init__(self, application, evidence):
         self.application = application.resolve()
@@ -157,6 +162,7 @@ class Driver:
                 "browserName": "wry", "tauri:options": {"application": str(application)},
             }}})
             self.session = response["sessionId"]
+            self.application_processes = frozenset(wait_for(lambda: application_pids(self.application)))
             self.command("POST", "/timeouts", {"implicit": 0, "script": 10000, "pageLoad": 30000})
             self.command("POST", "/window/rect", {"width": 1400, "height": 900})
             wait_for(lambda: self.find("//textarea[@aria-label='聊天消息']"))
@@ -217,7 +223,19 @@ class Driver:
 
     def js(self, script):
         # Read-only DOM inspection; never mocks invoke or calls backend directly.
-        return self.command("POST", "/execute/sync", {"script": script, "args": []})
+        for attempt in range(3):
+            try:
+                return self.command("POST", "/execute/sync", {"script": script, "args": []})
+            except (http.client.RemoteDisconnected, ConnectionResetError, urllib.error.URLError) as error:
+                # WebKit can reset a startup transport connection. Retry only
+                # this read-only inspection, in the same live app/session; no
+                # click, keystroke, consent, network request or app relaunch.
+                if (attempt == 2 or self.process.poll() is not None
+                        or frozenset(application_pids(self.application)) != self.application_processes):
+                    raise NativeTransportFailure("Read-only transport retry exhausted or original process exited") from error
+                with (self.evidence / "read-only-transport-retries.jsonl").open("a", encoding="utf-8") as output:
+                    output.write(json.dumps({"attempt": attempt + 1, "error": type(error).__name__}) + "\n")
+                time.sleep(0.25)
 
     def screenshot(self, name):
         (self.evidence / f"{name}.png").write_bytes(base64.b64decode(self.command("GET", "/screenshot")))
@@ -327,8 +345,12 @@ def verify_preserved(driver, server):
     assert driver.js("return [...document.querySelectorAll('input[type=password]')].every(e=>e.value==='')")
     close_profiles(driver)
     enable_history(driver)
-    # Restore the saved nonempty chat, not a new empty startup conversation.
-    driver.click(f"//div[span[contains(.,'{PROMPT}')]]/button[normalize-space(.)='仅恢复文字']")
+    # The saved title remains '新任务'; it is not derived from message text.
+    # This isolated fixture has exactly one two-message conversation. Require
+    # uniqueness, then verify exact reply and persisted task/chat identity below.
+    restore = "//div[@aria-label='本机保存的聊天']/div[span[contains(.,' · 2 条消息')]]/button[normalize-space(.)='仅恢复文字']"
+    wait_for(lambda: len(driver.command("POST", "/elements", {"using": "xpath", "value": restore})) == 1)
+    driver.click(restore)
     assert_literal_reply(driver)
     assert driver.js("return document.body.textContent.includes('未连接服务器')")
     time.sleep(1)

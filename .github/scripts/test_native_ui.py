@@ -36,6 +36,48 @@ class ProcessQueryTests(unittest.TestCase):
 
 
 class NativeDriverHelperTests(unittest.TestCase):
+    def transport_driver(self, directory):
+        driver = native.Driver.__new__(native.Driver)
+        driver.application = pathlib.Path("xyzaishell")
+        driver.application_processes = frozenset([123])
+        driver.evidence = pathlib.Path(directory)
+        driver.process = mock.Mock()
+        driver.process.poll.return_value = None
+        return driver
+
+    def test_read_only_transport_retry_keeps_same_live_application(self):
+        with tempfile.TemporaryDirectory() as directory:
+            driver = self.transport_driver(directory)
+            driver.command = mock.Mock(side_effect=[native.http.client.RemoteDisconnected("fixture"), True])
+            with mock.patch.object(native, "application_pids", return_value=[123]), mock.patch.object(native.time, "sleep"):
+                self.assertTrue(driver.js("return true"))
+            self.assertEqual(driver.command.call_count, 2)
+            self.assertTrue((driver.evidence / "read-only-transport-retries.jsonl").is_file())
+            driver.process.terminate.assert_not_called()
+
+    def test_read_only_retry_is_bounded_and_refuses_dead_app_or_driver(self):
+        for state, expected in [("live", 3), ("app-exited", 1), ("app-replaced", 1), ("driver-exited", 1)]:
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                driver = self.transport_driver(directory)
+                if state == "driver-exited":
+                    driver.process.poll.return_value = 1
+                driver.command = mock.Mock(side_effect=native.http.client.RemoteDisconnected("fixture"))
+                pids = [] if state == "app-exited" else [456] if state == "app-replaced" else [123]
+                with mock.patch.object(native, "application_pids", return_value=pids), \
+                        mock.patch.object(native.time, "sleep"):
+                    with self.assertRaises(native.NativeTransportFailure):
+                        driver.js("return true")
+                self.assertEqual(driver.command.call_count, expected)
+
+    def test_outer_readiness_wait_cannot_restart_exhausted_transport_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            driver = self.transport_driver(directory)
+            driver.command = mock.Mock(side_effect=urllib.error.URLError("fixture"))
+            with mock.patch.object(native, "application_pids", return_value=[123]), mock.patch.object(native.time, "sleep"):
+                with self.assertRaises(native.NativeTransportFailure):
+                    native.wait_for(lambda: driver.js("return true"))
+            self.assertEqual(driver.command.call_count, 3)
+
     def test_clipped_control_is_reached_by_real_tab_then_native_click(self):
         driver = native.Driver.__new__(native.Driver)
         driver.find = mock.Mock(return_value="target")
