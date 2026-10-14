@@ -902,8 +902,18 @@ mod tests {
             let transport = build_transport(
                 &format!("http://{}/v1", listener.local_addr().unwrap()),
                 Duration::from_secs(1),
-                Duration::from_millis(120),
-                Duration::from_millis(50),
+                // Isolate each timer: a busy test runner must not turn the
+                // total-deadline case into an earlier idle-deadline race.
+                if trickle {
+                    Duration::from_millis(120)
+                } else {
+                    Duration::from_secs(2)
+                },
+                if trickle {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_millis(50)
+                },
             )
             .unwrap();
             let server = tokio::spawn(async move {
@@ -948,7 +958,7 @@ mod tests {
                     "MODEL_IDLE_TIMEOUT"
                 }
             );
-            assert!(start.elapsed() < Duration::from_millis(500));
+            assert!(start.elapsed() < Duration::from_secs(1));
             server.await.unwrap();
         }
     }

@@ -326,6 +326,31 @@ mod linux {
             ("credential_id", token),
         ])
     }
+    fn required_attributes_match(
+        expected: &HashMap<&str, &str>,
+        actual: &HashMap<String, String>,
+    ) -> bool {
+        expected
+            .iter()
+            .all(|(key, value)| actual.get(*key).map(String::as_str) == Some(*value))
+    }
+    #[test]
+    fn provider_metadata_cannot_replace_any_required_credential_binding() {
+        let expected = attributes("synthetic-connection", "ssh_password", "synthetic-item");
+        let mut actual: HashMap<String, String> = expected
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect();
+        actual.insert("xdg:schema".into(), "provider-owned-schema".into());
+        assert!(required_attributes_match(&expected, &actual));
+        for key in expected.keys() {
+            let mut changed = actual.clone();
+            changed.insert((*key).into(), "different-binding".into());
+            assert!(!required_attributes_match(&expected, &changed));
+            changed.remove(*key);
+            assert!(!required_attributes_match(&expected, &changed));
+        }
+    }
     pub fn status() -> Result<()> {
         let service = SecretService::connect(EncryptionType::Dh).map_err(error)?;
         let collection = service.get_default_collection().map_err(|e| {
@@ -354,12 +379,16 @@ mod linux {
                 "application/octet-stream",
             )
             .map_err(error)?;
-        if item.get_attributes().map_err(error)?
-            != attributes(id, purpose.name(), &token)
-                .into_iter()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect()
-        {
+        let expected = attributes(id, purpose.name(), &token);
+        let actual = item.get_attributes().map_err(error)?;
+        // Providers may attach their own metadata. Every application binding
+        // remains mandatory; unrelated provider attributes do not grant access.
+        let matched = required_attributes_match(&expected, &actual);
+        #[cfg(test)]
+        if std::env::var("XYZ_TEST_ISOLATED_KEYRING").as_deref() == Ok("1") {
+            eprintln!("Isolated synthetic attribute verification: required_match={matched}, actual_count={}, required_count={}", actual.len(), expected.len());
+        }
+        if !matched {
             return Err(E::CredentialInvalid);
         }
         Ok(format!("xyzaishell:v1:{id}:{}:{token}", purpose.name()))

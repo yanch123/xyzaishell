@@ -8,8 +8,10 @@ use crate::{
     },
 };
 use serde::{Deserialize, Serialize};
+#[cfg(not(windows))]
+use std::path::Path;
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 use zeroize::{Zeroize, Zeroizing};
