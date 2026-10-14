@@ -6074,6 +6074,7 @@ dependencies = [
  "russh",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "url",

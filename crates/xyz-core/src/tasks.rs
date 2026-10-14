@@ -73,6 +73,7 @@ struct ChatRecord {
     snapshot: ChatSnapshot,
     revision: u64,
     cancel: Option<watch::Sender<bool>>,
+    terminal_run: Option<String>,
 }
 impl ChatRecord {
     fn changed(&mut self) {
@@ -94,6 +95,30 @@ impl TaskManager {
             chats: Arc::new(Mutex::new(BTreeMap::new())),
             permits: Arc::new(Semaphore::new(MAX_ACTIVE_RUNS)),
             events,
+        }
+    }
+    pub(crate) fn reserve_terminal(
+        &self,
+        chat_id: &str,
+        run_id: &str,
+    ) -> Result<ChatSnapshot, ApiError> {
+        let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        let record = chats.get_mut(chat_id).ok_or_else(chat_missing)?;
+        if record.snapshot.active_run_id.is_some() || record.terminal_run.is_some() {
+            return Err(ApiError::new(
+                "CHAT_BUSY",
+                "Finish or stop this chat's current run before starting another.",
+            ));
+        }
+        record.terminal_run = Some(run_id.into());
+        Ok(record.snapshot.clone())
+    }
+    pub(crate) fn release_terminal(&self, chat_id: &str, run_id: &str) {
+        let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = chats.get_mut(chat_id) {
+            if record.terminal_run.as_deref() == Some(run_id) {
+                record.terminal_run = None;
+            }
         }
     }
     pub fn config_status(&self) -> ModelConfigStatus {
@@ -165,6 +190,7 @@ impl TaskManager {
                 snapshot: chat.clone(),
                 revision: 1,
                 cancel: None,
+                terminal_run: None,
             },
         );
         drop(chats);
@@ -201,6 +227,10 @@ impl TaskManager {
         // The immutable snapshot and destination consent are resolved before
         // any client/connection is constructed. Reload cannot redirect a run.
         let config = self.config.authorized_snapshot()?;
+        let redactor = crate::observation::ObservationBuffer::new();
+        redactor.add_known_secret(config.api_key.as_str())?;
+        let safe_text = redactor.redact_prose(text);
+        let text = safe_text.as_str();
         let permit = self.permits.clone().try_acquire_owned().map_err(|_| {
             ApiError::new(
                 "MODEL_BUSY",
@@ -209,7 +239,7 @@ impl TaskManager {
         })?;
         let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
         let record = chats.get_mut(chat_id).ok_or_else(chat_missing)?;
-        if record.snapshot.active_run_id.is_some() {
+        if record.snapshot.active_run_id.is_some() || record.terminal_run.is_some() {
             return Err(ApiError::new(
                 "CHAT_BUSY",
                 "Wait for this chat response or cancel it before sending another message.",
@@ -327,9 +357,10 @@ impl TaskManager {
             .messages
             .last_mut()
             .ok_or_else(chat_missing)?;
-        if message.text.len() + text.len() > MAX_ASSISTANT_BYTES {
+        if text.len() > MAX_ASSISTANT_BYTES {
             return Err(ApiError::new("MODEL_OUTPUT_LIMIT", "The model response exceeded the 65536-byte text limit. Partial output is retained; nothing was executed."));
         }
+        message.text.clear();
         message.text.push_str(text);
         record.changed();
         let snapshot = emit.then(|| record.snapshot.clone());
@@ -395,6 +426,9 @@ impl TaskManager {
             .chat(&config.model);
         let request = CompletionRequest::new(text).messages(history).preamble("You are xyzaishell's text-chat assistant. You have no terminal, file, credential, or execution tools in this milestone. Never claim to have run commands. Previous assistant text may be partial if its response was interrupted.").max_tokens(config.request.max_output_tokens);
         let mut stream = model.stream(request).map_err(|_| safe_provider_error())?;
+        let redactor = crate::observation::ObservationBuffer::new();
+        redactor.add_known_secret(config.api_key.as_str())?;
+        let mut raw_output = zeroize::Zeroizing::new(String::new());
         let mut last_emit = Instant::now() - Duration::from_secs(1);
         let mut emitted = 0;
         let mut output_bytes = 0;
@@ -406,8 +440,10 @@ impl TaskManager {
             match item.map_err(|_| safe_provider_error())? {
                 Item::Event(StreamEvent::Text { text, .. }) => {
                     let emit = emitted < MAX_STREAM_SNAPSHOTS && last_emit.elapsed() >= Duration::from_millis(100);
-                    self.append_text(chat_id, run_id, &text, emit)?;
                     output_bytes += text.len();
+                    if output_bytes > MAX_ASSISTANT_BYTES { return Err(ApiError::new("MODEL_OUTPUT_LIMIT", "The model response exceeded the 65536-byte text limit. Partial output is retained; nothing was executed.")); }
+                    raw_output.push_str(&text);
+                    self.append_text(chat_id, run_id, &redactor.redact_prose(&raw_output), emit)?;
                     if emit { emitted += 1; last_emit = Instant::now(); }
                 }
                 Item::Event(StreamEvent::Start { kind: PartKind::ToolCall, .. }) | Item::Event(StreamEvent::Arguments { .. }) => return Err(ApiError::new("MODEL_TOOLS_UNAVAILABLE", "The provider returned a tool call. M2 is text-only; no command or tool was executed.")),

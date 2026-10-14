@@ -1,5 +1,5 @@
-import { act, render } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TerminalOutput } from '../lib/types';
 type FakeTerminal = { disposed: boolean; options: { disableStdin?: boolean; linkHandler?: { activate: () => void; allowNonHttpProtocols: boolean } }; writes: { bytes: Uint8Array; done: () => void }[]; onDataCallback?: (value: string) => void };
 const mocks = vi.hoisted(() => ({ instances: [] as FakeTerminal[], write: vi.fn().mockResolvedValue(undefined), ack: vi.fn().mockResolvedValue(undefined), resize: vi.fn().mockResolvedValue(undefined) }));
@@ -19,6 +19,7 @@ import { TerminalPane } from './TerminalPane';
 vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
 const a = {session_id:'host-a',generation:'1'};
 const b = {session_id:'host-b',generation:'2'};
+beforeEach(() => { mocks.write.mockClear(); mocks.ack.mockClear(); mocks.resize.mockClear(); });
 describe('terminal generation isolation', () => {
   it('disposes queued old-host output and fences late response/ACK callbacks across reconnect', async () => {
     let output!: (event:TerminalOutput) => void;
@@ -46,5 +47,19 @@ describe('terminal generation isolation', () => {
     expect(mocks.ack).toHaveBeenCalledExactlyOnceWith(b,'1');
     await act(async () => current.onDataCallback?.('new input'));
     expect(mocks.write).toHaveBeenCalledExactlyOnceWith(b,btoa('new input'));
+  });
+});
+
+
+describe('explicit manual interrupt', () => {
+  it('sends Ctrl+C only on its separate user button and leaves manual input available', async () => {
+    const common = { available: true, onConnect: vi.fn(), onDisconnect: vi.fn(), subscribe: () => () => {}, reportError: vi.fn(), sizeRef: { current: { cols: 80, rows: 24 } } };
+    render(<TerminalPane {...common} snapshot={{ session: a, state: 'connected' }} />);
+    const terminal = mocks.instances.at(-1)!;
+    expect(terminal.options.disableStdin).toBe(false); expect(mocks.write).not.toHaveBeenCalled();
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: '发送 Ctrl+C' })));
+    expect(mocks.write).toHaveBeenCalledExactlyOnceWith(a, btoa('\x03'));
+    await act(async () => terminal.onDataCallback?.('pwd\r'));
+    expect(mocks.write).toHaveBeenLastCalledWith(a, btoa('pwd\r'));
   });
 });

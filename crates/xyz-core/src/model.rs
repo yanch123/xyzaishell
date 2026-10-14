@@ -201,6 +201,26 @@ impl ModelConfigManager {
         state.status.consented = true;
         Ok(state.status.clone())
     }
+    /// Per-run terminal-context consent, independent of text-only chat consent.
+    pub(crate) fn terminal_snapshot(
+        &self,
+        revision: &str,
+        destination: &str,
+    ) -> Result<Arc<ModelSnapshot>, ApiError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.status.ready
+            || state.status.revision.as_deref() != Some(revision)
+            || state.status.destination.as_deref() != Some(destination)
+        {
+            return Err(ApiError::new("MODEL_CONFIG_CHANGED", "Review the current model destination before allowing this task's terminal context."));
+        }
+        state.snapshot.clone().ok_or_else(|| {
+            ApiError::new(
+                "MODEL_CONFIG_UNAVAILABLE",
+                "Load a valid model configuration first.",
+            )
+        })
+    }
     pub(crate) fn authorized_snapshot(&self) -> Result<Arc<ModelSnapshot>, ApiError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.status.consented {

@@ -564,3 +564,84 @@ async fn rejected_connection_probe_does_not_leak_an_empty_chat_slot() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn split_key_echo_is_redacted_with_original_snapshot_across_reload_and_cancel() {
+    for cancel_run in [false, true] {
+        let (server, base) = listener().await;
+        let fixture = Fixture::new(&base, "");
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let manager = TaskManager::new(
+            ModelConfigManager::from_path(Ok(fixture.path.clone())),
+            Arc::new(move |event| {
+                recorded.lock().unwrap().push(event);
+                true
+            }),
+        );
+        consent(&manager);
+        let (partial_tx, partial_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let (mut socket, _) = server.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let event = |content: &str, finish: serde_json::Value| {
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"id":"mock","object":"chat.completion.chunk","created":0,"model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","content":content},"finish_reason":finish}]})
+                )
+            };
+            let first = event("prefix synthetic-private-", serde_json::Value::Null);
+            let last = event("key suffix", serde_json::json!("stop")) + "data: [DONE]\n\n";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{first}",first.len()+last.len()).as_bytes()).await.unwrap();
+            partial_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            let _ = socket.write_all(last.as_bytes()).await;
+            request
+        });
+        let chat = manager.create_chat("Secret echo test").unwrap();
+        let running = manager
+            .send_message(&chat.chat_id, "Do not expose synthetic-private-key")
+            .unwrap();
+        partial_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let chat = manager.get_chat(&chat.chat_id).unwrap();
+                if chat.messages[1].text.contains("[REDACTED]") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let config_text = fs::read_to_string(&fixture.path)
+            .unwrap()
+            .replace("synthetic-private-key", "new-config-private-key");
+        fs::write(&fixture.path, config_text).unwrap();
+        manager.reload_config();
+        if cancel_run {
+            manager
+                .cancel_run(&chat.chat_id, running.active_run_id.as_ref().unwrap())
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
+        let done = finished(&manager, &chat.chat_id).await;
+        if cancel_run {
+            assert_eq!(done.messages[1].state, MessageState::Cancelled);
+        } else {
+            assert_eq!(done.messages[1].text, "prefix [REDACTED] suffix");
+        }
+        let request = responder.await.unwrap();
+        assert!(!request
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap()
+            .contains("synthetic-private-key"));
+        let public = serde_json::to_string(&*events.lock().unwrap()).unwrap();
+        assert!(!public.contains("synthetic-private-"));
+        assert!(!serde_json::to_string(&done)
+            .unwrap()
+            .contains("synthetic-private-"));
+    }
+}

@@ -260,6 +260,7 @@ pub struct SessionManager {
 struct Inner {
     state: Mutex<ManagerState>,
     sink: EventSink,
+    observation: crate::observation::ObservationBuffer,
 }
 struct ManagerState {
     snapshot: SessionSnapshot,
@@ -277,6 +278,10 @@ struct LiveSession {
     unacked: VecDeque<(u64, OwnedSemaphorePermit)>,
 }
 enum Command {
+    AiWrite {
+        permit: crate::execution::DispatchPermit,
+        reply: oneshot::Sender<Result<WriteReceipt, ApiError>>,
+    },
     Write {
         data: Zeroizing<Vec<u8>>,
         reply: oneshot::Sender<Result<WriteReceipt, ApiError>>,
@@ -288,6 +293,7 @@ impl SessionManager {
         Self {
             inner: Arc::new(Inner {
                 sink,
+                observation: crate::observation::ObservationBuffer::default(),
                 state: Mutex::new(ManagerState {
                     snapshot: SessionSnapshot {
                         revision: "0".into(),
@@ -310,6 +316,24 @@ impl SessionManager {
     }
     fn lock(&self) -> MutexGuard<'_, ManagerState> {
         self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(crate) fn observation(&self) -> crate::observation::ObservationBuffer {
+        self.inner.observation.clone()
+    }
+    pub(crate) fn begin_task_context(
+        &self,
+        session: &SessionRef,
+        model_secret: String,
+    ) -> Result<(SessionSnapshot, crate::observation::ObservationBuffer), ApiError> {
+        let state = self.lock();
+        require_connected(&state, session)?;
+        self.inner
+            .observation
+            .begin(session.clone(), vec![model_secret]);
+        Ok((
+            state.snapshot.clone(),
+            self.inner.observation.detached_redactor(),
+        ))
     }
     pub fn snapshot(&self) -> SessionSnapshot {
         self.lock().snapshot.clone()
@@ -335,6 +359,17 @@ impl SessionManager {
                     "SESSION_BUSY",
                     "Disconnect the current server before opening another connection.",
                 ));
+            }
+            self.inner.observation.reset();
+            match &request.auth {
+                Authentication::Password { password } => {
+                    self.inner.observation.add_known_secret(&password.0)?
+                }
+                Authentication::PrivateKey {
+                    passphrase: Some(p),
+                    ..
+                } => self.inner.observation.add_known_secret(&p.0)?,
+                _ => {}
             }
             state.generation += 1;
             state.revision += 1;
@@ -471,6 +506,34 @@ impl SessionManager {
         // Never retry after queue acceptance, including if this caller is cancelled.
         response.await.unwrap_or_else(|_| Err(ApiError::unknown()))
     }
+    pub(crate) async fn write_ai(
+        &self,
+        session: &SessionRef,
+        permit: crate::execution::DispatchPermit,
+    ) -> Result<WriteReceipt, ApiError> {
+        let (sender, response) = oneshot::channel();
+        let started = permit.started.clone();
+        {
+            let state = self.lock();
+            let live = require_connected(&state, session)?;
+            live.commands
+                .try_send(Command::AiWrite {
+                    permit,
+                    reply: sender,
+                })
+                .map_err(queue_error)?;
+        }
+        response.await.unwrap_or_else(|_| {
+            if started.load(std::sync::atomic::Ordering::Acquire) {
+                Err(ApiError::unknown())
+            } else {
+                Err(ApiError::new(
+                    "NOT_SENT",
+                    "The SSH actor closed before this AI frame started. Nothing was sent.",
+                ))
+            }
+        })
+    }
     pub fn ack_output(&self, session: &SessionRef, seq: &str) -> Result<(), ApiError> {
         let seq: u64 = seq
             .parse()
@@ -525,6 +588,7 @@ impl SessionManager {
                     live.unacked.push_back((*seq, permit));
                 }
             }
+            self.inner.observation.push(session, chunk);
             self.emit(SshEvent::Output {
                 session: session.clone(),
                 seq: seq.to_string(),
@@ -554,7 +618,7 @@ impl SessionManager {
         // reported unknown by its dropped response, never silently replayed.
         receiver.close();
         while let Some(command) = receiver.recv().await {
-            if let Command::Write { reply, .. } = command {
+            if let Command::Write { reply, .. } | Command::AiWrite { reply, .. } = command {
                 let _ = reply.send(Err(ApiError::new(
                     "NOT_SENT",
                     "The session closed before this frame was written.",
@@ -742,6 +806,24 @@ impl SessionManager {
                         // The sole writer serializes frames; it does not arbitrate human/AI intent.
                         transport_seq += 1;
                         let write = tokio::time::timeout(NETWORK_TIMEOUT, channel.data(&data[..])).await;
+                        let success = matches!(write, Ok(Ok(())));
+                        let receipt = if success { Ok(WriteReceipt { transport_seq: transport_seq.to_string(), delivery: "write_accepted".into(), remote_outcome: "unknown".into() }) } else { Err(ApiError::unknown()) };
+                        let _ = reply.send(receipt);
+                        if !success { return Err(ApiError::unknown()); }
+                    }
+                    Some(Command::AiWrite { permit, reply }) => {
+                        // Final gate is in this single SSH actor, at dequeue time.
+                        // Cancellation/session/expiry/approval are checked again here.
+                        let began = {
+                            let state = self.lock();
+                            require_connected(&state,session_ref).and_then(|_| permit.begin(session_ref))
+                        };
+                        if began.is_err() || permit.notify_started().is_err() {
+                            let _ = reply.send(Err(ApiError::new("NOT_SENT", "The queued AI action expired, was cancelled, or no longer matches its approval. Nothing was sent.")));
+                            continue;
+                        }
+                        transport_seq += 1;
+                        let write = tokio::time::timeout(NETWORK_TIMEOUT, channel.data(&permit.bytes[..])).await;
                         let success = matches!(write, Ok(Ok(())));
                         let receipt = if success { Ok(WriteReceipt { transport_seq: transport_seq.to_string(), delivery: "write_accepted".into(), remote_outcome: "unknown".into() }) } else { Err(ApiError::unknown()) };
                         let _ = reply.send(receipt);
@@ -1300,5 +1382,42 @@ mod tests {
             "LOCAL_FILE_PERMISSION_DENIED"
         );
         std::fs::remove_dir_all(base).unwrap();
+    }
+    #[tokio::test]
+    async fn dropped_ai_receipt_distinguishes_before_and_after_actor_begin() {
+        use crate::execution::{ExecutionGate, Owner};
+        for started in [false, true] {
+            let (manager, session, mut receiver) = connected();
+            let gate = ExecutionGate::default();
+            let owner = Owner {
+                task_id: "task".into(),
+                run_id: "run".into(),
+                session: session.clone(),
+            };
+            gate.acquire(owner.clone(), true).unwrap();
+            let action = gate.prepare(&owner, "pwd").unwrap();
+            gate.acknowledge(&owner, &action.action_id, "1").unwrap();
+            let permit = gate.queue(&owner).unwrap();
+            let writer = manager.clone();
+            let target = session.clone();
+            let write = tokio::spawn(async move { writer.write_ai(&target, permit).await });
+            match receiver.recv().await.unwrap() {
+                Command::AiWrite { permit, reply } => {
+                    if started {
+                        permit.begin(&session).unwrap();
+                    }
+                    drop(reply);
+                }
+                _ => panic!("expected AI frame"),
+            }
+            assert_eq!(
+                write.await.unwrap().unwrap_err().code,
+                if started {
+                    "DELIVERY_UNKNOWN"
+                } else {
+                    "NOT_SENT"
+                }
+            );
+        }
     }
 }

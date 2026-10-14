@@ -2,6 +2,10 @@
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
+use xyz_core::agent::{
+    AckTerminalAction, AgentManager, ContinueTerminalTask, DecideTerminalAction, StartTerminalTask,
+    TaskRunRequest, TerminalTaskSnapshot,
+};
 use xyz_core::ssh::{
     ApiError, ConnectRequest, HostKeyDecision, SessionManager, SessionRef, SessionSnapshot,
     TerminalSize, WriteReceipt,
@@ -126,18 +130,75 @@ async fn probe_model_compatibility(
     state.probe()
 }
 
+#[tauri::command]
+fn list_terminal_tasks(state: State<'_, AgentManager>) -> Vec<TerminalTaskSnapshot> {
+    state.list()
+}
+#[tauri::command]
+fn get_terminal_task(
+    task_id: String,
+    state: State<'_, AgentManager>,
+) -> Option<TerminalTaskSnapshot> {
+    state.get(&task_id)
+}
+#[tauri::command]
+async fn start_terminal_task(
+    request: StartTerminalTask,
+    state: State<'_, AgentManager>,
+) -> Result<TerminalTaskSnapshot, ApiError> {
+    state.start(request)
+}
+#[tauri::command]
+async fn ack_terminal_action(
+    request: AckTerminalAction,
+    state: State<'_, AgentManager>,
+) -> Result<TerminalTaskSnapshot, ApiError> {
+    state.acknowledge(request)
+}
+#[tauri::command]
+async fn decide_terminal_action(
+    request: DecideTerminalAction,
+    state: State<'_, AgentManager>,
+) -> Result<TerminalTaskSnapshot, ApiError> {
+    state.decide(request)
+}
+#[tauri::command]
+fn cancel_terminal_task(
+    request: TaskRunRequest,
+    state: State<'_, AgentManager>,
+) -> Result<TerminalTaskSnapshot, ApiError> {
+    state.cancel(request)
+}
+#[tauri::command]
+async fn continue_terminal_task(
+    request: ContinueTerminalTask,
+    state: State<'_, AgentManager>,
+) -> Result<TerminalTaskSnapshot, ApiError> {
+    state.continue_task(request)
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle().clone();
-            app.manage(SessionManager::new(Arc::new(move |event| {
+            let ssh = SessionManager::new(Arc::new(move |event| {
                 handle.emit("ssh:event", event).is_ok()
-            })));
+            }));
             let handle = app.handle().clone();
-            app.manage(TaskManager::new(
-                ModelConfigManager::new(),
+            let config = ModelConfigManager::new();
+            let chats = TaskManager::new(
+                config.clone(),
                 Arc::new(move |event| handle.emit("model:event", event).is_ok()),
+            );
+            let handle = app.handle().clone();
+            app.manage(AgentManager::new(
+                config,
+                chats.clone(),
+                ssh.clone(),
+                Arc::new(move |event| handle.emit("agent:event", event).is_ok()),
             ));
+            app.manage(ssh);
+            app.manage(chats);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -157,7 +218,14 @@ fn main() {
             get_chat,
             send_chat_message,
             cancel_chat_run,
-            probe_model_compatibility
+            probe_model_compatibility,
+            list_terminal_tasks,
+            get_terminal_task,
+            start_terminal_task,
+            ack_terminal_action,
+            decide_terminal_action,
+            cancel_terminal_task,
+            continue_terminal_task
         ])
         .run(tauri::generate_context!())
         .expect("Unable to start xyzaishell desktop host");

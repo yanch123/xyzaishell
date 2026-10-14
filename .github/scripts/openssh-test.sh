@@ -180,7 +180,10 @@ export XYZ_OPENSSH_PORT=$port XYZ_OPENSSH_USER=$username
 export XYZ_OPENSSH_PRIVATE_KEY="$fixture/client/key"
 export XYZ_OPENSSH_HOST_FINGERPRINT
 XYZ_OPENSSH_HOST_FINGERPRINT=$(ssh-keygen -lf "$fixture/server/host_key.pub" -E sha256 | awk '{print $2}')
-"$sshd" -V 2>&1
+# Version output is diagnostic only: OpenSSH 8.9 prints its version/usage
+# but exits nonzero for -V, which newer releases support. The daemon above
+# already passed configuration validation and the readiness check.
+"$sshd" -V 2>&1 || true
 cd "$repo"
 # --exact plus --ignored prevents silently passing without executing acceptance.
 cargo test -p xyz-core --locked --test openssh_interop \

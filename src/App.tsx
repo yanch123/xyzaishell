@@ -1,5 +1,10 @@
 import { useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
+import { useTerminalAgent } from './hooks/useTerminalAgent';
+import { TerminalTaskStartDialog } from './components/TerminalTaskStartDialog';
+import type { ChatSnapshot } from './lib/model';
+import type { SessionSnapshot } from './lib/types';
+import { sameSession } from './lib/types';
 import { useModelChat } from './hooks/useModelChat';
 import type { ModelConfigStatus } from './lib/model';
 import { ModelConsentDialog } from './components/ModelConsentDialog';
@@ -15,6 +20,14 @@ import { isActiveSession, SESSION_LABELS } from './lib/types';
 export default function App() {
   const ssh = useSshSession();
   const model = useModelChat();
+  const agent = useTerminalAgent(model.config, ssh.snapshot);
+  const [launch, setLaunch] = useState<{ chat: ChatSnapshot; instruction: string; config: ModelConfigStatus; target: SessionSnapshot } | null>(null);
+  const startTask = (chat: ChatSnapshot, instruction: string) => setLaunch({ chat, instruction, config: model.config, target: ssh.snapshot });
+  const confirmTask = async () => {
+    if (!launch || !launch.target.session || !launch.config.revision || !launch.config.destination) return;
+    const accepted = await agent.start(launch.chat, { chat_id: launch.chat.chat_id, session: launch.target.session, instruction: launch.instruction, readiness_confirmed: true, context_consent: { revision: launch.config.revision, destination: launch.config.destination } });
+    if (accepted) setLaunch(null);
+  };
   const [consent, setConsent] = useState<{ config: ModelConfigStatus; chatId?: string } | null>(null);
   const requestConsent = (chatId?: string) => { setModal(null); setConsent({ config: model.config, chatId }); };
   const confirmConsent = async () => {
@@ -30,7 +43,7 @@ export default function App() {
   const dragging = useRef(false);
   const available = ssh.native && ssh.ready;
   const active = isActiveSession(ssh.snapshot.state);
-  const hasModal = !!modal || !!ssh.challenge || !!consent;
+  const hasModal = !!modal || !!ssh.challenge || !!consent || !!launch;
   return <>
     <div className="app-shell" inert={hasModal}>
       <header className="app-header"><div className="brand"><div className="brand-mark"><Icon name="terminal" size={19} /></div><span>xyzai<span className="brand-light">shell</span></span><span className="version-tag">PREVIEW</span></div><div className="header-workspace"><span className={`status-dot ${ssh.snapshot.state === 'connected' ? 'online' : ''}`} /><span>{ssh.snapshot.host || '未连接服务器'}</span><span className="workspace-divider">/</span><span>SSH 工作空间</span></div><button className="header-settings icon-button" aria-label="打开设置" title="工作空间设置" onClick={() => setModal('settings')}><Icon name="settings" size={19} /></button></header>
@@ -41,15 +54,16 @@ export default function App() {
           <div className="workspace-grid" ref={workspace} style={{ '--terminal-share': `${split}%` } as CSSProperties}>
             <TerminalPane snapshot={ssh.snapshot} available={available} historyUnavailable={ssh.historyUnavailable} onConnect={() => { if (!active) setModal('connect'); }} onDisconnect={() => void ssh.disconnect()} subscribe={ssh.subscribeOutput} reportError={ssh.reportError} sizeRef={ssh.size} />
             <div className="pane-divider" role="separator" aria-label="调整终端与聊天的宽度" aria-orientation="vertical" aria-valuemin={40} aria-valuemax={75} aria-valuenow={split} tabIndex={0} onKeyDown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); setSplit(value => Math.max(40, Math.min(75, value + (event.key === 'ArrowLeft' ? -2 : 2)))); } }} onPointerDown={event => { dragging.current = true; event.currentTarget.setPointerCapture(event.pointerId); }} onPointerMove={event => { if (!dragging.current || !workspace.current) return; const box = workspace.current.getBoundingClientRect(); setSplit(Math.round(Math.max(40, Math.min(75, (event.clientX - box.left) / box.width * 100)))); }} onPointerUp={event => { dragging.current = false; event.currentTarget.releasePointerCapture(event.pointerId); }} onPointerCancel={() => { dragging.current = false; }} />
-            <ChatPane model={model} onConsent={requestConsent} showHistory={history} onToggleHistory={() => setHistory(value => !value)} onSettings={() => setModal('settings')} />
+            <ChatPane agent={agent} session={ssh.snapshot} onStartTask={startTask} displayEnabled={!hasModal} model={model} onConsent={requestConsent} showHistory={history} onToggleHistory={() => setHistory(value => !value)} onSettings={() => setModal('settings')} />
           </div>
         </main>
       </div>
-      <footer className="app-statusbar"><span><Icon name="server" size={12} />{SESSION_LABELS[ssh.snapshot.state]}<span className="status-divider">|</span>单服务器 / 单 PTY</span><span>SSH + 模型聊天 <span className="footer-stage">M2</span></span></footer>
+      <footer className="app-statusbar"><span><Icon name="server" size={12} />{SESSION_LABELS[ssh.snapshot.state]}<span className="status-divider">|</span>单服务器 / 单 PTY</span><span>SSH + 可控任务 <span className="footer-stage">M3</span></span></footer>
     </div>
     {modal === 'connect' && !ssh.challenge && <ConnectionDialog onClose={() => setModal(null)} onConnect={ssh.connect} size={ssh.size.current} available={available} />}
     {modal === 'settings' && !ssh.challenge && <SettingsDialog model={model} onConsent={() => requestConsent()} onTest={async () => { if (await model.probe()) setModal(null); }} onClose={() => setModal(null)} />}
     {consent && !ssh.challenge && <ModelConsentDialog config={consent.config} changed={consent.config.revision !== model.config.revision} busy={model.configBusy} sendAfter={!!consent.chatId} error={model.error} onConfirm={confirmConsent} onClose={() => { if (!model.configBusy) setConsent(null); }} />}
+    {launch && !ssh.challenge && <TerminalTaskStartDialog config={launch.config} target={launch.target} instruction={launch.instruction} changed={launch.config.revision !== model.config.revision || launch.config.destination !== model.config.destination || !sameSession(launch.target.session, ssh.snapshot.session) || ssh.snapshot.state !== 'connected'} busy={!!agent.pending[launch.chat.task_id]} error={agent.errors[launch.chat.task_id] ?? null} onConfirm={confirmTask} onClose={() => setLaunch(null)} />}
     {ssh.challenge && <HostKeyDialog key={ssh.challenge.challenge_id} challenge={ssh.challenge} onDecide={ssh.confirmHostKey} />}
   </>;
 }
