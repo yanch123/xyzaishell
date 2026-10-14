@@ -111,8 +111,13 @@ jobs:
       - name: Test real OpenSSH PTY interoperability on the disposable Linux runner
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get install --no-install-recommends -y openssh-server
+          sudo apt-get install --no-install-recommends -y openssh-server python3-pexpect
           bash .github/scripts/openssh-test.sh --disposable-user
+      - name: Test generated shell-log bootstrap in a real local PTY
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        # Use the distro Python matching the distro pexpect package.
+        run: /usr/bin/python3 crates/xyz-core/tests/shell_log_pty.py
       - name: Test native Secret Service in an isolated disposable keyring
         if: runner.os == 'Linux'
         timeout-minutes: 5

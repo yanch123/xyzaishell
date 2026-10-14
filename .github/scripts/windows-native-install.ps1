@@ -5,6 +5,8 @@ if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Windows') { throw 'Disposable Win
 if (-not $env:PACKAGE_DIR -or -not $env:TAURI_DRIVER) { throw 'Package and native driver setup required' }
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $evidence = Join-Path $env:RUNNER_TEMP 'xyzaishell-windows-smoke'
+$upgrade = -not [string]::IsNullOrEmpty($env:UPGRADE_BASELINE_DIR)
+if ($upgrade) { $evidence = Join-Path $evidence 'version-upgrade' }
 New-Item -ItemType Directory -Path $evidence -Force | Out-Null
 Start-Transcript -Path (Join-Path $evidence 'install.txt') | Out-Null
 $fixture = Join-Path $env:RUNNER_TEMP ('xyz-native-' + [guid]::NewGuid().ToString('N'))
@@ -52,6 +54,13 @@ try {
     if ((Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $checksum.Substring(0,64)) {
         throw 'Installer checksum mismatch'
     }
+    $candidateVersion = (Get-Content -Raw -LiteralPath (Join-Path $repo 'package.json') | ConvertFrom-Json).version
+    function Assert-InstalledVersion([string]$Expected) {
+        if (-not (Test-Path -LiteralPath $application)) { throw 'Installed binary is missing' }
+        $actual = (Get-Item -LiteralPath $application).VersionInfo.ProductVersion
+        if ($actual -notmatch ('^' + [regex]::Escape($Expected) + '(?:\.0)?$')) { throw "Installed version $actual does not match $Expected" }
+        Write-Output "PASS: installed executable version $actual"
+    }
     function Invoke-Installer([string]$Executable, [string]$Arguments) {
         $process = Start-Process -FilePath $Executable -ArgumentList $Arguments -PassThru
         if (-not $process.WaitForExit(180000)) {
@@ -76,16 +85,28 @@ try {
         }
         Write-Output 'PASS: synthetic model/profile/history config hashes preserved'
     }
-    function Invoke-NativeUi([string]$Phase, [string]$Label) {
+    function Invoke-NativeUi([string]$Phase, [string]$Label, [string]$Version) {
         & python (Join-Path $repo '.github/scripts/native-ui.py') --application $application `
-            --fixture $fixture --evidence (Join-Path $evidence $Label) --phase $Phase
+            --fixture $fixture --evidence (Join-Path $evidence $Label) --phase $Phase --application-version $Version
         if ($LASTEXITCODE -ne 0) { throw "Native installed-app UI check failed: $Label" }
     }
     Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber | Format-List
     Write-Output "Source commit: $(& git -C $repo rev-parse HEAD)"
-    # NSIS /D is deliberately last and unquoted inside the argument string.
+    if ($upgrade) {
+        $baseline = & python (Join-Path $repo '.github/scripts/upgrade_baseline.py') verify --platform windows-x64 --directory $env:UPGRADE_BASELINE_DIR
+        if ($LASTEXITCODE -ne 0 -or @($baseline).Count -ne 1) { throw 'Pinned upgrade baseline verification failed' }
+        Invoke-Installer $baseline "/S /D=$install"
+        Assert-InstalledVersion '0.1.0'
+        & python (Join-Path $repo '.github/scripts/upgrade_baseline.py') verify --platform windows-x64 --directory $env:UPGRADE_BASELINE_DIR --application $application
+        if ($LASTEXITCODE -ne 0) { throw 'Installed baseline executable is not the verified v0.1.0' }
+        & (Join-Path $repo '.github/scripts/install-webview-driver.ps1') -Evidence $evidence
+        Invoke-NativeUi 'seed' 'baseline-v0.1.0-install-and-restart' '0.1.0'
+        $beforeUpgrade = Get-ConfigFingerprint
+    }
+    # NSIS /D is last; no uninstall/data reset between the old and new installer.
     Invoke-Installer $package.FullName "/S /D=$install"
-    if (-not (Test-Path -LiteralPath $application)) { throw 'Installed binary is missing' }
+    Assert-InstalledVersion $candidateVersion
+    if ($upgrade) { Assert-ConfigFingerprint $beforeUpgrade }
     foreach ($resource in @('THIRD-PARTY-NOTICES.txt','RUST-STANDARD-LIBRARY.html','runtime-inventory.json','sources/option-ext-0.2.0.crate')) {
         $path = Join-Path $install "third-party/$resource"
         if (-not (Test-Path -LiteralPath $path) -or (Get-Item -LiteralPath $path).Length -eq 0) {
@@ -96,12 +117,15 @@ try {
     }
     # The real installer provisions WebView2 when missing. Only now select the
     # exact matching signed driver rather than assuming the runner has it.
-    & (Join-Path $repo '.github/scripts/install-webview-driver.ps1')
-    Invoke-NativeUi 'seed' 'first-install-and-restart'
+    & (Join-Path $repo '.github/scripts/install-webview-driver.ps1') -Evidence $evidence
+    if ($upgrade) {
+        Invoke-NativeUi 'upgrade' 'upgraded-v0.1.1' $candidateVersion
+    } else {
+    Invoke-NativeUi 'seed' 'first-install-and-restart' $candidateVersion
     $before = Get-ConfigFingerprint
     Invoke-Installer $package.FullName "/S /D=$install"
     Assert-ConfigFingerprint $before
-    Invoke-NativeUi 'preserved' 'same-version-reinstall'
+    Invoke-NativeUi 'preserved' 'same-version-reinstall' $candidateVersion
     $before = Get-ConfigFingerprint
     Invoke-Installer (Join-Path $install 'uninstall.exe') '/S'
     # NSIS may copy its uninstaller into TEMP; wait for its child to finish.
@@ -112,13 +136,18 @@ try {
     Assert-ConfigFingerprint $before
     Invoke-Installer $package.FullName "/S /D=$install"
     Assert-ConfigFingerprint $before
-    Invoke-NativeUi 'preserved' 'uninstall-and-reinstall'
+    Invoke-NativeUi 'preserved' 'uninstall-and-reinstall' $candidateVersion
+    }
     $finalFingerprint = Get-ConfigFingerprint
+    if ($upgrade) {
+        'PASS: pinned v0.1.0 installed and seeded through real UI; direct v0.1.1 upgrade retained profile/history hashes, text and stable IDs.' | Set-Content -LiteralPath (Join-Path $evidence 'result.txt') -Encoding utf8
+    } else {
     @(
         'PASS: actual NSIS install and native UI/IPC synthetic profile/chat persistence.'
         'PASS: same-version reinstall and uninstall/reinstall preserve config hashes and restored text.'
         'NOT TESTED: Windows 10/11, version upgrade, IME/clipboard, SmartScreen UX, live provider, SSH via UI.'
     ) | Set-Content -LiteralPath (Join-Path $evidence 'result.txt') -Encoding utf8
+    }
 } finally {
     # The runner is discarded after this job. Remove only the fixture created above.
     try {

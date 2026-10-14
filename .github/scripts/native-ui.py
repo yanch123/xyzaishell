@@ -397,6 +397,58 @@ def stored_identity(history):
     return matches[0]
 
 
+def verify_empty_shell_log(driver, history, server):
+    # This native smoke has no SSH connection and must never invent a shell
+    # event or create a database just to make export succeed.
+    assert not list(history.glob("shell-log*")), "Unexpected shell-log data before consent"
+    requests_before = len(server.requests)
+    driver.click(driver.button("打开终端日志"))
+    wait_for(lambda: driver.js("return document.querySelector('.shell-log-dialog')?.textContent.includes('当前筛选下暂无日志。')"))
+    wait_for(lambda: driver.js("return document.querySelector('.shell-log-dialog')?.textContent.includes('记录状态：未启用')"))
+    assert driver.js("return document.querySelector('.shell-log-dialog').textContent.includes('不保存终端输出，不自动发送给模型')")
+    checks = driver.command("POST", "/elements", {"using": "xpath", "value": "//div[contains(@class,'shell-log-consent')]//input[@type='checkbox']"})
+    assert len(checks) == 2
+    for checkbox in checks:
+        assert driver.command("GET", f"/element/{checkbox[ELEMENT]}/selected") is False
+        assert driver.command("GET", f"/element/{checkbox[ELEMENT]}/enabled") is False
+    start = driver.find(driver.button("启动终端日志"))
+    assert driver.command("GET", f"/element/{start}/enabled") is False
+    driver.screenshot("shell-log-disabled-empty")
+    driver.click(driver.button("关闭对话框"))
+    driver.click(driver.button("打开终端日志"))
+    for format_name in ("JSON", "CSV"):
+        driver.click(driver.button("筛选 / 刷新"))
+        wait_for(lambda: driver.js("return document.querySelector('.shell-log-entries')?.getAttribute('aria-busy') === 'false' && !document.querySelector('.shell-log-dialog [role=alert]')"))
+        driver.click(driver.button("导出 " + format_name))
+        wait_for(lambda: driver.js("return [...document.querySelectorAll('.shell-log-dialog [role=alert]')].some(e=>e.textContent === 'No shell log database exists to export.')"))
+        assert not list(history.glob("shell-log*")), "Empty export created a database, lock or export file"
+        assert driver.js("return !document.querySelector('input[aria-label=\"导出文件完整路径\"]')")
+    driver.screenshot("shell-log-empty-export-rejected")
+    driver.click(driver.button("关闭对话框"))
+    assert len(server.requests) == requests_before, "Shell-log UI unexpectedly contacted a model"
+
+
+def verify_phase_version(phase, version, application_hash, expected):
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise ValueError("Exact installed application version required")
+    if phase == "seed":
+        if expected is not None:
+            raise ValueError("Seed must use fresh fixture state")
+        return
+    if not expected or not expected.get("application_sha256"):
+        raise ValueError("Missing original application identity")
+    if phase == "upgrade":
+        if expected.get("application_version") != "0.1.0" or version != "0.1.1":
+            raise ValueError("Only the reviewed 0.1.0 to 0.1.1 upgrade is covered")
+        if expected["application_sha256"] == application_hash:
+            raise ValueError("Upgrade did not replace the old executable")
+    elif phase == "preserved":
+        if expected.get("application_version") != version or expected["application_sha256"] != application_hash:
+            raise ValueError("Same-version lifecycle changed the executable identity")
+    else:
+        raise ValueError("Unknown native acceptance phase")
+
+
 def main():
     if sys.flags.optimize:
         raise RuntimeError("Native acceptance assertions must not be disabled with Python optimization")
@@ -404,7 +456,8 @@ def main():
     parser.add_argument("--application", required=True, type=pathlib.Path)
     parser.add_argument("--fixture", required=True, type=pathlib.Path)
     parser.add_argument("--evidence", required=True, type=pathlib.Path)
-    parser.add_argument("--phase", choices=["seed", "preserved"], required=True)
+    parser.add_argument("--phase", choices=["seed", "preserved", "upgrade"], required=True)
+    parser.add_argument("--application-version", required=True)
     args = parser.parse_args()
     root = args.fixture.resolve(strict=True)
     assert (root / ".xyz-native-fixture").read_text() == "synthetic disposable fixture\n"
@@ -419,7 +472,9 @@ def main():
         history = history / "state"
     args.evidence.mkdir(parents=True, exist_ok=True)
     state_file = root / "expected.json"
-    expected = json.loads(state_file.read_text()) if args.phase == "preserved" else None
+    expected = json.loads(state_file.read_text()) if args.phase != "seed" else None
+    application_hash = hashlib.sha256(args.application.read_bytes()).hexdigest()
+    verify_phase_version(args.phase, args.application_version, application_hash, expected)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", expected["port"] if expected else 0), ModelFixture)
     server.requests, server.invalid_requests = [], 0
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -451,7 +506,7 @@ allow_loopback_http = true
     try:
         # First phase includes a real process restart. Preserved phase is called
         # after installer reinstallation and again after uninstall/reinstall.
-        phases = ["seed", "restart"] if expected is None else ["preserved"]
+        phases = ["seed", "restart"] if expected is None else [args.phase]
         identity = expected["identity"] if expected else None
         for phase in phases:
             directory = args.evidence / phase
@@ -462,6 +517,8 @@ allow_loopback_http = true
                     seed(driver, server)
                 else:
                     verify_preserved(driver, server)
+                if args.application_version != "0.1.0":
+                    verify_empty_shell_log(driver, history, server)
                 visible_task_identity = driver.js("return document.querySelector('.chat-status span[title]')?.getAttribute('title')")
             except BaseException:
                 with contextlib.suppress(Exception):
@@ -478,15 +535,19 @@ allow_loopback_http = true
                 identity = actual
             assert actual == identity, "Restoration changed the stored task/chat identity"
             server.requests.clear()
-        if expected is None:
-            state_file.write_text(json.dumps({"port": server.server_port, "identity": identity}), encoding="utf-8")
+        if expected is None or args.phase == "upgrade":
+            state_file.write_text(json.dumps({"port": server.server_port, "identity": identity,
+                "application_version": args.application_version, "application_sha256": application_hash}), encoding="utf-8")
         (args.evidence / "result.json").write_text(json.dumps({
             "result": "passed", "phase": args.phase, "application": str(args.application),
-            "application_sha256": hashlib.sha256(args.application.read_bytes()).hexdigest(),
+            "application_sha256": application_hash, "application_version": args.application_version,
+            "upgrade_from": expected["application_version"] if args.phase == "upgrade" else None,
             "native_ipc": True, "synthetic_loopback_model": True,
             "profile_and_history_persisted": True, "restored_task_identity_preserved": True,
             "history_requires_new_process_consent": True, "restore_model_requests": 0,
-            "not_tested": ["real provider", "SSH via UI", "desktop input methods", "version upgrade", "Windows 10/11"],
+            "shell_log_empty_export_fail_closed": args.application_version != "0.1.0",
+            "not_tested": ["real provider", "SSH via UI", "desktop input methods", "Windows 10/11"]
+                + ([] if args.phase == "upgrade" else ["version upgrade in this phase"]),
         }, indent=2), encoding="utf-8")
     finally:
         server.shutdown()

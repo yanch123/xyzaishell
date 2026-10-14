@@ -1,5 +1,6 @@
 # Official Microsoft download, pinned to the installed WebView2 runtime version.
 # Never substitute an unmatched Edge browser version or disable signature checks.
+param([Parameter(Mandatory=$true)][string]$Evidence)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($env:CI -ne 'true' -or $env:RUNNER_OS -ne 'Windows') { throw 'Disposable Windows CI only' }
@@ -18,12 +19,19 @@ $runtime = $runtimes[0]
 $version = $runtime.VersionInfo.ProductVersion
 if ($version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw 'Unexpected WebView2 runtime version' }
 $directory = Join-Path $env:RUNNER_TEMP 'xyz-edge-driver'
-New-Item -ItemType Directory -Path $directory | Out-Null
 $archive = Join-Path $directory 'edgedriver_win64.zip'
 $url = "https://msedgedriver.microsoft.com/$version/edgedriver_win64.zip"
-Invoke-WebRequest -Uri $url -OutFile $archive
-Expand-Archive -LiteralPath $archive -DestinationPath $directory
+if (-not (Test-Path -LiteralPath $directory)) {
+    New-Item -ItemType Directory -Path $directory | Out-Null
+    Invoke-WebRequest -Uri $url -OutFile $archive
+    Expand-Archive -LiteralPath $archive -DestinationPath $directory
+}
 $driver = Join-Path $directory 'msedgedriver.exe'
+# Fresh-install and upgrade scenarios share only the signed driver download.
+# Every use rechecks its signature/version; browser profiles stay fixture-local.
+if (-not (Test-Path -LiteralPath $archive -PathType Leaf) -or -not (Test-Path -LiteralPath $driver -PathType Leaf)) {
+    throw 'Existing driver cache is incomplete; refusing unverified reuse'
+}
 $signature = Get-AuthenticodeSignature -LiteralPath $driver
 if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
     throw 'Microsoft Edge Driver Authenticode verification failed'
@@ -36,8 +44,7 @@ if ($LASTEXITCODE -ne 0 -or $reported -notmatch ('\b' + [regex]::Escape($version
 # and keep all browser data inside the wrapper's private fixture.
 $env:WEBVIEW2_BROWSER_EXECUTABLE_FOLDER = $runtime.DirectoryName
 $env:WEBVIEW2_USER_DATA_FOLDER = Join-Path $env:LOCALAPPDATA 'webview2-user-data'
-$evidence = Join-Path $env:RUNNER_TEMP 'xyzaishell-windows-smoke'
-New-Item -ItemType Directory -Path $evidence -Force | Out-Null
+New-Item -ItemType Directory -Path $Evidence -Force | Out-Null
 @{
     runtimeVersion = $version
     runtimePath = $runtime.FullName
@@ -50,6 +57,6 @@ New-Item -ItemType Directory -Path $evidence -Force | Out-Null
     signature = "$($signature.Status)"
     signer = $signature.SignerCertificate.Subject
     limitation = 'SHA256 records downloaded bytes; authenticity is checked using Microsoft Authenticode, not a vendor checksum manifest.'
-} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidence 'driver-provenance.json') -Encoding utf8
+} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Evidence 'driver-provenance.json') -Encoding utf8
 "NATIVE_DRIVER=$driver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 $env:NATIVE_DRIVER = $driver

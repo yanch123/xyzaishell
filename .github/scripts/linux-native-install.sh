@@ -9,6 +9,11 @@ umask 077
 [[ ${CI:-} == true && $(uname -s) == Linux ]] || { echo 'Disposable Linux CI only' >&2; exit 1; }
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 evidence="$RUNNER_TEMP/xyzaishell-native-linux"
+upgrade=false
+if [[ -n ${UPGRADE_BASELINE_DIR:-} ]]; then
+  upgrade=true
+  evidence="$evidence/version-upgrade"
+fi
 mkdir -p "$evidence"
 exec > >(tee "$evidence/install.txt") 2>&1
 fixture=$(mktemp -d /tmp/xyz-native.XXXXXXXX)
@@ -50,7 +55,31 @@ candidate_name=$(dpkg-deb --field "${packages[0]}" Package)
 [[ "$candidate_name" == xyzaishell ]] || { echo 'Unexpected package name' >&2; exit 1; }
 (cd "$repo" && python3 .github/scripts/artifacts.py verify-package --platform linux-x64 --installers "$PACKAGE_DIR")
 package_name=$candidate_name
+candidate_version=$(cd "$repo" && python3 .github/scripts/artifacts.py check-version)
+run_ui() {
+  local phase=$1 label=$2 version=$3
+  timeout --kill-after=10s 240s xvfb-run -a dbus-run-session -- \
+    python3 "$repo/.github/scripts/native-ui.py" --application /usr/bin/xyzaishell \
+      --fixture "$fixture" --evidence "$evidence/$label" --phase "$phase" --application-version "$version"
+}
+fingerprint() {
+  sha256sum "$XDG_CONFIG_HOME/xyzaishell/"{model.toml,connections.toml} \
+    "$XDG_STATE_HOME/xyzaishell/history.sqlite3"
+}
+if $upgrade; then
+  baseline=$(cd "$repo" && python3 .github/scripts/upgrade_baseline.py verify \
+    --platform linux-x64 --directory "$UPGRADE_BASELINE_DIR")
+  sudo apt-get install --no-install-recommends -y "$baseline"
+  [[ $(dpkg-query -W -f='${Version}' "$package_name") == 0.1.0 ]]
+  (cd "$repo" && python3 .github/scripts/upgrade_baseline.py verify \
+    --platform linux-x64 --directory "$UPGRADE_BASELINE_DIR" --application /usr/bin/xyzaishell)
+  run_ui seed baseline-v0.1.0-install-and-restart 0.1.0
+  fingerprint > "$fixture/before-upgrade.sha256"
+fi
+# No uninstall or data reset between the old application and this installation.
 sudo apt-get install --no-install-recommends -y "${packages[0]}"
+[[ $(dpkg-query -W -f='${Version}' "$package_name") == "$candidate_version" ]]
+if $upgrade; then sha256sum --check "$fixture/before-upgrade.sha256"; fi
 test -x /usr/bin/xyzaishell
 dpkg-query -W "$package_name" 'libwebkit2gtk-4.1-*' 'libgtk-3-*' | tee "$evidence/runtime.txt"
 dpkg -L "$package_name" | grep -E '/share/applications/[^/]+\.desktop$'
@@ -61,32 +90,30 @@ for resource in THIRD-PARTY-NOTICES.txt RUST-STANDARD-LIBRARY.html runtime-inven
 done
 ldd /usr/bin/xyzaishell | tee "$evidence/linkage.txt"
 ! grep -q 'not found' "$evidence/linkage.txt"
-run_ui() {
-  local phase=$1 label=$2
-  timeout --kill-after=10s 240s xvfb-run -a dbus-run-session -- \
-    python3 "$repo/.github/scripts/native-ui.py" --application /usr/bin/xyzaishell \
-      --fixture "$fixture" --evidence "$evidence/$label" --phase "$phase"
-}
-fingerprint() {
-  sha256sum "$XDG_CONFIG_HOME/xyzaishell/"{model.toml,connections.toml} \
-    "$XDG_STATE_HOME/xyzaishell/history.sqlite3"
-}
-run_ui seed first-install-and-restart
-fingerprint > "$fixture/before-reinstall.sha256"
-sudo apt-get install --reinstall --no-install-recommends -y "${packages[0]}"
-sha256sum --check "$fixture/before-reinstall.sha256"
-run_ui preserved same-version-reinstall
-fingerprint > "$fixture/before-uninstall.sha256"
-sudo apt-get remove -y "$package_name"
-test ! -e /usr/bin/xyzaishell
-sha256sum --check "$fixture/before-uninstall.sha256"
-sudo apt-get install --no-install-recommends -y "${packages[0]}"
-sha256sum --check "$fixture/before-uninstall.sha256"
-run_ui preserved uninstall-and-reinstall
+if $upgrade; then
+  run_ui upgrade upgraded-v0.1.1 "$candidate_version"
+else
+  run_ui seed first-install-and-restart "$candidate_version"
+  fingerprint > "$fixture/before-reinstall.sha256"
+  sudo apt-get install --reinstall --no-install-recommends -y "${packages[0]}"
+  sha256sum --check "$fixture/before-reinstall.sha256"
+  run_ui preserved same-version-reinstall "$candidate_version"
+  fingerprint > "$fixture/before-uninstall.sha256"
+  sudo apt-get remove -y "$package_name"
+  test ! -e /usr/bin/xyzaishell
+  sha256sum --check "$fixture/before-uninstall.sha256"
+  sudo apt-get install --no-install-recommends -y "${packages[0]}"
+  sha256sum --check "$fixture/before-uninstall.sha256"
+  run_ui preserved uninstall-and-reinstall "$candidate_version"
+fi
 fingerprint > "$fixture/final.sha256"
+if $upgrade; then
+  printf '%s\n' 'PASS: pinned v0.1.0 installed and seeded through real UI; direct v0.1.1 upgrade retained profile/history hashes, text and stable IDs.' > "$evidence/result.txt"
+else
 printf '%s\n' \
   'PASS: actual DEB installed; real native DOM/IPC profile/chat persistence and consent verified.' \
   'PASS: same-version reinstall and uninstall/reinstall preserved config hashes and restored text.' \
   'NOT TESTED: version upgrade, full desktop/X11/Wayland/IME/clipboard, live provider, SSH through UI.' \
   > "$evidence/result.txt"
+fi
 cat "$evidence/result.txt"

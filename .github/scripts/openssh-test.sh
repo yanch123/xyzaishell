@@ -202,9 +202,12 @@ cd "$repo"
 # --exact plus --ignored prevents silently passing without executing acceptance.
 cargo test -p xyz-core --locked --test openssh_interop \
   openssh_real_pty_shell_unicode_resize_and_disconnect -- --ignored --exact --nocapture
+cargo test -p xyz-core --locked --test shell_log_openssh \
+  shell_log_real_openssh_records_commands_without_model -- --ignored --exact --nocapture
 
 # OpenSSH records protocol request types, independently of the client's events.
-# The two connections must each allocate exactly one PTY and start one shell.
+# Two terminal-interoperability plus three shell-log connections must each
+# allocate exactly one PTY and start one shell. Bootstrap stays in visible PTY.
 # Any exec/subsystem request, including one refused by MaxSessions, is failure.
 python3 - "$fixture/sshd.log" <<'PY'
 import pathlib
@@ -212,11 +215,11 @@ import re
 import sys
 
 log = pathlib.Path(sys.argv[1]).read_text()
-for request, count in [('pty-req', 2), ('shell', 2), ('window-change', 1)]:
+for request, count in [('pty-req', 5), ('shell', 5), ('window-change', 1)]:
     actual = len(re.findall(r'server_input_channel_req: channel \d+ request ' + request + r' reply ', log))
     assert actual == count, f'Expected {count} {request} requests, got {actual}'
 assert not re.search(r'request (exec|subsystem) reply ', log), 'Hidden exec/subsystem request detected'
-assert len(re.findall(r'server_input_channel_open: ctype session ', log)) == 2, 'Unexpected extra session channel'
-assert len(re.findall(r'Starting session: shell on ', log)) == 2, 'Expected two real OS PTY shells'
-print('PASS: OpenSSH observed two PTY shells, resize, and zero exec/subsystem requests.')
+assert len(re.findall(r'server_input_channel_open: ctype session ', log)) == 5, 'Unexpected extra session channel'
+assert len(re.findall(r'Starting session: shell on ', log)) == 5, 'Expected five real OS PTY shells'
+print('PASS: OpenSSH observed five PTY shells, resize, and zero exec/subsystem requests.')
 PY

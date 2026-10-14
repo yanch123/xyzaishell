@@ -27,9 +27,23 @@ WebView2 user-data folder. It does not alter machine browser/registry settings.
 - Close the actual app process and restart. History requires fresh opt-in; read
   the saved profile and restore only text, retain task/chat identity, and observe
   zero new model requests and no SSH connection.
+- On v0.1.1, open and close the real Shell-log dialog while disconnected; consent/start remain disabled, and JSON/CSV export returns the real empty-store error without creating a DB, lock or export file. No synthetic shell events are injected.
 - Same-version installer reinstallation, then uninstall/reinstall. Configuration
   hashes remain unchanged during installer operations; the binary disappears on
   uninstall; the restored native UI still reads the synthetic saved state.
+
+A separate fresh private fixture then installs the public v0.1.0 release pinned
+by installer and manifest SHA256, exact source/run provenance and installed binary
+SHA256. It creates the synthetic profile/history through the old real UI, restarts,
+then directly installs v0.1.1 over it. Before launching the new application it
+checks the installed version and unchanged data-file hashes. The new real UI must
+restore the same text/task identity with fresh history consent and zero model
+requests, then actually uninstall without deleting the data. This is the reviewed
+0.1.0→0.1.1 upgrade path, not arbitrary upgrades or downgrade support.
+
+Fresh-install and upgrade scenarios do not share HOME/XDG/AppData or WebView
+profiles. Only the native driver download is reused; Windows signature/version
+checks still run on every use. Upgrade evidence is inside `version-upgrade/`.
 
 Screenshots, native-driver logs, installer transcript, runtime/driver versions,
 installed resource hashes and JSON results are retained as Actions artifacts.
@@ -39,10 +53,12 @@ user profile, keyring, credential or SSH server is involved.
 
 ## Not established by this suite
 
-Same-version reinstallation is **not a version-upgrade test**. There is no older
-released version yet. Windows Server 2022 is **not Windows 10 or Windows 11**.
+Same-version reinstallation is **not a version-upgrade test**; the separate pinned
+0.1.0→0.1.1 fixture is required to establish that specific path. Windows Server
+2022 is **not Windows 10 or Windows 11**.
 Xvfb is **not an end-user X11/Wayland desktop session**. These tests do not cover
-IME/clipboard, real-provider compatibility, SSH through the installed UI,
+IME/clipboard, real-provider compatibility, SSH through the installed UI or
+nonempty Shell-log export through installed UI,
 SmartScreen/unsigned-publisher UX, or long-running interactive behavior. Keep
 the remaining acceptance matrix and release limits explicit.
 

@@ -67,7 +67,11 @@ def read(path):
     return validate(json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique))
 
 
-def verify_activation_tree(root, source, activation):
+def verify_activation_tree(root, source, activation, tag):
+    require(isinstance(tag, str) and re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag), "Stable vX.Y.Z tag required")
+    # Only the first release used a minor-version documentation directory.
+    evidence_version = "v0.1" if tag == "v0.1.0" else tag
+    evidence_root = f"docs/{evidence_version}/release-evidence/"
     for sha in (source, activation):
         require(re.fullmatch(r"[0-9a-f]{40}", sha), "Exact source and activation SHAs required")
     subprocess.run(["git", "merge-base", "--is-ancestor", source, activation], cwd=root, check=True)
@@ -76,7 +80,7 @@ def verify_activation_tree(root, source, activation):
     changed = [path for path in changed if path]
     require(".github/release-intent.json" in changed, "Activation must explicitly change the release intent")
     for path in changed:
-        require(path == ".github/release-intent.json" or path.startswith("docs/v0.1/release-evidence/"),
+        require(path == ".github/release-intent.json" or path.startswith(evidence_root),
                 f"Untested change between candidate and activation: {path}")
         entry = subprocess.check_output(["git", "ls-tree", activation, "--", path], cwd=root, text=True).strip()
         require(not entry or entry.startswith("100644 blob "), "Release-control/evidence files must be regular non-executable blobs")
@@ -118,7 +122,7 @@ def main():
     args = parser.parse_args()
     value = read(args.path)
     if args.activation_sha:
-        verify_activation_tree(Path.cwd(), value["source_commit"], args.activation_sha)
+        verify_activation_tree(Path.cwd(), value["source_commit"], args.activation_sha, value["tag"])
     if args.canonical_output:
         args.canonical_output.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
     if args.github_output:

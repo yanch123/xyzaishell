@@ -1,8 +1,9 @@
 # Explicit release-intent procedure
 
-This is inactive documentation, not a release request. Do not create
-`.github/release-intent.json` until the release owner has approved the exact
-version, source commit, publication mode and acceptance evidence.
+This document does not activate a release. The existing `.github/release-intent.json`
+records the completed v0.1.0 release; leave it unchanged during development.
+Replace it only after the release owner has approved the new exact version,
+source commit, publication mode and acceptance evidence.
 
 ## Sequence
 
@@ -17,7 +18,9 @@ version, source commit, publication mode and acceptance evidence.
    acceptance to be complete. This choice must be reviewed on `dev`.
 3. Add the intent on `dev` with the candidate's complete 40-character SHA. Only
    `.github/release-intent.json` and regular non-executable evidence files inside
-   `docs/v0.1/release-evidence/` may differ from the candidate. An application,
+   `docs/<tag>/release-evidence/` may differ from the candidate (`v0.1.1` uses
+   `docs/v0.1.1/release-evidence/`; legacy `v0.1.0` uses `docs/v0.1/release-evidence/`).
+   Evidence for a different version is not allowed in the activation diff. An application,
    workflow or dependency change requires a newly tested candidate instead.
 4. Review the intent and merge/fast-forward the authorized `dev` state to `main`.
    A main push changing the intent triggers the workflow. It confirms ancestry,
@@ -82,7 +85,9 @@ Each acceptance category has exactly `status`, `evidence` and `notes`:
 least one HTTPS evidence link. Notes must state the actual OS/build, cases,
 outcome and limits as appropriate. Never include credentials or personal data.
 `not_applicable` is allowed only for `version_upgrade` on first release `v0.1.0`;
-same-version reinstall does not establish cross-version upgrade. Pending records
+same-version reinstall does not establish cross-version upgrade. For v0.1.1,
+`version_upgrade` needs actual v0.1.0-to-v0.1.1 evidence before prerelease or
+stable publication; it cannot be waived as first-release N/A. Pending records
 are allowed in draft mode; prerelease allows pending only for the four desktop
 categories. No category may be pending in stable publish mode. The validator
 checks structure and gates; a link
@@ -95,8 +100,9 @@ Validate a prepared record locally with:
 python3 .github/scripts/release_intent.py PATH_TO_REVIEWED_RECORD
 ```
 
-No example activation file is installed by this repository, to avoid an
-accidental main push triggering a release request.
+Changing a package version or making a normal development commit does not
+reactivate an unchanged old intent. Do not change or delete that historical
+record merely to start new-version development. Never rewrite the old tag/assets.
 
 ## Failure and recovery
 

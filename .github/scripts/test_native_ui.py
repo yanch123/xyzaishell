@@ -16,6 +16,29 @@ native = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(native)
 
 
+class NativeVersionPhaseTests(unittest.TestCase):
+    def test_seed_and_same_version_preservation(self):
+        native.verify_phase_version("seed", "0.1.1", "new-hash", None)
+        expected = {"application_version": "0.1.1", "application_sha256": "new-hash"}
+        native.verify_phase_version("preserved", "0.1.1", "new-hash", expected)
+        with self.assertRaises(ValueError):
+            native.verify_phase_version("preserved", "0.1.1", "other-hash", expected)
+
+    def test_upgrade_requires_exact_old_version_and_replaced_executable(self):
+        expected = {"application_version": "0.1.0", "application_sha256": "old-hash"}
+        native.verify_phase_version("upgrade", "0.1.1", "new-hash", expected)
+        for version, digest, record in [("0.1.0", "new-hash", expected), ("0.1.1", "old-hash", expected),
+                ("0.1.2", "new-hash", expected), ("0.1.1", "new-hash", None),
+                ("0.1.1", "new-hash", {"application_version": "0.0.9", "application_sha256": "old-hash"})]:
+            with self.assertRaises(ValueError):
+                native.verify_phase_version("upgrade", version, digest, record)
+
+    def test_invalid_version_or_phase_rejected(self):
+        for phase, version in [("seed", "latest"), ("seed", "0.1.1\\nextra"), ("other", "0.1.1")]:
+            with self.assertRaises(ValueError):
+                native.verify_phase_version(phase, version, "hash", None)
+
+
 class ProcessQueryTests(unittest.TestCase):
     def test_windows_query_is_fail_closed(self):
         application = pathlib.Path("xyzaishell.exe").resolve()
