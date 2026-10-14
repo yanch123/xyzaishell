@@ -751,6 +751,20 @@ mod tests {
     }
 
     #[test]
+    fn protected_private_dacl_does_not_substitute_for_current_user_ownership() {
+        let identity = Identity::effective().unwrap();
+        let sid = user_sid();
+        // icacls /inheritance:r /grant:r changes the DACL, not the owner.
+        // An elevated fixture creator may default ownership to Administrators;
+        // a private/protected DACL must not hide that ownership mismatch.
+        let grants = format!("D:P(A;OICI;FA;;;{sid})");
+        let sd = descriptor(&format!("O:BA{grants}"));
+        assert_eq!(validate_descriptor(sd.0, identity.sid()), Err(UNSAFE_FILE));
+        let sd = descriptor(&format!("O:{sid}{grants}"));
+        assert_eq!(validate_descriptor(sd.0, identity.sid()), Ok(()));
+    }
+
+    #[test]
     fn inheritance_and_deny_entries_do_not_excuse_broad_grants() {
         let identity = Identity::effective().unwrap();
         let sid = user_sid();

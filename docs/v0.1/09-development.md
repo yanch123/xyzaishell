@@ -134,3 +134,7 @@ M3 已提交 `f1e2688ebbc31772d5b6ffe7e65487781f544fda`，远程 106 个文件�
 M5 提交 `30dc4e42664b308f3f4f2858683f1473b105e5fb` 的 [CI 38529158888](https://github.com/yanch123/xyzaishell/actions/runs/38529158888) 中，前端、浏览器、Linux 原生测试和含通知资源的 DEB 构建通过；Windows 在通知生成阶段解析 CRLF 锁文件失败，尚未开始本轮 Rust 测试。依赖两平台构建的安装后 UI／生命周期验收被跳过，不能视为通过。
 
 修复仅规范化锁文件的解析视图，保留原始字节参与 provenance；仓库属性固定普通文本换行，并对受 SHA 校验的许可原文和二进制保持精确字节。新增 LF／CRLF／混合换行、异常记录和启用 `core.autocrlf` 的实际 Git checkout 回归。平台 CI 仍须重新执行并验证。
+
+换行修复 `2e3d6babb247cb8d3186b9079cf6dfdcd066d1ae` 的 [CI 38530020258](https://github.com/yanch123/xyzaishell/actions/runs/38530020258) 已通过两平台测试、Clippy、含通知资源的 NSIS／DEB 打包和 Ubuntu 两版本安装启动检查，随后首次运行真实安装后 WebDriver 验收。三项原生交互均未完成：Windows 档案管理返回存储拒绝；Ubuntu 已实际保存档案，但 WebKit 无法点击滚动区域外的返回按钮；Ubuntu 24 还检测到 session 删除后应用进程未退出。故仍不宣称完整安装生命周期通过。
+
+截图与后端校验复核表明：Windows 测试目录只设置 DACL、未显式设置 owner，存在被安全存储拒绝的可能，旧日志缺少 owner 证据，需下一轮记录确认。改进仅针对全新隔离夹具设置并验证当前用户 owner，生产安全规则不变，另加 Windows descriptor 拒绝错误 owner 的回归。原生测试通过真实键盘导航处理明确不可交互的离屏按钮，退出时先关闭真实窗口并验证进程消失；强制清理不得计为正常退出。Linux 裸测试环境补中文字体以便审查截图。这些修复须由新 CI 再次验证。

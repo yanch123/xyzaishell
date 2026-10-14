@@ -13,6 +13,7 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import signal
 import socket
 import sqlite3
@@ -73,6 +74,19 @@ def application_pids(application):
     return pids
 
 
+def protect_windows_fixture_file(path):
+    # Only called for the newly created synthetic model config inside the
+    # marker-validated fixture. Administrator tokens may otherwise create files
+    # owned by Administrators; inherited ACLs are also not explicit protection.
+    sid = subprocess.check_output(["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                                   "$ErrorActionPreference='Stop'; [Security.Principal.WindowsIdentity]::GetCurrent().User.Value"],
+                                  text=True, timeout=15).strip()
+    if not re.fullmatch(r"S-1-(?:[0-9]+-)+[0-9]+", sid):
+        raise RuntimeError("Could not identify the synthetic fixture owner")
+    subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"], check=True)
+    subprocess.run(["icacls", str(path), "/setowner", f"*{sid}"], check=True)
+
+
 class ModelFixture(http.server.BaseHTTPRequestHandler):
     """Bound only to loopback; reject unexpected requests instead of relaying."""
 
@@ -108,6 +122,16 @@ class ModelFixture(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+
+class WebDriverError(RuntimeError):
+    def __init__(self, body):
+        super().__init__(body)
+        try:
+            value = json.loads(body)
+            self.code = value.get("value", value).get("error")
+        except (ValueError, AttributeError):
+            self.code = None
 
 
 class Driver:
@@ -150,10 +174,10 @@ class Driver:
             with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=45) as response:
                 result = json.load(response)
         except urllib.error.HTTPError as error:
-            raise RuntimeError(error.read().decode(errors="replace")) from error
+            raise WebDriverError(error.read().decode(errors="replace")) from error
         result = result.get("value", result)
         if isinstance(result, dict) and result.get("error"):
-            raise RuntimeError(str(result))
+            raise WebDriverError(json.dumps(result))
         return result
 
     def command(self, method, suffix, value=None):
@@ -169,7 +193,22 @@ class Driver:
     def click(self, xpath):
         element = wait_for(lambda: self.find(xpath))
         wait_for(lambda: self.command("GET", f"/element/{element}/enabled"))
-        self.command("POST", f"/element/{element}/click", {})
+        try:
+            self.command("POST", f"/element/{element}/click", {})
+        except WebDriverError as error:
+            if error.code != "element not interactable":
+                raise
+            # WebKit may leave a newly shifted modal footer below its scroll
+            # viewport. Real Tab navigation scrolls the focused control into
+            # view. Never mutate CSS/DOM, invoke JS clicks, or replay a request
+            # whose dispatch is ambiguous.
+            for _ in range(40):
+                self.command("POST", "/actions", {"actions": [{"type": "key", "id": "keyboard", "actions": [
+                    {"type": "keyDown", "value": "\ue004"}, {"type": "keyUp", "value": "\ue004"}]}]})
+                if self.command("GET", "/element/active")[ELEMENT] == element:
+                    self.command("POST", f"/element/{element}/click", {})
+                    return
+            raise RuntimeError("Native keyboard navigation could not reach the control") from error
 
     def fill(self, label, text):
         element = wait_for(lambda: self.find(f"//label[starts-with(normalize-space(.),'{label}')]/input"))
@@ -187,7 +226,20 @@ class Driver:
         failure = None
         if self.session:
             try:
+                # Close the real window first. Deleting a WebDriver session can
+                # merely detach on WebKit; terminating a driver may kill its
+                # Windows job. Neither proves ordinary application shutdown.
+                self.command("DELETE", "/window")
+                wait_for(lambda: not application_pids(self.application), timeout=10)
+            except Exception as error:
+                failure = error
+            try:
                 self.command("DELETE", "")
+            except WebDriverError as error:
+                # W3C closes the session when its final window closes. Accept
+                # only that precise protocol result after verified app exit.
+                if error.code != "invalid session id" or application_pids(self.application):
+                    failure = error
             except Exception as error:
                 failure = error
             self.session = None
@@ -343,6 +395,8 @@ allow_loopback_http = true
             output.write(text)
         if os.name != "nt":
             (config / "model.toml").chmod(0o600)
+        else:
+            protect_windows_fixture_file(config / "model.toml")
     try:
         # First phase includes a real process restart. Preserved phase is called
         # after installer reinstallation and again after uninstall/reinstall.

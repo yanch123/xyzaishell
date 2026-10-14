@@ -35,6 +35,73 @@ class ProcessQueryTests(unittest.TestCase):
                 self.assertEqual(native.application_pids(application), expected)
 
 
+class NativeDriverHelperTests(unittest.TestCase):
+    def test_clipped_control_is_reached_by_real_tab_then_native_click(self):
+        driver = native.Driver.__new__(native.Driver)
+        driver.find = mock.Mock(return_value="target")
+        calls = []
+        def command(method, path, value=None):
+            calls.append((method, path, value))
+            if path.endswith("/enabled"):
+                return True
+            if path.endswith("/click") and sum(p.endswith('/click') for _, p, _ in calls) == 1:
+                raise native.WebDriverError('{"value":{"error":"element not interactable"}}')
+            if path == "/element/active":
+                return {native.ELEMENT: "target"}
+        driver.command = command
+        driver.click("fixture")
+        self.assertEqual([path for _, path, _ in calls],
+                         ["/element/target/enabled", "/element/target/click", "/actions", "/element/active", "/element/target/click"])
+        self.assertEqual(calls[2][2]["actions"][0]["actions"][0]["value"], "\ue004")
+
+    def test_ambiguous_click_errors_are_never_replayed(self):
+        driver = native.Driver.__new__(native.Driver)
+        driver.find = mock.Mock(return_value="target")
+        driver.command = mock.Mock(side_effect=[True, native.WebDriverError('{"value":{"error":"unknown error"}}')])
+        with self.assertRaises(native.WebDriverError):
+            driver.click("fixture")
+        self.assertEqual(driver.command.call_count, 2)
+
+    def test_close_verifies_app_exit_before_session_or_driver_teardown(self):
+        driver = native.Driver.__new__(native.Driver)
+        driver.application = pathlib.Path("xyzaishell")
+        driver.session = "session"
+        driver.process = mock.Mock()
+        driver.process.poll.return_value = None
+        driver.log = mock.Mock()
+        events = []
+        def command(method, path):
+            events.append(path)
+            if path == "":
+                raise native.WebDriverError('{"value":{"error":"invalid session id"}}')
+        driver.command = command
+        driver.process.terminate.side_effect = lambda: events.append("terminate-driver")
+        with mock.patch.object(native, "application_pids", side_effect=lambda _: events.append("check-app-exited") or []):
+            driver.close()
+        self.assertEqual(events[:4], ["/window", "check-app-exited", "", "check-app-exited"])
+        self.assertIn("terminate-driver", events[4:])
+
+    def test_windows_fixture_file_explicitly_sets_current_user_owner(self):
+        path = pathlib.Path("synthetic-model.toml")
+        with mock.patch.object(native.subprocess, "check_output", return_value="S-1-5-21-123-456-789-1000\n"), \
+                mock.patch.object(native.subprocess, "run") as run:
+            native.protect_windows_fixture_file(path)
+        self.assertEqual(run.call_args_list[-1].args[0][-2:], ["/setowner", "*S-1-5-21-123-456-789-1000"])
+
+    def test_driver_cleanup_cannot_turn_a_live_application_into_a_pass(self):
+        driver = native.Driver.__new__(native.Driver)
+        driver.application = pathlib.Path("xyzaishell")
+        driver.session = "session"
+        driver.process = mock.Mock()
+        driver.process.poll.return_value = None
+        driver.log = mock.Mock()
+        driver.command = mock.Mock()
+        with mock.patch.object(native, "wait_for", side_effect=[AssertionError("app still running"), True]):
+            with self.assertRaisesRegex(RuntimeError, "shutdown was not clean"):
+                driver.close()
+        driver.process.terminate.assert_called_once()
+
+
 class NativeHelperTests(unittest.TestCase):
     def setUp(self):
         self.server = native.http.server.ThreadingHTTPServer(("127.0.0.1", 0), native.ModelFixture)

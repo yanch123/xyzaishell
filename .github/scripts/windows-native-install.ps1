@@ -12,10 +12,13 @@ $install = Join-Path $fixture 'installed-app'
 $finalFingerprint = $null
 try {
     New-Item -ItemType Directory -Path $fixture | Out-Null
+    Write-Output "New synthetic directory security before protection: $((Get-Acl -LiteralPath $fixture).Sddl)"
     # Only this new disposable fixture gets a private inheritable current-user ACL.
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     & icacls $fixture /inheritance:r /grant:r "*${sid}:(OI)(CI)F"
     if ($LASTEXITCODE -ne 0) { throw 'Could not protect synthetic fixture directory' }
+    & icacls $fixture /setowner "*$sid"
+    if ($LASTEXITCODE -ne 0) { throw 'Could not set synthetic fixture owner' }
     [IO.File]::WriteAllText((Join-Path $fixture '.xyz-native-fixture'), "synthetic disposable fixture`n")
     $env:APPDATA = Join-Path $fixture 'config'
     $env:LOCALAPPDATA = Join-Path $fixture 'local'
@@ -23,10 +26,20 @@ try {
     New-Item -ItemType Directory -Path $env:APPDATA,$env:LOCALAPPDATA | Out-Null
     $configRoot = Join-Path $env:APPDATA 'xyzaishell'
     New-Item -ItemType Directory -Path $configRoot | Out-Null
+    Write-Output "New synthetic config security before protection: $((Get-Acl -LiteralPath $configRoot).Sddl)"
     # ProfileStore requires the actual config root to have a protected DACL;
     # a private inherited ACL alone is insufficient. No existing user dir is edited.
     & icacls $configRoot /inheritance:r /grant:r "*${sid}:(OI)(CI)F"
     if ($LASTEXITCODE -ne 0) { throw 'Could not protect synthetic application config root' }
+    & icacls $configRoot /setowner "*$sid"
+    if ($LASTEXITCODE -ne 0) { throw 'Could not set synthetic application config owner' }
+    foreach ($path in @($fixture, $configRoot)) {
+        $acl = Get-Acl -LiteralPath $path
+        if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid -or -not $acl.AreAccessRulesProtected) {
+            throw 'Synthetic directory owner/protected ACL does not match the application boundary'
+        }
+        Write-Output "Synthetic directory security: $path $($acl.Sddl)"
+    }
     $application = Join-Path $install 'xyzaishell.exe'
     $packages = @(Get-ChildItem -LiteralPath $env:PACKAGE_DIR -Filter '*.exe')
     if ($packages.Count -ne 1) { throw 'Expected exactly one NSIS installer' }
