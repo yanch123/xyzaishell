@@ -71,7 +71,7 @@ jobs:
       contents: read
 
   release:
-    name: Apply only the explicit draft or publish instruction
+    name: Apply only the explicit draft, prerelease or publish instruction
     needs: [preflight, verify]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -122,11 +122,37 @@ jobs:
           actual=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')
           test "$actual" = "$RELEASE_SHA"
           gh release create "$RELEASE_TAG" "$RUNNER_TEMP/release-assets/"* \
-            --verify-tag --target "$RELEASE_SHA" --draft \
+            --verify-tag --target "$RELEASE_SHA" --draft --prerelease=false --latest=false \
             --title "xyzaishell $RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
+          # gh resolves authenticated drafts through GraphQL. The REST tag
+          # lookup only finds published releases, so use the ID even before publication.
+          release_id=$(gh release view "$RELEASE_TAG" --json databaseId --jq '.databaseId')
+          [[ "$release_id" =~ ^[0-9]+$ ]] || { echo 'Expected a numeric draft release ID.'; exit 1; }
+          test "$release_id" -gt 0
+          verify_remote() {
+            gh api "repos/$GH_REPO/releases/$release_id" > "$RUNNER_TEMP/release-state.json"
+            gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" > "$RUNNER_TEMP/release-tag.json"
+            gh release list --limit 100 --json tagName,isDraft,isPrerelease,isLatest \
+              --jq "map(select(.tagName == \"$RELEASE_TAG\"))" > "$RUNNER_TEMP/release-summary.json"
+            python3 .github/scripts/verify_release.py \
+              --intent "$RUNNER_TEMP/release-request/release-request.json" \
+              --release "$RUNNER_TEMP/release-state.json" --summary "$RUNNER_TEMP/release-summary.json" \
+              --tag-ref "$RUNNER_TEMP/release-tag.json" --assets "$RUNNER_TEMP/release-assets" "$@"
+            test "$(jq -r '.id' "$RUNNER_TEMP/release-state.json")" = "$release_id"
+          }
+          # Missing installers, incomplete uploads or digest mismatches keep
+          # this newly created release private. Never publish first and check later.
+          verify_remote --draft-stage
+          # Address the fresh release by its verified ID, not a potentially
+          # replaced tag-to-release lookup. Never retry this state change blindly.
           if [[ "$RELEASE_MODE" == publish ]]; then
-            gh release edit "$RELEASE_TAG" --draft=false --latest
+            gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+              -F draft=false -F prerelease=false -f make_latest=true > /dev/null
+          elif [[ "$RELEASE_MODE" == prerelease ]]; then
+            gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+              -F draft=false -F prerelease=true -f make_latest=false > /dev/null
           else
             test "$RELEASE_MODE" = draft
           fi
-          gh release view "$RELEASE_TAG" --json tagName,isDraft,url,assets
+          verify_remote
+          gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease,url,assets

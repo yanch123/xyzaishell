@@ -32,6 +32,30 @@ class ReleaseIntentTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 intent.validate(value)
 
+    def test_prerelease_only_allows_pending_desktop_acceptance(self):
+        for key in intent.REQUIRED_EVIDENCE:
+            value = self.valid("prerelease")
+            value["acceptance"][key] = {"status": "pending", "evidence": [], "notes": "Not yet tested"}
+            if key in intent.DESKTOP_EVIDENCE:
+                self.assertEqual(intent.validate(value), value)
+                rendered = intent.notes(value, "https://github.com/a/b/actions/runs/123")
+                self.assertIn(f"{key}: pending", rendered)
+                self.assertIn("预发布试用版", rendered)
+                self.assertIn("不作为正式稳定版或 Latest", rendered)
+            else:
+                with self.assertRaises(ValueError):
+                    intent.validate(value)
+
+    def test_prerelease_cannot_reuse_publish_confirmation_or_waive_desktop(self):
+        value = self.valid("publish")
+        value["mode"] = "prerelease"
+        with self.assertRaises(ValueError):
+            intent.validate(value)
+        value = self.valid("prerelease")
+        value["acceptance"]["windows_10"]["status"] = "not_applicable"
+        with self.assertRaises(ValueError):
+            intent.validate(value)
+
     def test_no_waiver_for_required_platforms(self):
         value = self.valid("publish")
         value["acceptance"]["windows_11"]["status"] = "not_applicable"
