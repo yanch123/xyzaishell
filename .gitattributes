@@ -1,0 +1,13 @@
+# Keep source/lockfile bytes identical on Linux and Windows checkouts. PowerShell
+# and NSIS accept LF; line-ending conversion must not alter release provenance.
+* text=auto eol=lf
+
+# Binary assets and exact upstream license evidence must never be transformed.
+*.png -text
+*.ico -text
+*.crate -text
+*.zip -text
+*.gz -text
+*.deb -text
+*.exe -text
+docs/v0.1/tools/license-overrides/* -text

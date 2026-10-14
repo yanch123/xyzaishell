@@ -17,6 +17,25 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def lock_checksums(data):
+    # Normalize only the parser's view. Evidence and provenance always hash and
+    # copy the untouched original bytes, including their original line endings.
+    text = '\n'.join(data.decode('utf-8').splitlines())
+    checksum = {}
+    for block in text.split('[[package]]')[1:]:
+        fields = {key: json.loads(value) for key, value in re.findall(
+            r'^(name|version|source|checksum) = ("[^"\n]*")$', block, re.M)}
+        if not {'name', 'version'} <= fields.keys():
+            raise ValueError('Cargo.lock package is missing its name or version')
+        identity = (fields['name'], fields['version'], fields.get('source'))
+        if identity in checksum:
+            raise ValueError('Cargo.lock contains a duplicate package identity')
+        checksum[identity] = fields.get('checksum')
+    if not checksum:
+        raise ValueError('Cargo.lock contains no package entries')
+    return checksum
+
+
 def capture(root, destination, explicit=None):
     candidates = set()
     for path in root.rglob('*'):
@@ -72,11 +91,7 @@ def main():
                 normal_targets.setdefault(package['id'], []).append(target)
     # Cargo-generated lock entries use plain quoted values for these fields.
     # Avoid a TOML dependency on Python 3.10 (Ubuntu 22.04).
-    checksum = {}
-    for block in locks['Cargo.lock'].decode().split('[[package]]')[1:]:
-        fields = {key: json.loads(value) for key, value in re.findall(
-            r'^(name|version|source|checksum) = ("[^"\n]*")$', block, re.M)}
-        checksum[(fields['name'], fields['version'], fields.get('source'))] = fields.get('checksum')
+    checksum = lock_checksums(locks['Cargo.lock'])
     output.mkdir(parents=True)
     records = []
     for package in sorted(metadata['packages'], key=lambda p: p['id']):
