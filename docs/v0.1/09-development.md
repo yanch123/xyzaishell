@@ -152,3 +152,5 @@ Ubuntu 22.04 在有副作用的选项点击时发生 WebDriver 传输断连，�
 OpenSSH 夹具统一使用与启动相同的权限探测／清理 launcher，避免非特权 `kill -0` 对 root 进程的 EPERM 误判，并补充真实退出码和探测诊断，真实 PTY 与零 exec 审计要求不变。旧运行是否正由 EPERM 引起仍待证实。
 
 历史存储发现 BEGIN 前安全文件检查可能与另一实例的 journal 删除重叠。复用稳定历史初始化锁覆盖所有数据库读写操作，从安全检查一直持有到事务释放，避免同版本实例彼此改变检查中的 sidecar；仍保留 SQLite IMMEDIATE、修订 CAS 和严格权限检查，不将其他错误伪装成 Conflict。初始化内部调用避免递归取锁；锁等待 5 秒后显式 Busy。增加 16 轮严格单赢家／Conflict、读写顺序、超时不改变修订、崩溃释放和 Windows delete-pending 测试，以及不包含路径／内容的测试诊断。Linux 188 项普通 Rust 测试、格式及 Clippy 通过；Windows type-check 不是 Windows 运行证明，原失败具体原因与新平台测试仍待 CI 确认。
+
+`1f8b9b298bd3da29636d9c6b3f5d1d3cc22feb02` 的 [CI 38539383512](https://github.com/yanch123/xyzaishell/actions/runs/38539383512) 已通过 Linux 真实 OpenSSH 与 Secret Service；Windows 原 16 轮严格单赢家／Conflict、访问锁及超时回归通过。新增 Windows 定向测试失败在其自身前提：DeleteFileW 后元数据探测返回 `Ok(false)`（名称不可见），并非假定的 `Unavailable`。因此该夹具不能称为原失败的精确复现；原失败具体根因仍未知。定向测试调整为验证 journal 删除生命周期期间的访问锁顺序，不固定平台对已删除名称的错误分类，严格 CAS 与生产权限判断保持不变。

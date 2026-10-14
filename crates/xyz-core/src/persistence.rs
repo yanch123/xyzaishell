@@ -423,8 +423,8 @@ impl HistoryStore {
     // The private-file checks must precede SQLite access, but SQLite's locks do
     // not cover those checks. Hold a separate stable cross-process file lock
     // until each transaction/statement is dropped, including reads and startup.
-    // This prevents a cooperating writer's journal deletion from racing the
-    // metadata checks (notably Windows STATUS_DELETE_PENDING). SQLite IMMEDIATE
+    // This prevents a cooperating writer's journal lifecycle from racing the
+    // metadata checks, independently of OS deletion semantics. SQLite IMMEDIATE
     // transactions and expected-revision checks remain authoritative for CAS.
     // The access lock has PrivateDirectory's bounded five-second wait; SQLite
     // retains its independent two-second busy timeout for foreign connections.

@@ -816,7 +816,7 @@ fn access_lock_timeout_is_bounded_and_does_not_change_revision() {
 
 #[cfg(windows)]
 #[test]
-fn access_lock_avoids_windows_delete_pending_journal_checks() {
+fn access_lock_covers_windows_journal_deletion_lifecycle() {
     use std::{
         os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
         sync::mpsc,
@@ -844,8 +844,14 @@ fn access_lock_avoids_windows_delete_pending_journal_checks() {
                     .open(&journal)
                     .unwrap();
                 let wide: Vec<u16> = journal.as_os_str().encode_wide().chain(Some(0)).collect();
-                // SAFETY: NUL-terminated synthetic fixture path. Keeping the shared
-                // file handle open makes classic DeleteFileW deletion pending.
+                assert_eq!(
+                    writer
+                        .directory
+                        .validate_database_file("history.sqlite3-journal", MAX_JOURNAL_BYTES),
+                    Ok(true)
+                );
+                // SAFETY: NUL-terminated synthetic fixture path. Keep an open
+                // shared handle across deletion, as a metadata reader can do.
                 assert_ne!(
                     unsafe { DeleteFileW(wide.as_ptr()) },
                     0,
@@ -855,13 +861,13 @@ fn access_lock_avoids_windows_delete_pending_journal_checks() {
                 let probe = writer
                     .directory
                     .validate_database_file("history.sqlite3-journal", MAX_JOURNAL_BYTES);
-                // This is the exact pre-SQLite failure window the access lock must
-                // exclude. Do not classify delete-pending as an absent/safe file.
-                assert_eq!(
-                    probe,
-                    Err(StorageError::Unavailable),
-                    "delete-pending metadata probe: {probe:?}"
-                );
+                // A native Windows runner returned Ok(false) here: removal
+                // from the namespace can precede the last handle closing. Do
+                // not assume an Unavailable/STATUS_DELETE_PENDING result, nor
+                // claim this fixture reproduces the original CAS failure.
+                // The invariant below is ordering: the contender cannot check
+                // any files or enter SQLite until this entire lifecycle ends.
+                eprintln!("synthetic open-handle deletion metadata probe: {probe:?}");
                 let source = source.clone();
                 scope.spawn(move || {
                     started_tx.send(()).unwrap();
@@ -881,6 +887,12 @@ fn access_lock_avoids_windows_delete_pending_journal_checks() {
                 // Finish journal deletion before releasing the same lock that
                 // protected creation, validation and the full SQLite transaction.
                 drop(file);
+                assert_eq!(
+                    writer
+                        .directory
+                        .validate_database_file("history.sqlite3-journal", MAX_JOURNAL_BYTES),
+                    Ok(false)
+                );
                 Ok(())
             })
             .unwrap();
