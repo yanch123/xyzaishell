@@ -9,8 +9,8 @@ import pathlib
 import re
 import unittest
 import subprocess
-import os
-import time
+import shlex
+import sys
 import pexpect
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -98,20 +98,23 @@ class CurrentShellContract(unittest.TestCase):
 
     def test_interrupt_reports_foreground_130_and_never_retries(self):
         s = self.shell(); s.install()
-        s.p.sendline(b'sleep 30 # xyz-action:interrupt')
-        s.p.expect(rb';B;[0-9]+;')
-        # PS0 emits Begin before the job has necessarily taken the foreground.
-        # Synchronize with real PTY job control, never use output silence/sleep
-        # as evidence that the application has started receiving terminal input.
-        deadline = time.monotonic() + 5
-        while os.tcgetpgrp(s.p.child_fd) == s.p.pid:
-            self.assertLess(time.monotonic(), deadline, 'sleep did not become the foreground job')
-            time.sleep(0.005)
+        # The actual foreground helper confirms its own signal disposition.
+        # PS0 command substitutions can temporarily own another process group;
+        # neither a Begin prefix nor tcgetpgrp != Bash PID identifies the job.
+        helper = 'import signal,time; signal.signal(signal.SIGINT, signal.SIG_DFL); print("XYZ_INTERRUPT_READY", flush=True); time.sleep(30)'
+        command = shlex.quote(sys.executable) + ' -c ' + shlex.quote(helper) + ' # xyz-action:interrupt'
+        s.p.sendline(command.encode())
+        s.p.expect_exact(b'XYZ_INTERRUPT_READY\r\n')
+        started = frames(s.p.before)
+        self.assertEqual([f[0] for f in started], [b'B'])
+        self.assertEqual(base64.b64decode(started[0][4]).rstrip(b'\n'), command.encode())
         s.p.sendcontrol('c')
         s.p.expect_exact(PROMPT)
         events = frames(s.p.before)
         self.assertEqual([f[0] for f in events], [b'E', b'R'])
         self.assertEqual(events[0][3], b'130')
+        self.assertEqual(events[0][1], started[0][1])
+        self.assertEqual(events[1][1], started[0][1])
 
     def test_array_prompt_hooks_keep_order_and_original_values_and_restore(self):
         s = self.shell("PS0='ORIGINAL0'; PROMPT_COMMAND=('builtin printf \"ONE:%s\\n\" \"$?\"' 'builtin printf \"TWO:%s\\n\" \"$?\"'); before=$(declare -p PROMPT_COMMAND PS0); trap 'printf EXIT_OK' EXIT")

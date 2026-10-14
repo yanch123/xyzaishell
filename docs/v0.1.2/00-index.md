@@ -65,3 +65,5 @@
 - [06 — 整合验证](development/06-integrated-stage.md)
 
 - [04 — 当前 Shell 生命周期与独立日志](development/04-current-shell-integration.md)：实现边界、关联注释及真实 PTY / Rust 验证记录。
+
+- [07 — 中断测试同步修正](development/07-interrupt-fixture.md)
