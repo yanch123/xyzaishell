@@ -150,6 +150,7 @@ class Driver:
         while native_port == self.port:
             native_port = free_port()
         self.base = f"http://127.0.0.1:{self.port}"
+        self.connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=45)
         self.log = (evidence / "driver.log").open("wb")
         command = [os.environ["TAURI_DRIVER"], "--port", str(self.port),
                    "--native-port", str(native_port)]
@@ -174,13 +175,40 @@ class Driver:
 
     def call(self, method, suffix, value=None):
         payload = None if value is None else json.dumps(value).encode()
-        request = urllib.request.Request(self.base + suffix, data=payload, method=method,
-                                         headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=45) as response:
-                result = json.load(response)
-        except urllib.error.HTTPError as error:
-            raise WebDriverError(error.read().decode(errors="replace")) from error
+            # urllib injects Connection: close. tauri-driver forwards that
+            # hop-by-hop header into its pooled native-driver connection. Keep
+            # this sequential HTTP/1.1 loopback connection alive instead.
+            # HTTPConnection sends exactly once; never replay a command here.
+            self.connection.request(method, suffix, body=payload,
+                                    headers={"Content-Type": "application/json", "Connection": "keep-alive"})
+            response = self.connection.getresponse()
+            limit = 16 * 1024 * 1024
+            if response.length is not None and response.length > limit:
+                self.connection.close()
+                raise NativeTransportFailure("Native driver response exceeded the fixture bound")
+            if response.length is not None:
+                # Unbounded read of an already bounded Content-Length uses
+                # HTTPResponse's exact-length framing check (IncompleteRead).
+                body = response.read()
+            else:
+                body = response.read(limit + 1)
+                if len(body) > limit:
+                    self.connection.close()
+                    raise NativeTransportFailure("Native driver response exceeded the fixture bound")
+                # Require chunked termination or actual EOF, not merely a short
+                # read whose prefix happened to be syntactically valid JSON.
+                if response.read(1) or not response.isclosed():
+                    self.connection.close()
+                    raise NativeTransportFailure("Native driver response framing was incomplete")
+            if not 200 <= response.status < 300:
+                raise WebDriverError(body.decode(errors="replace"))
+            result = json.loads(body)
+        except (OSError, http.client.HTTPException) as error:
+            self.connection.close()
+            # Read-only js() may retry under its exact-instance bound. Every
+            # mutating caller propagates this uncertain transport failure.
+            raise urllib.error.URLError(error) from error
         result = result.get("value", result)
         if isinstance(result, dict) and result.get("error"):
             raise WebDriverError(json.dumps(result))
@@ -269,6 +297,7 @@ class Driver:
                 self.process.kill()
                 self.process.wait(timeout=10)
         self.log.close()
+        self.connection.close()
         try:
             wait_for(lambda: not application_pids(self.application), timeout=10)
         except AssertionError as error:

@@ -142,3 +142,7 @@ M5 提交 `30dc4e42664b308f3f4f2858683f1473b105e5fb` 的 [CI 38529158888](https:
 `61352514ecf62d16ebfbbfb08f4bbb50c147282f` 的 [CI 38533189264](https://github.com/yanch123/xyzaishell/actions/runs/38533189264) 已在三平台实际安装后完成档案保存、模型接收方授权、真实 Rust HTTP／SSE 中文回复与字面脚本文本显示，并已执行关闭应用和重启流程；重启后的完整状态验证尚未完成。Windows 日志确认新夹具原 owner 为 Administrators，设置为当前 runner 用户后档案保存成功，根因得到验证。Linux 中文字体及离屏按钮处理生效。
 
 后续测试仍失败：Windows／Ubuntu 24 的测试错误地以完整提示词查找历史标题，实际标题为“新任务 · 2 条消息”；Ubuntu 22 在重启后的只读启动检查出现一次 WebDriver 连接中断。修正测试为唯一两消息存档，同时保留恢复完整内容、稳定 chat／task ID 及零自动请求断言；只读传输异常只在原 driver 和精确应用进程仍存活时做有界重试，不重建会话，不自动重试修改状态的指令。完整重装与卸载生命周期仍待下一轮验证。
+
+`c3010c373e55ca6b3f7ab7ceb472a9398c7590c2` 的 [CI 38534805293](https://github.com/yanch123/xyzaishell/actions/runs/38534805293) 已在 Windows Server 2022 和 Ubuntu 24.04 完成三个安装后阶段：首次安装／聊天与重启恢复、同版本重装、卸载重装；最后一次卸载与配置指纹保留也通过。两平台打包、普通测试和 Ubuntu 两版本基础安装启动检查继续通过。
+
+Ubuntu 22.04 在有副作用的选项点击时发生 WebDriver 传输断连，测试未自动重放。固定版本 tauri-driver 会将除 Host 外的请求头转发给使用连接池的 native-driver 客户端；本地服务回归确认 urllib 默认发出 `Connection: close`。测试传输改用显式 HTTP/1.1 keep-alive，验证复用单个连接、完整读取响应，以及变更命令被断开时仍只发送一次。该传输不稳定根因属于待原生重测确认的假设，不将 helper 测试成功当作 Ubuntu 22.04 验收完成。

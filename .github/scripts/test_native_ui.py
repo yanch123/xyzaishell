@@ -111,6 +111,7 @@ class NativeDriverHelperTests(unittest.TestCase):
         driver.process = mock.Mock()
         driver.process.poll.return_value = None
         driver.log = mock.Mock()
+        driver.connection = mock.Mock()
         events = []
         def command(method, path):
             events.append(path)
@@ -137,11 +138,91 @@ class NativeDriverHelperTests(unittest.TestCase):
         driver.process = mock.Mock()
         driver.process.poll.return_value = None
         driver.log = mock.Mock()
+        driver.connection = mock.Mock()
         driver.command = mock.Mock()
         with mock.patch.object(native, "wait_for", side_effect=[AssertionError("app still running"), True]):
             with self.assertRaisesRegex(RuntimeError, "shutdown was not clean"):
                 driver.close()
         driver.process.terminate.assert_called_once()
+
+
+class WebDriverTransportTests(unittest.TestCase):
+    def setUp(self):
+        class Handler(native.http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            def log_message(self, *_args):
+                pass
+            def do_GET(self):
+                self.do_POST()
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.server.observed.append((self.path, self.headers.get("Connection"), self.client_address, body))
+                if self.path == "/mutation-drop":
+                    self.close_connection = True
+                    return
+                payload = b'{"value":true}'
+                self.send_response(200)
+                if self.path.startswith("/chunked"):
+                    self.send_header("Transfer-Encoding", "chunked")
+                elif self.path == "/eof":
+                    self.send_header("Connection", "close")
+                else:
+                    self.send_header("Content-Length", "100" if self.path == "/truncated" else str(len(payload)))
+                self.end_headers()
+                if self.path.startswith("/chunked"):
+                    self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n")
+                    if self.path == "/chunked":
+                        self.wfile.write(b"0\r\n\r\n")
+                else:
+                    self.wfile.write(payload)
+                if self.path in ("/truncated", "/chunked-truncated", "/eof"):
+                    self.close_connection = True
+        self.server = native.http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.observed = []
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.driver = native.Driver.__new__(native.Driver)
+        self.driver.connection = native.http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
+
+    def tearDown(self):
+        self.driver.connection.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_explicit_keepalive_reuses_connection_instead_of_urllib_close(self):
+        url = f"http://127.0.0.1:{self.server.server_port}/old-urllib"
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url, timeout=2) as response:
+            response.read()
+        self.assertTrue(self.driver.call("GET", "/first"))
+        self.assertTrue(self.driver.call("POST", "/second", {"synthetic": True}))
+        first, second, third = self.server.observed
+        self.assertEqual(first[1], "close")
+        self.assertEqual((second[1], third[1]), ("keep-alive", "keep-alive"))
+        self.assertEqual(second[2], third[2], "Commands should share one HTTP connection")
+
+    def test_uncertain_mutation_is_sent_exactly_once(self):
+        with self.assertRaises(urllib.error.URLError):
+            self.driver.call("POST", "/mutation-drop", {"click": "synthetic"})
+        self.assertEqual(len(self.server.observed), 1)
+        self.assertEqual(self.server.observed[0][0], "/mutation-drop")
+        self.assertIsNone(self.driver.connection.sock)
+
+    def test_truncated_valid_json_cannot_count_as_command_success(self):
+        with self.assertRaises(urllib.error.URLError):
+            self.driver.call("POST", "/truncated", {"click": "synthetic"})
+        self.assertEqual(len(self.server.observed), 1)
+        self.assertIsNone(self.driver.connection.sock)
+
+    def test_complete_chunked_and_close_delimited_json_are_accepted(self):
+        self.assertTrue(self.driver.call("GET", "/chunked"))
+        self.assertTrue(self.driver.call("GET", "/eof"))
+
+    def test_missing_chunked_terminator_rejects_valid_json_prefix(self):
+        with self.assertRaises(urllib.error.URLError):
+            self.driver.call("POST", "/chunked-truncated", {"click": "synthetic"})
+        self.assertEqual(len(self.server.observed), 1)
+        self.assertIsNone(self.driver.connection.sock)
 
 
 class NativeHelperTests(unittest.TestCase):
