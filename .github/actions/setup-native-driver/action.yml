@@ -1,0 +1,23 @@
+name: Set up native installed-app WebDriver
+description: Pinned Tauri driver and platform-native driver for disposable CI only.
+runs:
+  using: composite
+  steps:
+    - name: Install Linux native driver
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y webkit2gtk-driver xvfb xauth dbus-x11
+        dpkg-query -W webkit2gtk-driver
+    - name: Install pinned official Tauri driver from locked registry dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        driver_root="$RUNNER_TEMP/xyz-tauri-driver"
+        cargo install tauri-driver --version 2.1.0 --locked --root "$driver_root"
+        suffix=''
+        if [[ "$RUNNER_OS" == Windows ]]; then suffix='.exe'; fi
+        test -f "$driver_root/bin/tauri-driver$suffix"
+        echo "TAURI_DRIVER=$driver_root/bin/tauri-driver$suffix" >> "$GITHUB_ENV"
+        cargo install --list --root "$driver_root"

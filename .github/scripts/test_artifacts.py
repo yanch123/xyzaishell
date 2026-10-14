@@ -59,6 +59,14 @@ class ArtifactTests(unittest.TestCase):
             self.assertIn(artifacts.sha256(path), checksums)
             self.assertIn(f"build-{platform}.json", checksums)
 
+    def test_install_smoke_verification_binds_current_checkout(self):
+        output, _ = self.installer()
+        with patch.object(artifacts, "command", return_value="a" * 40):
+            self.assertTrue(artifacts.verify_package(self.root, output, "linux-x64").is_file())
+        with patch.object(artifacts, "command", return_value="b" * 40):
+            with self.assertRaises(ValueError):
+                artifacts.verify_package(self.root, output, "linux-x64")
+
     def test_missing_installer_rejected(self):
         with self.assertRaises(ValueError):
             artifacts.collect(self.root, self.root / "output", "linux-x64", "deb")

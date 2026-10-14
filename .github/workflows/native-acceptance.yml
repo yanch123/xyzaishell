@@ -1,0 +1,60 @@
+name: Installed native application acceptance smoke
+
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        description: Exact source SHA used by the caller's installer artifacts.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  installed-app:
+    name: Native UI and installer lifecycle (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: installers-linux-x64
+            evidence: xyzaishell-native-linux
+          - os: ubuntu-24.04
+            artifact: installers-linux-x64
+            evidence: xyzaishell-native-linux
+          - os: windows-2022
+            artifact: installers-windows-x64
+            evidence: xyzaishell-windows-smoke
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/xyzaishell-package
+      - uses: ./.github/actions/setup-native-driver
+      - name: Install and exercise the actual DEB
+        if: runner.os == 'Linux'
+        env:
+          PACKAGE_DIR: ${{ runner.temp }}/xyzaishell-package
+        run: bash .github/scripts/linux-native-install.sh
+      - name: Install and exercise the actual NSIS package on Windows Server
+        if: runner.os == 'Windows'
+        env:
+          PACKAGE_DIR: ${{ runner.temp }}/xyzaishell-package
+        shell: pwsh
+        run: .github/scripts/windows-native-install.ps1
+      - name: Save native screenshots, lifecycle checks, and precise limits
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-acceptance-${{ matrix.os }}
+          path: ${{ runner.temp }}/${{ matrix.evidence }}/
+          if-no-files-found: warn
+          retention-days: 14

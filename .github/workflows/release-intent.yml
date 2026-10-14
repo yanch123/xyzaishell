@@ -1,0 +1,132 @@
+name: Execute explicit main release intent
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/release-intent.json']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: explicit-release-intent
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate explicit intent and exact tested-source boundary
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.intent.outputs.tag }}
+      sha: ${{ steps.intent.outputs.sha }}
+      mode: ${{ steps.intent.outputs.mode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate owner acceptance and prohibit untested application/workflow changes
+        id: intent
+        env:
+          ACTIVATION_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release_intent.py .github/release-intent.json \
+            --activation-sha "$ACTIVATION_SHA" \
+            --canonical-output "$RUNNER_TEMP/release-request.json" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Verify candidate version and main ancestry
+        env:
+          RELEASE_TAG: ${{ steps.intent.outputs.tag }}
+          RELEASE_SHA: ${{ steps.intent.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$RELEASE_SHA" refs/remotes/origin/main
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo 'Tag already exists. Inspect any partial prior release; never overwrite it automatically.'
+            exit 1
+          fi
+          git checkout --detach "$RELEASE_SHA"
+          python3 .github/scripts/artifacts.py check-version --tag "$RELEASE_TAG"
+          test -f .github/workflows/native-acceptance.yml
+          test -f .github/scripts/release_intent.py
+      - name: Preserve the validated release-owner record for this run
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: validated-release-request
+          path: ${{ runner.temp }}/release-request.json
+          if-no-files-found: error
+          retention-days: 14
+
+  verify:
+    name: Rebuild and verify the exact candidate including installed native acceptance
+    needs: preflight
+    uses: ./.github/workflows/ci.yml
+    with:
+      source-ref: ${{ needs.preflight.outputs.sha }}
+    permissions:
+      contents: read
+
+  release:
+    name: Apply only the explicit draft or publish instruction
+    needs: [preflight, verify]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: validated-release-request
+          path: ${{ runner.temp }}/release-request
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: installers-*
+          path: ${{ runner.temp }}/release-installers
+      - name: Validate all provenance and prepare exact-source assets and acceptance notes
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          VERIFICATION_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/artifacts.py release --tag "$RELEASE_TAG" \
+            --installers "$RUNNER_TEMP/release-installers" --output "$RUNNER_TEMP/release-assets"
+          python3 .github/scripts/release_intent.py "$RUNNER_TEMP/release-request/release-request.json" \
+            --notes-output "$RUNNER_TEMP/release-notes.md" --run-url "$VERIFICATION_URL"
+      - name: Create a fresh exact tag and release; never overwrite or infer publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+          RELEASE_MODE: ${{ needs.preflight.outputs.mode }}
+        run: |
+          set -euo pipefail
+          # List successfully first: a network/permission error must not be
+          # interpreted as a missing release or authorize an overwrite.
+          existing=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .id")
+          test -z "$existing" || { echo 'Release already exists; inspect it manually.'; exit 1; }
+          tags=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$RELEASE_TAG" \
+            --jq "map(select(.ref == \"refs/tags/$RELEASE_TAG\")) | length")
+          test "$tags" = 0 || { echo 'Tag already exists; inspect it manually.'; exit 1; }
+          gh api --method POST "repos/$GH_REPO/git/refs" \
+            -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_SHA" >/dev/null
+          actual=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')
+          test "$actual" = "$RELEASE_SHA"
+          gh release create "$RELEASE_TAG" "$RUNNER_TEMP/release-assets/"* \
+            --verify-tag --target "$RELEASE_SHA" --draft \
+            --title "xyzaishell $RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
+          if [[ "$RELEASE_MODE" == publish ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false --latest
+          else
+            test "$RELEASE_MODE" = draft
+          fi
+          gh release view "$RELEASE_TAG" --json tagName,isDraft,url,assets

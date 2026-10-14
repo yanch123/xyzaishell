@@ -31,3 +31,7 @@ id_ed25519*
 # Browser preview tests (synthetic data only)
 /playwright-report/
 /test-results/
+
+# Rebuilt from locked dependency sources before packaging.
+/src-tauri/resources/third-party/
+/docs/v0.1/tools/__pycache__/

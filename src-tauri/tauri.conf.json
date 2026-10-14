@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "dev.xyzaishell.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "python docs/v0.1/tools/prepare_third_party.py && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "python docs/v0.1/tools/prepare_third_party.py && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -36,6 +36,9 @@
     "icon": [
       "icons/icon.png",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "resources/third-party/": "third-party/"
+    }
   }
 }

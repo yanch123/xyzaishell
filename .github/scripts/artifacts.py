@@ -145,6 +145,15 @@ def release(root, installers, output, tag):
     write_checksums(output, "SHA256SUMS.txt")
 
 
+def verify_package(root, installers, platform):
+    root, installers = Path(root).resolve(), Path(installers).resolve()
+    manifest_path = installers / f"build-{platform}.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise ValueError("Missing regular package provenance file")
+    return validate_manifest(read_json(manifest_path), platform, check_version(root),
+                             command("git", "rev-parse", "HEAD", cwd=root), root, installers)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
@@ -158,11 +167,16 @@ def main():
     release_parser.add_argument("--tag", required=True)
     release_parser.add_argument("--installers", required=True)
     release_parser.add_argument("--output", required=True)
+    verify_parser = sub.add_parser("verify-package")
+    verify_parser.add_argument("--platform", choices=PLATFORMS, required=True)
+    verify_parser.add_argument("--installers", required=True)
     args = parser.parse_args()
     if args.action == "check-version":
         print(check_version(Path.cwd(), args.tag))
     elif args.action == "collect":
         collect(Path.cwd(), args.output, args.platform, args.bundle)
+    elif args.action == "verify-package":
+        print(verify_package(Path.cwd(), args.installers, args.platform))
     else:
         release(Path.cwd(), args.installers, args.output, args.tag)
 
