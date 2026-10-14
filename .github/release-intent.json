@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "tag": "v0.1.0",
-  "source_commit": "73c040217d27c002201a8ed593511d198af2dc0e",
+  "tag": "v0.1.1",
+  "source_commit": "18eba0cf02a2c265862e957ba86f1cb24e4bedde",
   "mode": "prerelease",
-  "confirmation": "prerelease xyzaishell v0.1.0 from 73c040217d27c002201a8ed593511d198af2dc0e",
+  "confirmation": "prerelease xyzaishell v0.1.1 from 18eba0cf02a2c265862e957ba86f1cb24e4bedde",
   "acceptance": {
     "windows_10": {
       "status": "pending",
@@ -18,42 +18,50 @@
     "ubuntu_22_04_desktop": {
       "status": "pending",
       "evidence": [
-        "https://github.com/yanch123/xyzaishell/actions/runs/38544184281"
+        "https://github.com/yanch123/xyzaishell/actions/runs/38552926592",
+        "https://github.com/yanch123/xyzaishell/blob/0eb98a736c06609a6bdd7a789a18c6957a836093/docs/v0.1.1/release-evidence/01-automated-acceptance.md"
       ],
       "notes": "Ubuntu 22.04 已有 hosted runner/Xvfb 的实际安装与原生 DOM/IPC、历史恢复及重装卸载验收；真实桌面的 Wayland/X11 完整流程、输入法、剪贴板和辅助功能尚未覆盖，不填写人工桌面通过。"
     },
     "ubuntu_24_04_desktop": {
       "status": "pending",
       "evidence": [
-        "https://github.com/yanch123/xyzaishell/actions/runs/38544184281"
+        "https://github.com/yanch123/xyzaishell/actions/runs/38552926592",
+        "https://github.com/yanch123/xyzaishell/blob/0eb98a736c06609a6bdd7a789a18c6957a836093/docs/v0.1.1/release-evidence/01-automated-acceptance.md"
       ],
       "notes": "Ubuntu 24.04 已有 hosted runner/Xvfb 的实际安装与原生 DOM/IPC、历史恢复及重装卸载验收；真实桌面的 Wayland/X11 完整流程、输入法、剪贴板和辅助功能尚未覆盖，不填写人工桌面通过。"
     },
     "installation_lifecycle": {
       "status": "passed",
       "evidence": [
-        "https://github.com/yanch123/xyzaishell/actions/runs/38544184281"
+        "https://github.com/yanch123/xyzaishell/actions/runs/38552926592",
+        "https://github.com/yanch123/xyzaishell/blob/0eb98a736c06609a6bdd7a789a18c6957a836093/docs/v0.1.1/release-evidence/01-automated-acceptance.md"
       ],
-      "notes": "精确候选的 Windows Server 2022、Ubuntu 22.04/24.04 自动安装后验收覆盖首次安装、档案保存、流式聊天、关闭重启、仅文字恢复且无自动请求、同版本重装、卸载重装和最终卸载后的配置指纹保留。不是 Windows 10/11 实机或跨版本升级验收。"
+      "notes": "精确候选在 Windows Server 2022、Ubuntu 22.04/24.04 通过新装、档案与合成流式聊天、关闭重启、同版本重装、卸载重装及最终卸载后的配置保留。Shell日志入口、默认禁用和空库导出拒绝经原生UI验证；不是Windows 10/11实机验收。"
     },
     "ssh_model_security": {
       "status": "passed",
       "evidence": [
-        "https://github.com/yanch123/xyzaishell/actions/runs/38544184281"
+        "https://github.com/yanch123/xyzaishell/actions/runs/38552926592",
+        "https://github.com/yanch123/xyzaishell/blob/0eb98a736c06609a6bdd7a789a18c6957a836093/docs/v0.1.1/release-evidence/01-automated-acceptance.md"
       ],
-      "notes": "通过范围仅为自动测试：真实 OpenSSH PTY及零exec审计、Rust模型/Agent/命令授权/取消/秘密脱敏测试、原生DPAPI与隔离Secret Service、并发历史CAS；安装后真实IPC连接合成回环SSE并确认发送接收方。未测试真实模型供应商/生产账号或通过安装后UI连接外部SSH；每次命令写入后仍需用户核实终端就绪，脱敏不保证识别未知或变形秘密。"
+      "notes": "仅自动测试通过：真实OpenSSH五次可见PTY且零exec/subsystem；独立Shell日志记录时间、执行前物理目录和完整顶层命令，真实SSH非空JSON导出；两平台Rust测试覆盖CSV/JSON、脱敏、权限与异常路径。原生UI连接SSH后点击非空日志导出的全链路未实测；外部模型供应商/生产凭据未测试。日志默认关闭、明文、不存输出，不保证未知秘密脱敏，不是防篡改审计。"
     },
     "dependency_notices": {
       "status": "passed",
       "evidence": [
-        "https://github.com/yanch123/xyzaishell/actions/runs/38544184281"
+        "https://github.com/yanch123/xyzaishell/actions/runs/38552926592",
+        "https://github.com/yanch123/xyzaishell/blob/0eb98a736c06609a6bdd7a789a18c6957a836093/docs/v0.1.1/release-evidence/01-automated-acceptance.md"
       ],
       "notes": "两平台按锁定依赖生成第三方通知、Rust标准库告知、适用源码和WebView2 loader文本；实际NSIS/DEB安装后核实通知与源码资源存在及摘要。两平台安装包、锁文件、版本和精确提交由provenance校验。项目自身未选择额外开源许可证，不宣称替代所有法律判断。"
     },
     "version_upgrade": {
-      "status": "not_applicable",
-      "evidence": [],
-      "notes": "v0.1.0 是首个发布候选，无既有正式版本可作为升级基线。同版本覆盖安装和卸载重装已测试，不等同跨版本升级。"
+      "status": "passed",
+      "evidence": [
+        "https://github.com/yanch123/xyzaishell/actions/runs/38552926592",
+        "https://github.com/yanch123/xyzaishell/blob/0eb98a736c06609a6bdd7a789a18c6957a836093/docs/v0.1.1/release-evidence/01-automated-acceptance.md"
+      ],
+      "notes": "Windows Server 2022、Ubuntu 22.04和24.04均实际安装已发布且哈希固定的v0.1.0，使用旧版真实UI建立合成档案/聊天并重启，再直接安装v0.1.1；版本与二进制变化、配置指纹、文字及稳定任务ID保留均通过。使用独立临时数据目录，未以同版本重装替代升级；不代表Windows 10/11实机或任意旧版本升级。"
     }
   }
 }
