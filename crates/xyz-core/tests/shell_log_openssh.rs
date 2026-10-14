@@ -236,9 +236,15 @@ async fn shell_log_real_openssh_records_commands_without_model() {
         t.disconnect(&first).await;
         let second = t.connect().await;
         t.completed(&second, "set +o history").await;
-        t.write(&second, "echo MUST_NOT_REUSE_PREVIOUS_COMMAND\n")
-            .await;
+        // The prompt-boundary gap belongs to the same sequence as the completed
+        // foreground command; it must reach both consumers before more input.
         t.until(|t| t.service.status().state == CaptureState::Gap)
+            .await;
+        assert_eq!(
+            t.manager.shell_integration().status().phase,
+            IntegrationPhase::Unknown
+        );
+        t.write(&second, "echo MUST_NOT_REUSE_PREVIOUS_COMMAND\n")
             .await;
         t.service.flush().unwrap();
         assert_eq!(

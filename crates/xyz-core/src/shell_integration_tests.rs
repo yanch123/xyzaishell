@@ -312,3 +312,75 @@ fn late_install_handshake_cannot_erase_timeout_without_a_status_poll() {
     assert_eq!(f.service.status().phase, IntegrationPhase::Unknown);
     assert!(f.service.ready_snapshot(f.session()).is_err());
 }
+
+#[test]
+fn shared_prompt_boundary_gap_reaches_logger_even_after_foreground_end() {
+    let f = Fixture::new();
+    f.ready();
+    let path = std::env::temp_dir().join(format!("xyz-integration-gap-{}", Uuid::new_v4()));
+    let log = ShellLogService::new(
+        Ok(path),
+        crate::observation::ObservationBuffer::new(),
+        Arc::new(|_| {}),
+    );
+    f.service.attach_log(log.clone());
+    let ready = f.service.ready_snapshot(f.session()).unwrap();
+    log.start_shared(f.snapshot.clone(), true, ready.shell_id, true)
+        .unwrap();
+    // Matches the real OpenSSH wire sequence from `set +o history` exactly.
+    f.begin(1, "set +o history");
+    f.event("E;1;124;0");
+    f.event("G;1;hooks_changed");
+    assert_eq!(f.service.status().phase, IntegrationPhase::Unknown);
+    assert_eq!(
+        log.status().state,
+        crate::shell_log_types::CaptureState::Gap
+    );
+    let rows = log
+        .query(crate::shell_log_types::ShellLogQuery::default())
+        .unwrap()
+        .entries;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].status,
+        crate::shell_log_types::CommandStatus::Completed
+    );
+    assert_eq!(rows[0].exit_code, Some(0));
+    assert!(f.service.ready_snapshot(f.session()).is_err());
+    log.disconnect(f.session());
+}
+
+#[test]
+fn paused_shared_logger_retains_prompt_gap_and_cannot_resume() {
+    let f = Fixture::new();
+    f.ready();
+    let path = std::env::temp_dir().join(format!("xyz-integration-paused-gap-{}", Uuid::new_v4()));
+    let log = ShellLogService::new(
+        Ok(path),
+        crate::observation::ObservationBuffer::new(),
+        Arc::new(|_| {}),
+    );
+    f.service.attach_log(log.clone());
+    let ready = f.service.ready_snapshot(f.session()).unwrap();
+    log.start_shared(f.snapshot.clone(), true, ready.shell_id, true)
+        .unwrap();
+    log.pause().unwrap();
+    f.begin(1, "set +o history");
+    f.event("E;1;124;0");
+    f.event("G;1;hooks_changed");
+    assert_eq!(f.service.status().phase, IntegrationPhase::Unknown);
+    assert_eq!(
+        log.status().state,
+        crate::shell_log_types::CaptureState::Paused
+    );
+    assert_eq!(
+        log.resume(f.session()).unwrap_err().code,
+        "SHELL_LOG_INTEGRATION_LOST"
+    );
+    assert!(log
+        .query(crate::shell_log_types::ShellLogQuery::default())
+        .unwrap()
+        .entries
+        .is_empty());
+    log.disconnect(f.session());
+}

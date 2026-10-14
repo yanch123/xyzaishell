@@ -51,6 +51,7 @@ struct Capture {
     attempted: BTreeSet<(String, String)>,
     shell_id: String,
     hello: bool,
+    integration_lost: bool,
     high_sequence: u64,
     active: Option<(u64, String)>,
 }
@@ -156,6 +157,7 @@ impl ShellLogService {
             attempted: BTreeSet::new(),
             shell_id: String::new(),
             hello: false,
+            integration_lost: false,
             high_sequence: 0,
             active: None,
         }));
@@ -224,6 +226,7 @@ impl ShellLogService {
             c.snapshot = Some(snapshot);
             c.shell_id = shell_id;
             c.hello = true;
+            c.integration_lost = false;
             c.high_sequence = 0;
             c.active = None;
         }
@@ -300,6 +303,7 @@ impl ShellLogService {
         c.snapshot = Some(snapshot);
         c.shell_id = Uuid::new_v4().to_string();
         c.hello = false;
+        c.integration_lost = false;
         c.high_sequence = 0;
         c.active = None;
         drop(gate);
@@ -346,7 +350,11 @@ impl ShellLogService {
         c.active = None;
         let result = self.shared.update(|s| {
             s.state = CaptureState::Paused;
-            s.reason = Some("Collection paused; protocol metadata remains filtered.".into());
+            s.reason = Some(if c.integration_lost {
+                "Collection paused; shell integration was lost. Reconnect and enable integration before recording again."
+            } else {
+                "Collection paused; protocol metadata remains filtered."
+            }.into());
         });
         drop(gate);
         drop(c);
@@ -357,6 +365,9 @@ impl ShellLogService {
     pub fn resume(&self, session: &SessionRef) -> Result<ShellLogStatus, ApiError> {
         let c = self.capture.lock().unwrap_or_else(|p| p.into_inner());
         let s = self.status();
+        if c.integration_lost && s.session.as_ref() == Some(session) {
+            return Err(error("SHELL_LOG_INTEGRATION_LOST", "Shell integration was lost while recording or paused. Reconnect and enable integration before recording again."));
+        }
         if !s.enabled
             || s.session.as_ref() != Some(session)
             || s.state != CaptureState::Paused
@@ -493,9 +504,17 @@ impl ShellLogService {
             ));
         }
     }
+    fn integration_lost(&self, c: &mut Capture) {
+        c.integration_lost = true;
+        self.finish_active(c, CommandStatus::Unknown, None);
+        self.shared.update(|s| {
+            if s.state != CaptureState::Paused { s.state = CaptureState::Gap; }
+            s.reason = Some("Shell integration was lost; records may be incomplete. Reconnect and enable integration before recording again.".into());
+        });
+    }
     fn handle_event(&self, c: &mut Capture, event: WireEvent) {
         let s = self.status();
-        if !s.enabled {
+        if !s.enabled || (c.integration_lost && !matches!(&event, WireEvent::Closed)) {
             return;
         }
         match event {
@@ -611,29 +630,20 @@ impl ShellLogService {
                 });
             }
             WireEvent::Malformed { .. } => {
-                if !c.hello {
-                    return;
-                }
-                if matches!(s.state, CaptureState::Recording | CaptureState::Gap) {
-                    self.finish_active(c, CommandStatus::Unknown, None);
-                    self.shared.update(|s| {
-                        s.state = CaptureState::Gap;
-                        s.reason = Some("Malformed shell metadata was discarded.".into());
-                    });
+                if c.hello {
+                    self.integration_lost(c);
                 }
             }
             WireEvent::Gap { sequence, .. } => {
-                if !c.hello || sequence <= c.high_sequence {
+                // A prompt/hook failure can be reported AFTER End, using the
+                // same top-level command sequence that Begin already accepted.
+                // Drop only older replays; a current-boundary gap must remain
+                // visible even when the foreground record is already complete.
+                if !c.hello || sequence < c.high_sequence {
                     return;
                 }
                 c.high_sequence = sequence;
-                if matches!(s.state, CaptureState::Recording | CaptureState::Gap) {
-                    self.finish_active(c, CommandStatus::Unknown, None);
-                    self.shared.update(|s| {
-                        s.state = CaptureState::Gap;
-                        s.reason = Some("The shell reported an incomplete command record.".into());
-                    });
-                }
+                self.integration_lost(c);
             }
         }
     }

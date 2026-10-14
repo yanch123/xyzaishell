@@ -1,6 +1,38 @@
 import { test, expect } from '@playwright/test';
+import type { Locator } from '@playwright/test';
 
-test('synthetic settings: save, minimal-test consent, key non-echo and unsaved close', async ({ page }, testInfo) => {
+/** Text, controls and placeholders must remain readable on their actual surface. */
+async function expectReadable(locator: Locator, pseudo: string | null = null) {
+  const contrast = await locator.evaluate((element, pseudoElement) => {
+    const rgb = (value: string) => {
+      const channels = value.match(/[\d.]+/g)?.map(Number) ?? [];
+      if (channels.length < 3) throw new Error(`Unsupported computed color: ${value}`);
+      return channels;
+    };
+    const luminance = (channels: number[]) => channels.slice(0, 3).map(channel => {
+      const normalized = channel / 255;
+      return normalized <= .04045 ? normalized / 12.92 : ((normalized + .055) / 1.055) ** 2.4;
+    }).reduce((sum, channel, index) => sum + channel * [.2126, .7152, .0722][index], 0);
+    const foreground = rgb(getComputedStyle(element, pseudoElement).color);
+    let current: Element | null = element;
+    let background: number[] | null = null;
+    while (current) {
+      const color = rgb(getComputedStyle(current).backgroundColor);
+      if (color.length === 3 || color[3] === 1) { background = color; break; }
+      if (color[3] !== 0) throw new Error('Contrast test requires an opaque settings surface');
+      current = current.parentElement;
+    }
+    if (!background) throw new Error('Missing opaque settings background');
+    const first = luminance(foreground); const second = luminance(background);
+    return (Math.max(first, second) + .05) / (Math.min(first, second) + .05);
+  }, pseudo);
+  expect(contrast, `${await locator.getAttribute('class') ?? await locator.evaluate(node => node.tagName)} text contrast`).toBeGreaterThanOrEqual(4.5);
+}
+
+for (const colorScheme of ['dark', 'light'] as const) {
+
+test(`synthetic settings (${colorScheme} OS): save, readable consent, key non-echo and unsaved close`, async ({ page }, testInfo) => {
+  await page.emulateMedia({ colorScheme });
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.addInitScript(() => {
@@ -46,16 +78,22 @@ test('synthetic settings: save, minimal-test consent, key non-echo and unsaved c
   await settings.getByLabel('Base URL').fill('https://model-fixture.example/v1');
   await settings.getByLabel('API Key', { exact: false }).fill('SYNTHETIC_BROWSER_KEY');
   await settings.getByLabel('模型名').fill('synthetic-model');
+  for (const field of ['Base URL', 'API Key', '模型名']) await expectReadable(settings.getByLabel(field, { exact: false }));
+  await expectReadable(settings.getByLabel('API Key', { exact: false }), '::placeholder');
+  await expectReadable(settings.getByRole('button', { name: '模型', exact: true }));
   await settings.getByRole('button', { name: '保存并测试', exact: true }).click();
   const consent = settings.getByRole('group', { name: '确认测试接收方' });
   await expect(consent).toBeVisible();
   await expect(consent.getByRole('button', { name: '确认并测试', exact: true })).toBeDisabled();
   await expect(settings.getByLabel('API Key', { exact: false })).toHaveValue('');
   expect(await page.evaluate(() => (window as unknown as { __SETTINGS_CALLS__: { command: string }[] }).__SETTINGS_CALLS__.filter(item => item.command === 'test_model_config'))).toHaveLength(0);
+  for (const text of await consent.locator('h4, p, .check-field span').all()) await expectReadable(text);
+  await consent.scrollIntoViewIfNeeded();
   await page.screenshot({ path: testInfo.outputPath('settings-saved-awaiting-test-consent.png'), fullPage: true });
   await consent.getByRole('checkbox').check();
   await consent.getByRole('button', { name: '确认并测试', exact: true }).click();
   await expect(settings.getByText('设置已保存，流式聊天测试通过。未验证工具调用。')).toBeVisible();
+  for (const text of await settings.locator('.settings-test-result strong, .settings-test-result p').all()) await expectReadable(text);
   await page.screenshot({ path: testInfo.outputPath('settings-minimal-test-complete.png'), fullPage: true });
   await settings.getByLabel('模型名').fill('unsaved-model');
   await settings.getByRole('button', { name: '关闭设置', exact: true }).click();
@@ -72,3 +110,5 @@ test('synthetic settings: save, minimal-test consent, key non-echo and unsaved c
   expect(calls.some(item => ['send_chat_message', 'connect_server', 'connect_saved_profile', 'send_user_input'].includes(item.command))).toBe(false);
   expect(errors).toEqual([]);
 });
+
+}

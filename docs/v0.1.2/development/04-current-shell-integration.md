@@ -32,3 +32,11 @@
 `crates/xyz-core/tests/shell_log_openssh.rs` 已改为当前 Shell 安装、等到真实 `R` 后订阅日志。Linux OpenSSH、Bash 5.1、Windows 构建和端到端产品验收由后续集成流水线提供证据。
 
 复核后的夹具修正：Ctrl+C 测试不再在 PS0 的部分 Begin 输出后立即发送信号，而先用 PTY 前台进程组确认 sleep 已接管前台。修正后完整 12 项 PTY 套件连续运行三次，36/36 通过；产品执行逻辑未因此更改。
+
+## 托管 OpenSSH 回归修正
+
+CI run `38581418388` 的 Ubuntu 24.04 OpenSSH 实测暴露了日志消费者的同序号缺口处理错误：`set +o history` 正常产生 `B;1` / `E;1` 后，提示符验证再产生 `G;1;hooks_changed`，旧日志逻辑用 `sequence <= high_sequence` 将这个有效缺口误当重放丢弃。执行消费者已正确进入 Unknown，错误仅使日志状态仍显示 Recording。
+
+改为只丢弃更旧序号；同序号提示符缺口保留已完成的前台结果并将记录状态设为 Gap。补充两个日志单元测试和一个共享解析器回归测试，OpenSSH 用例在继续手动输入前核对两个消费者。修正后本地日志 43/43、生命周期 12/12、严格 Clippy 通过；托管 OpenSSH 重新运行的结果单独记录，不以本地单元测试替代。
+
+同轮修正还保留暂停期间的集成丢失证据：缺口/畸形帧会置位 capture 的永久丢失标志，界面仍可显示 Paused，但恢复返回 `SHELL_LOG_INTEGRATION_LOST`，后续事件不能偷偷重新显示 Recording。用户在 Gap 后再暂停也不能清除该证据；新连接上经核验的 `start_shared` 才重置它。宿主恢复入口额外核对当前生命周期就绪。新增暂停 → 缺口 → 恢复、畸形帧和共享解析器回归覆盖。

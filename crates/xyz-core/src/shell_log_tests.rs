@@ -341,3 +341,111 @@ fn reconnected_disabled_shell_keeps_observations_and_rejects_old_stream() {
     assert_eq!(f.service.ingest(&next, b"still visible"), b"still visible");
     assert!(!f.service.status().enabled);
 }
+
+#[test]
+fn current_sequence_prompt_gap_remains_visible_after_completed_foreground() {
+    let f = Fixture::new();
+    f.start();
+    f.hello();
+    f.begin(1, "set +o history");
+    f.end(1);
+    f.event(WireEvent::Gap {
+        sequence: 1,
+        reason: "hooks_changed".into(),
+    });
+    assert_eq!(f.service.status().state, CaptureState::Gap);
+    let rows = f.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, CommandStatus::Completed);
+    assert_eq!(rows[0].exit_code, Some(7));
+    // Repeated gap notifications do not revise the completed command outcome.
+    f.event(WireEvent::Gap {
+        sequence: 1,
+        reason: "hooks_changed".into(),
+    });
+    assert_eq!(f.rows()[0].status, CommandStatus::Completed);
+}
+#[test]
+fn same_sequence_gap_before_end_is_unknown_but_older_gap_is_a_replay() {
+    let f = Fixture::new();
+    f.start();
+    f.hello();
+    f.begin(1, "one");
+    f.event(WireEvent::Gap {
+        sequence: 1,
+        reason: "hooks_changed".into(),
+    });
+    f.end(1);
+    assert_eq!(f.rows()[0].status, CommandStatus::Unknown);
+    // Separate healthy capture: an older gap must not poison its newer record.
+    let f = Fixture::new();
+    f.start();
+    f.hello();
+    f.begin(1, "one");
+    f.end(1);
+    f.begin(2, "two");
+    f.event(WireEvent::Gap {
+        sequence: 1,
+        reason: "history_missing".into(),
+    });
+    assert_eq!(f.service.status().state, CaptureState::Recording);
+    f.end(2);
+    let rows = f.rows();
+    assert_eq!(rows[0].command, "two");
+    assert_eq!(rows[0].status, CommandStatus::Completed);
+}
+
+#[test]
+fn metadata_loss_while_paused_is_retained_and_resume_never_claims_recording() {
+    for loss in [
+        WireEvent::Gap {
+            sequence: 1,
+            reason: "hooks_changed".into(),
+        },
+        WireEvent::Malformed {
+            reason: "invalid_frame".into(),
+        },
+    ] {
+        let f = Fixture::new();
+        f.start();
+        f.hello();
+        f.begin(1, "one");
+        f.end(1);
+        f.service.flush().unwrap();
+        f.service.pause().unwrap();
+        f.event(loss);
+        assert_eq!(f.service.status().state, CaptureState::Paused);
+        assert!(f
+            .service
+            .status()
+            .reason
+            .unwrap()
+            .contains("integration was lost"));
+        assert_eq!(
+            f.service.resume(f.session()).unwrap_err().code,
+            "SHELL_LOG_INTEGRATION_LOST"
+        );
+        f.begin(2, "must not silently revive capture");
+        f.end(2);
+        assert_eq!(f.service.status().state, CaptureState::Paused);
+        assert_eq!(f.rows().len(), 1);
+    }
+}
+#[test]
+fn pause_after_gap_cannot_clear_loss_evidence_or_resume() {
+    let f = Fixture::new();
+    f.start();
+    f.hello();
+    f.begin(1, "one");
+    f.end(1);
+    f.event(WireEvent::Gap {
+        sequence: 1,
+        reason: "hooks_changed".into(),
+    });
+    f.service.pause().unwrap();
+    assert_eq!(
+        f.service.resume(f.session()).unwrap_err().code,
+        "SHELL_LOG_INTEGRATION_LOST"
+    );
+    assert_eq!(f.service.status().state, CaptureState::Paused);
+}

@@ -1,5 +1,5 @@
 import { TaskSecretPanel } from './TaskSecretPanel';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { ChatSnapshot, ModelConfigStatus } from '../lib/model';
 import type { SessionSnapshot } from '../lib/types';
 import { sameSession } from '../lib/types';
@@ -19,6 +19,9 @@ export function TerminalTaskPane({ agent, current, config, session, onStart, onS
   const pending = agent.pending[id];
   const draft = agent.drafts[id] ?? '';
   const [checked, setChecked] = useState(false);
+  const [draftExpanded, setDraftExpanded] = useState(false);
+  const draftRegionId = useId();
+  const compactComposer = !!task?.owner && !draftExpanded;
   const body = useRef<HTMLDivElement>(null);
   const following = useRef(true);
   const connected = !!task && session.state === 'connected' && sameSession(task.session, session.session);
@@ -28,6 +31,7 @@ export function TerminalTaskPane({ agent, current, config, session, onStart, onS
   const canStart = agent.native && agent.ready && !!current && !readOnly && !current.active_run_id && config.ready && session.state === 'connected' && !agent.blocked && !!draft.trim() && bytes <= MAX_MESSAGE_BYTES;
   useEffect(() => { setChecked(false); }, [task?.run_id, task?.phase, task?.round]);
   useEffect(() => { following.current = true; }, [id]);
+  useEffect(() => { setDraftExpanded(false); }, [id, task?.run_id]);
   useEffect(() => {
     const scroll = body.current;
     if (!following.current || !scroll) return;
@@ -65,6 +69,9 @@ export function TerminalTaskPane({ agent, current, config, session, onStart, onS
       {agent.errors[id] && <div className="inline-error" role="alert">{agent.errors[id]}</div>}
       {agent.uncertain[id] && <div className="notice warning" role="alert"><span>本次操作的响应不确定，已阻止重复提交。只读取后端状态核对，不会重发命令。</span><button className="button secondary" onClick={() => void agent.refresh()}>核对任务状态</button></div>}
     </div>
-    <div className="composer-area"><div className="composer"><textarea aria-label="终端任务指令" placeholder="描述要执行的任务… 请勿输入密码或密钥" value={draft} maxLength={MAX_DRAFT_LENGTH} disabled={!current} onChange={event => current && agent.updateDraft(id, event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing) { event.preventDefault(); submit(); } }} /><div className="composer-toolbar"><span className="task-model-label" title={config.destination ?? undefined}>{config.model ?? '未配置模型'}</span><button className="save-draft" disabled={!canStart} onClick={submit}>{pending === 'starting' ? '正在启动…' : '核对并开始执行'}<Icon name="arrow" size={15} /></button></div></div><div className={`composer-footnote ${bytes > MAX_MESSAGE_BYTES ? 'over-limit' : ''}`}><span>{bytes > MAX_MESSAGE_BYTES ? '任务指令超过 16 KiB，请缩短' : current?.active_run_id ? '先停止或等待当前聊天生成，再启动终端任务' : agent.blocked ? '已有任务或待核实操作 · 草稿不会发送' : '启动前需要数据授权与当前 Shell 集成就绪'}</span></div></div>
+    <div className="task-composer-shell">
+      {task?.owner && <button className="task-composer-toggle" aria-expanded={!compactComposer} aria-controls={draftRegionId} onClick={() => setDraftExpanded(value => !value)}>{compactComposer ? '展开新任务草稿' : '收起新任务草稿'}<span>当前任务结束后才能发送</span></button>}
+      <div id={draftRegionId} hidden={compactComposer} className="composer-area"><div className="composer"><textarea aria-label="终端任务指令" placeholder="描述要执行的任务… 请勿输入密码或密钥" value={draft} maxLength={MAX_DRAFT_LENGTH} disabled={!current} onChange={event => current && agent.updateDraft(id, event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing) { event.preventDefault(); submit(); } }} /><div className="composer-toolbar"><span className="task-model-label" title={config.destination ?? undefined}>{config.model ?? '未配置模型'}</span><button className="save-draft" disabled={!canStart} onClick={submit}>{pending === 'starting' ? '正在启动…' : '核对并开始执行'}<Icon name="arrow" size={15} /></button></div></div><div className={`composer-footnote ${bytes > MAX_MESSAGE_BYTES ? 'over-limit' : ''}`}><span>{bytes > MAX_MESSAGE_BYTES ? '任务指令超过 16 KiB，请缩短' : current?.active_run_id ? '先停止或等待当前聊天生成，再启动终端任务' : agent.blocked ? '已有任务或待核实操作 · 草稿不会发送' : '启动前需要数据授权与当前 Shell 集成就绪'}</span></div></div>
+    </div>
   </>;
 }

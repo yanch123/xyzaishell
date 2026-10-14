@@ -490,6 +490,7 @@ async fn set_shell_log_paused(
 ) -> Result<ShellLogStatus, ApiError> {
     let service = state.inner().clone();
     let session = ssh.snapshot().session;
+    let integration = ssh.shell_integration();
     tauri::async_runtime::spawn_blocking(move || {
         if paused {
             service.pause()
@@ -500,6 +501,7 @@ async fn set_shell_log_paused(
                     "Connect before resuming shell logging.",
                 )
             })?;
+            integration.ready_snapshot(&session)?;
             service.resume(&session)
         }
     })

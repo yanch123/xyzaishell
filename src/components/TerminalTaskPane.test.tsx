@@ -91,3 +91,24 @@ describe('integrated automatic execution states', () => {
     expect(screen.getByRole('button', { name: '停止 AI 任务' })).toBeDefined();
   });
 });
+
+describe('compact active-task review layout', () => {
+  it('collapses the unavailable new-task editor while keeping its draft accessible and restoring it after stop', () => {
+    const owner = task({ phase: 'waiting_approval', action: action({ policy: 'require_approval', displayed: true }) });
+    const onStart = vi.fn();
+    const view = render(<TerminalTaskPane {...common} onStart={onStart} agent={controller({ owner, blocked: true, tasks: { 'chat-a': owner }, drafts: { 'chat-a': '保留下一次任务草稿' } })} />);
+    expect(screen.queryByRole('textbox', { name: '终端任务指令' })).toBeNull();
+    expect(screen.getByRole('group', { name: '精确终端命令' })).toBeDefined();
+    const expand = screen.getByRole('button', { name: /展开新任务草稿/ });
+    expect(expand.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(expand);
+    expect((screen.getByRole('textbox', { name: '终端任务指令' }) as HTMLTextAreaElement).value).toBe('保留下一次任务草稿');
+    expect((screen.getByRole('button', { name: '核对并开始执行' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: /收起新任务草稿/ }));
+    expect(screen.queryByRole('textbox', { name: '终端任务指令' })).toBeNull();
+    view.rerender(<TerminalTaskPane {...common} onStart={onStart} agent={controller({ owner: null, blocked: false, tasks: { 'chat-a': { ...owner, phase: 'cancelled', owner: false, terminal_ready: true } }, drafts: { 'chat-a': '保留下一次任务草稿' } })} />);
+    expect((screen.getByRole('textbox', { name: '终端任务指令' }) as HTMLTextAreaElement).value).toBe('保留下一次任务草稿');
+    expect(screen.queryByRole('button', { name: /展开新任务草稿/ })).toBeNull();
+    expect(onStart).not.toHaveBeenCalled();
+  });
+});

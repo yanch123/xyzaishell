@@ -87,14 +87,22 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
   await page.screenshot({ path: testInfo.outputPath('synthetic-task-consent.png'), fullPage: true });
   await launch.click(); await expect(dialog).toBeHidden();
   const card = page.getByRole('group', { name: '精确终端命令' });
-  await card.scrollIntoViewIfNeeded();
+  // The compact window must leave enough actual task space to show both the
+  // exact target and command. Do not bypass the production display-ACK gate.
+  await expect.poll(async () => (await page.locator('.execution-scroll').boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(220);
+  await card.locator('.action-target').scrollIntoViewIfNeeded();
+  await expect(card.locator('.action-target')).toBeInViewport({ ratio: 1 });
+  await expect(card.getByLabel('准确命令文本')).toBeInViewport({ ratio: 1 });
   await expect(card.getByText('SSH 接受写入 · 不代表命令成功')).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('synthetic-task-dispatched.png'), fullPage: true });
   await expect(page.getByRole('article', { name: '任务模型分析' })).toContainText('<script>window.unsafe = true</script>');
   expect(await page.evaluate(() => (window as unknown as { unsafe?: boolean }).unsafe)).toBeUndefined();
   const proceed = page.getByRole('button', { name: '确认就绪并继续分析' });
   await expect(proceed).toBeDisabled();
   await page.getByRole('checkbox', { name: '我已检查终端，并确认当前可接收下一步命令。' }).check(); await proceed.click();
-  await card.scrollIntoViewIfNeeded();
+  await card.locator('.action-target').scrollIntoViewIfNeeded();
+  await expect(card.locator('.action-target')).toBeInViewport({ ratio: 1 });
+  await expect(card.getByLabel('准确命令文本')).toBeInViewport({ ratio: 1 });
   await expect(page.getByRole('button', { name: '仅批准这条命令' })).toBeEnabled();
   await expect(card.getByLabel('准确命令文本')).toHaveText('touch ./synthetic-marker');
   await page.screenshot({ path: testInfo.outputPath('synthetic-task-single-approval.png'), fullPage: true });
