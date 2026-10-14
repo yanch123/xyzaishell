@@ -1,67 +1,73 @@
 {
   "schema_version": 1,
-  "tag": "v0.1.1",
-  "source_commit": "18eba0cf02a2c265862e957ba86f1cb24e4bedde",
+  "tag": "v0.1.2",
+  "source_commit": "bdd1d1ee9bd3a06cf8eabbcfe8a4ff59c1af192d",
   "mode": "prerelease",
-  "confirmation": "prerelease xyzaishell v0.1.1 from 18eba0cf02a2c265862e957ba86f1cb24e4bedde",
+  "confirmation": "prerelease xyzaishell v0.1.2 from bdd1d1ee9bd3a06cf8eabbcfe8a4ff59c1af192d",
   "acceptance": {
     "windows_10": {
       "status": "pending",
-      "evidence": [],
-      "notes": "Windows 10 真实用户桌面尚未验收。Windows Server 2022 的自动安装、真实 DOM/IPC 与生命周期结果不替代此项；本次明确以预发布测试版提供试用。安装包未签名。"
+      "evidence": [
+        "https://github.com/yanch123/xyzaishell/actions/runs/38588091775",
+        "https://github.com/yanch123/xyzaishell/blob/main/docs/v0.1.2/release-evidence/01-automated-acceptance.md"
+      ],
+      "notes": "Windows 10 完整用户桌面验收尚未完成。托管 Windows Server 2022 / Linux Xvfb 的自动安装与原生 UI 测试不能替代对应实机、输入法、剪贴板和完整桌面体验。安装包未签名，本次作为预发布试用版提供。"
     },
     "windows_11": {
       "status": "pending",
-      "evidence": [],
-      "notes": "Windows 11 真实用户桌面尚未验收。Windows Server 2022 的自动安装、真实 DOM/IPC 与生命周期结果不替代此项；本次明确以预发布测试版提供试用。安装包未签名。"
+      "evidence": [
+        "https://github.com/yanch123/xyzaishell/actions/runs/38588091775",
+        "https://github.com/yanch123/xyzaishell/blob/main/docs/v0.1.2/release-evidence/01-automated-acceptance.md"
+      ],
+      "notes": "Windows 11 完整用户桌面验收尚未完成。托管 Windows Server 2022 / Linux Xvfb 的自动安装与原生 UI 测试不能替代对应实机、输入法、剪贴板和完整桌面体验。安装包未签名，本次作为预发布试用版提供。"
     },
     "ubuntu_22_04_desktop": {
       "status": "pending",
       "evidence": [
-        "https://github.com/yanch123/xyzaishell/actions/runs/38552926592",
-        "https://github.com/yanch123/xyzaishell/blob/0eb98a736c06609a6bdd7a789a18c6957a836093/docs/v0.1.1/release-evidence/01-automated-acceptance.md"
+        "https://github.com/yanch123/xyzaishell/actions/runs/38588091775",
+        "https://github.com/yanch123/xyzaishell/blob/main/docs/v0.1.2/release-evidence/01-automated-acceptance.md"
       ],
-      "notes": "Ubuntu 22.04 已有 hosted runner/Xvfb 的实际安装与原生 DOM/IPC、历史恢复及重装卸载验收；真实桌面的 Wayland/X11 完整流程、输入法、剪贴板和辅助功能尚未覆盖，不填写人工桌面通过。"
+      "notes": "Ubuntu 22.04 完整用户桌面验收尚未完成。托管 Windows Server 2022 / Linux Xvfb 的自动安装与原生 UI 测试不能替代对应实机、输入法、剪贴板和完整桌面体验。安装包未签名，本次作为预发布试用版提供。"
     },
     "ubuntu_24_04_desktop": {
       "status": "pending",
       "evidence": [
-        "https://github.com/yanch123/xyzaishell/actions/runs/38552926592",
-        "https://github.com/yanch123/xyzaishell/blob/0eb98a736c06609a6bdd7a789a18c6957a836093/docs/v0.1.1/release-evidence/01-automated-acceptance.md"
+        "https://github.com/yanch123/xyzaishell/actions/runs/38588091775",
+        "https://github.com/yanch123/xyzaishell/blob/main/docs/v0.1.2/release-evidence/01-automated-acceptance.md"
       ],
-      "notes": "Ubuntu 24.04 已有 hosted runner/Xvfb 的实际安装与原生 DOM/IPC、历史恢复及重装卸载验收；真实桌面的 Wayland/X11 完整流程、输入法、剪贴板和辅助功能尚未覆盖，不填写人工桌面通过。"
+      "notes": "Ubuntu 24.04 完整用户桌面验收尚未完成。托管 Windows Server 2022 / Linux Xvfb 的自动安装与原生 UI 测试不能替代对应实机、输入法、剪贴板和完整桌面体验。安装包未签名，本次作为预发布试用版提供。"
     },
     "installation_lifecycle": {
       "status": "passed",
       "evidence": [
-        "https://github.com/yanch123/xyzaishell/actions/runs/38552926592",
-        "https://github.com/yanch123/xyzaishell/blob/0eb98a736c06609a6bdd7a789a18c6957a836093/docs/v0.1.1/release-evidence/01-automated-acceptance.md"
+        "https://github.com/yanch123/xyzaishell/actions/runs/38588091775",
+        "https://github.com/yanch123/xyzaishell/blob/main/docs/v0.1.2/release-evidence/01-automated-acceptance.md"
       ],
-      "notes": "精确候选在 Windows Server 2022、Ubuntu 22.04/24.04 通过新装、档案与合成流式聊天、关闭重启、同版本重装、卸载重装及最终卸载后的配置保留。Shell日志入口、默认禁用和空库导出拒绝经原生UI验证；不是Windows 10/11实机验收。"
+      "notes": "精确候选在 Windows Server 2022、Ubuntu 22.04/24.04 通过安装、真实原生 DOM/IPC 设置保存与最小模型测试、连接档案、聊天历史、重启、同版本重装及卸载重装。只使用独立合成数据，未替代真实外部服务器和用户桌面验收。"
     },
     "ssh_model_security": {
       "status": "passed",
       "evidence": [
-        "https://github.com/yanch123/xyzaishell/actions/runs/38552926592",
-        "https://github.com/yanch123/xyzaishell/blob/0eb98a736c06609a6bdd7a789a18c6957a836093/docs/v0.1.1/release-evidence/01-automated-acceptance.md"
+        "https://github.com/yanch123/xyzaishell/actions/runs/38588091775",
+        "https://github.com/yanch123/xyzaishell/blob/main/docs/v0.1.2/release-evidence/01-automated-acceptance.md"
       ],
-      "notes": "仅自动测试通过：真实OpenSSH五次可见PTY且零exec/subsystem；独立Shell日志记录时间、执行前物理目录和完整顶层命令，真实SSH非空JSON导出；两平台Rust测试覆盖CSV/JSON、脱敏、权限与异常路径。原生UI连接SSH后点击非空日志导出的全链路未实测；外部模型供应商/生产凭据未测试。日志默认关闭、明文、不存输出，不保证未知秘密脱敏，不是防篡改审计。"
+      "notes": "两平台 Rust 测试与严格 Clippy、164 项前端测试、12 项浏览器用例通过；Ubuntu 22.04/24.04 的真实 OpenSSH 和当前 Bash 5.1/5.2 PTY 测试通过，覆盖普通命令自动推进、精确危险授权、独立完成与就绪、日志中断及暂停后拒绝错误恢复。Linux 隔离 Secret Service 与 Windows 保护存储测试通过。日志为可选明文，不存输出，不保证未知秘密脱敏，不是不可篡改审计；不宣称任意 Shell 配置或外部模型兼容。"
     },
     "dependency_notices": {
       "status": "passed",
       "evidence": [
-        "https://github.com/yanch123/xyzaishell/actions/runs/38552926592",
-        "https://github.com/yanch123/xyzaishell/blob/0eb98a736c06609a6bdd7a789a18c6957a836093/docs/v0.1.1/release-evidence/01-automated-acceptance.md"
+        "https://github.com/yanch123/xyzaishell/actions/runs/38588091775",
+        "https://github.com/yanch123/xyzaishell/blob/main/docs/v0.1.2/release-evidence/01-automated-acceptance.md"
       ],
-      "notes": "两平台按锁定依赖生成第三方通知、Rust标准库告知、适用源码和WebView2 loader文本；实际NSIS/DEB安装后核实通知与源码资源存在及摘要。两平台安装包、锁文件、版本和精确提交由provenance校验。项目自身未选择额外开源许可证，不宣称替代所有法律判断。"
+      "notes": "Windows NSIS 与 Linux DEB 按锁文件构建，两平台 provenance 包含精确源码、版本、锁文件和产物摘要。构建核对已审阅的 WebView2 loader 摘要及告知文本；原生安装检查第三方与 Rust 标准库告知、适用源码资源集合及其摘要，不单独宣称已验证安装后的 loader 文件。项目未另行选择开源许可证，不替代所有法律判断。"
     },
     "version_upgrade": {
       "status": "passed",
       "evidence": [
-        "https://github.com/yanch123/xyzaishell/actions/runs/38552926592",
-        "https://github.com/yanch123/xyzaishell/blob/0eb98a736c06609a6bdd7a789a18c6957a836093/docs/v0.1.1/release-evidence/01-automated-acceptance.md"
+        "https://github.com/yanch123/xyzaishell/actions/runs/38588091775",
+        "https://github.com/yanch123/xyzaishell/blob/main/docs/v0.1.2/release-evidence/01-automated-acceptance.md"
       ],
-      "notes": "Windows Server 2022、Ubuntu 22.04和24.04均实际安装已发布且哈希固定的v0.1.0，使用旧版真实UI建立合成档案/聊天并重启，再直接安装v0.1.1；版本与二进制变化、配置指纹、文字及稳定任务ID保留均通过。使用独立临时数据目录，未以同版本重装替代升级；不代表Windows 10/11实机或任意旧版本升级。"
+      "notes": "三种托管原生环境均实际安装已发布且哈希固定的 v0.1.1，通过旧版 UI 建立合成连接和历史并重启，再安装 v0.1.2。检查版本及二进制变化、连接 ID/目标、完整历史行、只读恢复、模型配置与高级项保留，以及原连接文件备份字节一致和私有权限。Windows 备份 ACL 校验使用同一 pwsh 环境且失败即阻止。此元数据迁移测试不证明任意历史版本或旧加密凭据迁移。"
     }
   }
 }

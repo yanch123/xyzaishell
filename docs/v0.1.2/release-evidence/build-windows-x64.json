@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_commit": "bdd1d1ee9bd3a06cf8eabbcfe8a4ff59c1af192d",
+  "version": "0.1.2",
+  "platform": "windows-x64",
+  "bundle": "nsis",
+  "package_file": "xyzaishell-0.1.2-windows-x64.exe",
+  "package_sha256": "0235fdf844756c14c1ac3b6e838b5f94e6e5bf547c2aa5f020a1e0e06d7f6a1d",
+  "lockfiles": {
+    "Cargo.lock": "c702139185dc0d1dfbcc42e80fb739c036463d40c906912a40b074ff4c99ff70",
+    "package-lock.json": "7bb5e48e9dd6ba46be18c83877057649dd58ce49f021766f6b40b744ea14c170"
+  },
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: x86_64-pc-windows-msvc\nrelease: 1.99.0\nLLVM version: 23.1.1",
+  "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+  "node": "v22.23.3",
+  "runner_os": "Windows",
+  "runner_image": "win22",
+  "runner_image_version": "20261004.326.1",
+  "workflow_run": "38588091775",
+  "workflow_attempt": "1",
+  "signing": "No signing credential is supplied by this workflow.",
+  "acceptance": "Build and automated checks only; interactive desktop acceptance is separate."
+}

@@ -1,0 +1,13 @@
+{
+  "archiveSha256": "16AD3EA073E26F0000D1315E0A851EEB44B2754C66D47652E265CCE5DEA662AF",
+  "driverSha256": "C34A6B22814A18599F2A67BEF922BA879AE44158F216D4D2DF797D293F545665",
+  "limitation": "SHA256 records downloaded bytes; authenticity is checked using Microsoft Authenticode, not a vendor checksum manifest.",
+  "signer": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+  "runtimeVersion": "131.0.2903.86",
+  "userDataFolder": "D:\\a\\_temp\\xyz-native-51188101ac254f0aab9fe5b6c93fd819\\local\\webview2-user-data",
+  "signature": "Valid",
+  "runtimePath": "C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\131.0.2903.86\\msedgewebview2.exe",
+  "downloadUrl": "https://msedgedriver.microsoft.com/131.0.2903.86/edgedriver_win64.zip",
+  "driverVersion": "Microsoft Edge WebDriver 131.0.2903.86 (cf5bf303997cad93d7a0bede234d3c3dc01cc63d)",
+  "runtimeSelection": "Process-local WEBVIEW2_BROWSER_EXECUTABLE_FOLDER pins this installed runtime for the test"
+}

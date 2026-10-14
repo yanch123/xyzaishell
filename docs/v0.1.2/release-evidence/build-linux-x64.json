@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_commit": "bdd1d1ee9bd3a06cf8eabbcfe8a4ff59c1af192d",
+  "version": "0.1.2",
+  "platform": "linux-x64",
+  "bundle": "deb",
+  "package_file": "xyzaishell-0.1.2-linux-x64.deb",
+  "package_sha256": "f7b40ee8d320255f1aeb403580558faf77ee9cd8722983dd4b860f1b7693f780",
+  "lockfiles": {
+    "Cargo.lock": "c702139185dc0d1dfbcc42e80fb739c036463d40c906912a40b074ff4c99ff70",
+    "package-lock.json": "7bb5e48e9dd6ba46be18c83877057649dd58ce49f021766f6b40b744ea14c170"
+  },
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1",
+  "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+  "node": "v22.23.3",
+  "runner_os": "Linux",
+  "runner_image": "ubuntu22",
+  "runner_image_version": "20261004.315.1",
+  "workflow_run": "38588091775",
+  "workflow_attempt": "1",
+  "signing": "No signing credential is supplied by this workflow.",
+  "acceptance": "Build and automated checks only; interactive desktop acceptance is separate."
+}

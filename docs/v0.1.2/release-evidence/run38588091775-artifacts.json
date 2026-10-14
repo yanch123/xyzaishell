@@ -1,0 +1,154 @@
+[
+  {
+    "id": 11907715053,
+    "name": "native-acceptance-ubuntu-24.04",
+    "size_in_bytes": 3468946,
+    "url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11907715053",
+    "archive_download_url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11907715053/zip",
+    "expired": false,
+    "created_at": "2026-10-14T15:25:47Z",
+    "expires_at": "2026-10-28T15:25:45Z",
+    "updated_at": "2026-10-14T15:25:47Z",
+    "digest": "sha256:80d47587c77738067e6713b89ecda40a7d1d5ca40a70138cc8bb904754222153",
+    "workflow_run": {
+      "id": 38588091775,
+      "repository_id": 1416770987,
+      "head_repository_id": 1416770987,
+      "head_branch": "dev",
+      "head_sha": "bdd1d1ee9bd3a06cf8eabbcfe8a4ff59c1af192d"
+    }
+  },
+  {
+    "id": 11907590189,
+    "name": "native-acceptance-ubuntu-22.04",
+    "size_in_bytes": 3551279,
+    "url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11907590189",
+    "archive_download_url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11907590189/zip",
+    "expired": false,
+    "created_at": "2026-10-14T15:26:11Z",
+    "expires_at": "2026-10-28T15:26:10Z",
+    "updated_at": "2026-10-14T15:26:11Z",
+    "digest": "sha256:e330ac6734eb497fcc510e85a623897fbde5d35a941b1376f7df26069b8e0b19",
+    "workflow_run": {
+      "id": 38588091775,
+      "repository_id": 1416770987,
+      "head_repository_id": 1416770987,
+      "head_branch": "dev",
+      "head_sha": "bdd1d1ee9bd3a06cf8eabbcfe8a4ff59c1af192d"
+    }
+  },
+  {
+    "id": 11907035544,
+    "name": "native-acceptance-windows-2022",
+    "size_in_bytes": 2636600,
+    "url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11907035544",
+    "archive_download_url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11907035544/zip",
+    "expired": false,
+    "created_at": "2026-10-14T15:26:09Z",
+    "expires_at": "2026-10-28T15:26:07Z",
+    "updated_at": "2026-10-14T15:26:09Z",
+    "digest": "sha256:c9a06a38b2cf12bc126d3913e51f3deac2c462bde9ee46081112b98fb822e3a5",
+    "workflow_run": {
+      "id": 38588091775,
+      "repository_id": 1416770987,
+      "head_repository_id": 1416770987,
+      "head_branch": "dev",
+      "head_sha": "bdd1d1ee9bd3a06cf8eabbcfe8a4ff59c1af192d"
+    }
+  },
+  {
+    "id": 11906861184,
+    "name": "installers-windows-x64",
+    "size_in_bytes": 6533762,
+    "url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11906861184",
+    "archive_download_url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11906861184/zip",
+    "expired": false,
+    "created_at": "2026-10-14T15:22:48Z",
+    "expires_at": "2026-10-28T15:22:47Z",
+    "updated_at": "2026-10-14T15:22:48Z",
+    "digest": "sha256:381a44848947798ec6b5853781aa30d9598f6ff3edc8a0a68d748c564c4a94fc",
+    "workflow_run": {
+      "id": 38588091775,
+      "repository_id": 1416770987,
+      "head_repository_id": 1416770987,
+      "head_branch": "dev",
+      "head_sha": "bdd1d1ee9bd3a06cf8eabbcfe8a4ff59c1af192d"
+    }
+  },
+  {
+    "id": 11906501943,
+    "name": "installers-linux-x64",
+    "size_in_bytes": 11967081,
+    "url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11906501943",
+    "archive_download_url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11906501943/zip",
+    "expired": false,
+    "created_at": "2026-10-14T15:23:10Z",
+    "expires_at": "2026-10-28T15:23:09Z",
+    "updated_at": "2026-10-14T15:23:10Z",
+    "digest": "sha256:d3f6235c7cd6940eb7d8681ced703d4c1fa1d35e527ea3d6804ea0a501056efb",
+    "workflow_run": {
+      "id": 38588091775,
+      "repository_id": 1416770987,
+      "head_repository_id": 1416770987,
+      "head_branch": "dev",
+      "head_sha": "bdd1d1ee9bd3a06cf8eabbcfe8a4ff59c1af192d"
+    }
+  },
+  {
+    "id": 11906099757,
+    "name": "install-smoke-ubuntu-24.04",
+    "size_in_bytes": 9517,
+    "url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11906099757",
+    "archive_download_url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11906099757/zip",
+    "expired": false,
+    "created_at": "2026-10-14T15:24:31Z",
+    "expires_at": "2026-10-28T15:24:30Z",
+    "updated_at": "2026-10-14T15:24:31Z",
+    "digest": "sha256:1b0ec0df4baf386ddc2913d5ac11607ea490efc779c3b8a79c3450432262ebdd",
+    "workflow_run": {
+      "id": 38588091775,
+      "repository_id": 1416770987,
+      "head_repository_id": 1416770987,
+      "head_branch": "dev",
+      "head_sha": "bdd1d1ee9bd3a06cf8eabbcfe8a4ff59c1af192d"
+    }
+  },
+  {
+    "id": 11905954784,
+    "name": "install-smoke-ubuntu-22.04",
+    "size_in_bytes": 9251,
+    "url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11905954784",
+    "archive_download_url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11905954784/zip",
+    "expired": false,
+    "created_at": "2026-10-14T15:24:20Z",
+    "expires_at": "2026-10-28T15:24:19Z",
+    "updated_at": "2026-10-14T15:24:20Z",
+    "digest": "sha256:c83672f7d4c18450712972a781e4f4e187d361cffce49a65515180dc64efa93b",
+    "workflow_run": {
+      "id": 38588091775,
+      "repository_id": 1416770987,
+      "head_repository_id": 1416770987,
+      "head_branch": "dev",
+      "head_sha": "bdd1d1ee9bd3a06cf8eabbcfe8a4ff59c1af192d"
+    }
+  },
+  {
+    "id": 11905344326,
+    "name": "browser-preview-smoke",
+    "size_in_bytes": 3719463,
+    "url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11905344326",
+    "archive_download_url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11905344326/zip",
+    "expired": false,
+    "created_at": "2026-10-14T15:19:45Z",
+    "expires_at": "2026-10-28T15:19:44Z",
+    "updated_at": "2026-10-14T15:19:45Z",
+    "digest": "sha256:684562a032e6e6916aa0a5f4bb1706b0405b16ca94313d0b8a0d267aa71d993a",
+    "workflow_run": {
+      "id": 38588091775,
+      "repository_id": 1416770987,
+      "head_repository_id": 1416770987,
+      "head_branch": "dev",
+      "head_sha": "bdd1d1ee9bd3a06cf8eabbcfe8a4ff59c1af192d"
+    }
+  }
+]

@@ -1,0 +1,7 @@
+libgtk-3-0	
+libgtk-3-0t64:amd64	3.24.41-4ubuntu1.3
+libgtk-3-bin	
+libgtk-3-common	3.24.41-4ubuntu1.3
+libgtk-3-dev	
+libwebkit2gtk-4.1-0:amd64	2.52.6-0ubuntu0.24.04.1
+xyzaishell	0.1.2

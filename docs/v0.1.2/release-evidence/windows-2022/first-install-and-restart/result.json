@@ -1,0 +1,25 @@
+{
+  "result": "passed",
+  "phase": "seed",
+  "application": "D:\\a\\_temp\\xyz-native-51188101ac254f0aab9fe5b6c93fd819\\installed-app\\xyzaishell.exe",
+  "application_sha256": "f4a4702ed4ac545018176de5e05cbc50991215954e76bedefdb5e9baecd751de",
+  "application_version": "0.1.2",
+  "upgrade_from": null,
+  "native_ipc": true,
+  "synthetic_loopback_model": true,
+  "profile_and_history_persisted": true,
+  "restored_task_identity_preserved": true,
+  "history_requires_new_process_consent": true,
+  "restore_model_requests": 0,
+  "shell_log_empty_export_fail_closed": true,
+  "profile_id_preserved": true,
+  "legacy_history_rows_and_protected_profile_backup_verified": false,
+  "model_settings_saved_and_tested_via_ui": true,
+  "not_tested": [
+    "real provider",
+    "SSH via UI",
+    "desktop input methods",
+    "Windows 10/11",
+    "version upgrade in this phase"
+  ]
+}
