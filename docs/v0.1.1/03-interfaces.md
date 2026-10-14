@@ -6,7 +6,7 @@
 
 id、全局 sequence、SSH session_id/generation、shell_id/sequence、host/port/username、started_at_ms（本机收到）、finished_at_ms、remote_started_at（远端报告）、command、cwd（执行前物理路径）、status（running/completed/unknown）、exit_code、redacted。
 
-同一 Shell 的手动/AI 命令按同一方式采集，不推断输入来源。completed 表示收到了返回提示符事件，不等于返回码为零，也不能证明后台子进程结束。
+同一 Shell 的手动/AI 命令按同一方式采集，不推断输入来源。running 仅表示已经记录开始、尚未记录结束，不能证明进程当前仍运行。completed 表示收到了返回提示符事件，不等于返回码为零，也不能证明后台子进程结束。
 
 ## Tauri IPC
 

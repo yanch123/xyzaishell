@@ -19,3 +19,8 @@ pub mod storage;
 pub mod history;
 pub mod persistence;
 pub mod task_secrets;
+
+pub mod shell_log;
+pub mod shell_log_protocol;
+pub mod shell_log_store;
+pub mod shell_log_types;

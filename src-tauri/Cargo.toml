@@ -8,6 +8,7 @@ rust-version.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+base64 = "0.22"
 serde.workspace = true
 tauri = { version = "2", features = [] }
 xyz-core = { path = "../crates/xyz-core" }

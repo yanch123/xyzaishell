@@ -261,6 +261,7 @@ struct Inner {
     state: Mutex<ManagerState>,
     sink: EventSink,
     observation: crate::observation::ObservationBuffer,
+    shell_log: Mutex<Option<crate::shell_log::ShellLogService>>,
     trust: Result<Option<Arc<crate::storage::trust::KnownHostsStore>>, ApiError>,
 }
 struct ManagerState {
@@ -314,6 +315,7 @@ impl SessionManager {
                 sink,
                 trust,
                 observation: crate::observation::ObservationBuffer::default(),
+                shell_log: Mutex::new(None),
                 state: Mutex::new(ManagerState {
                     snapshot: SessionSnapshot {
                         revision: "0".into(),
@@ -336,6 +338,21 @@ impl SessionManager {
     }
     fn lock(&self) -> MutexGuard<'_, ManagerState> {
         self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Attach once during host initialization, before a connection is opened.
+    pub fn attach_shell_log(&self, service: crate::shell_log::ShellLogService) {
+        *self
+            .inner
+            .shell_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(service);
+    }
+    fn shell_log(&self) -> Option<crate::shell_log::ShellLogService> {
+        self.inner
+            .shell_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
     pub fn observation(&self) -> crate::observation::ObservationBuffer {
         self.inner.observation.clone()
@@ -611,7 +628,14 @@ impl SessionManager {
                     live.unacked.push_back((*seq, permit));
                 }
             }
-            self.inner.observation.push(session, chunk);
+            // Metadata is passive and must not become an AI observation. Keep the
+            // original bytes/seq for the visible terminal and its backpressure ACK.
+            if let Some(log) = self.shell_log() {
+                let visible = log.ingest(session, chunk);
+                self.inner.observation.push(session, &visible);
+            } else {
+                self.inner.observation.push(session, chunk);
+            }
             self.emit(SshEvent::Output {
                 session: session.clone(),
                 seq: seq.to_string(),
@@ -670,6 +694,9 @@ impl SessionManager {
             state.snapshot.host_key = None;
             state.snapshot.clone()
         };
+        if let Some(log) = self.shell_log() {
+            log.disconnect(&session);
+        }
         let _ = self.emit(SshEvent::State { snapshot });
     }
     async fn run_connected(

@@ -6,7 +6,7 @@ import type { ModelChatController } from '../hooks/useModelChat';
 
 export function SettingsDialog({ onClose, model, onConsent, onTest, onHistoryStatus }: { onClose: () => void; model: ModelChatController; onConsent: () => void; onTest: () => Promise<void>; onHistoryStatus?: (status: HistoryStatus) => void }) {
   const { config } = model;
-  return <Modal title="工作空间设置" eyebrow="XYZAI SHELL · v0.1" onClose={onClose} className="settings-modal">
+  return <Modal title="工作空间设置" eyebrow="XYZAI SHELL · v0.1.1" onClose={onClose} className="settings-modal">
     <div className="settings-section"><div className="settings-icon"><Icon name="spark" /></div><div className="settings-content"><h3>模型连接 <span className={config.ready ? 'feature-badge' : 'subtle-badge'}>{!model.native ? '网页预览' : config.ready ? '配置已加载' : '需要配置'}</span></h3>
       <p>OpenAI-compatible Chat Completions 流式聊天。默认聊天仅在当前应用进程内存保留；可在下方明确启用本机明文历史。服务提供方可能保留请求。</p>
       <dl className="model-details"><div><dt>配置路径</dt><dd className="selectable-path">{config.path ?? (model.native ? '正在读取本机配置路径…' : '桌面应用中显示实际路径')}</dd></div><div><dt>请求地址</dt><dd>{config.destination ?? '尚未加载'}</dd></div><div><dt>模型</dt><dd>{config.model ?? '尚未配置'}</dd></div><div><dt>聊天接收方确认</dt><dd>{config.consented ? '当前配置已确认' : '尚未确认'}</dd></div></dl>

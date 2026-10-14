@@ -1,10 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use xyz_core::agent::{
     AckTerminalAction, AgentManager, ContinueTerminalTask, DecideTerminalAction, EnsureTaskSecrets,
     PrepareSecretInput, StartTerminalTask, TaskRunRequest, TaskSecretsView, TerminalTaskSnapshot,
+};
+use xyz_core::shell_log::ShellLogService;
+use xyz_core::shell_log_types::{
+    ExportFormat, ShellLogExport, ShellLogPage, ShellLogQuery, ShellLogStatus,
 };
 use xyz_core::ssh::{
     ApiError, ConnectRequest, HostKeyDecision, SessionManager, SessionRef, SessionSnapshot,
@@ -339,6 +344,97 @@ async fn forget_saved_chat(
     .map_err(|_| worker_error())?
 }
 
+#[tauri::command]
+fn get_shell_log_status(state: State<'_, ShellLogService>) -> ShellLogStatus {
+    state.status()
+}
+
+#[tauri::command]
+async fn start_shell_log(
+    session: SessionRef,
+    consent: bool,
+    readiness_confirmed: bool,
+    state: State<'_, ShellLogService>,
+    ssh: State<'_, SessionManager>,
+) -> Result<ShellLogStatus, ApiError> {
+    if !readiness_confirmed || !consent {
+        return Err(ApiError::new(
+            "SHELL_LOG_CONSENT_REQUIRED",
+            "Confirm local plaintext logging and an idle compatible shell prompt.",
+        ));
+    }
+    let snapshot = ssh.snapshot();
+    if snapshot.session.as_ref() != Some(&session)
+        || snapshot.state != xyz_core::ssh::SessionState::Connected
+    {
+        return Err(ApiError::new(
+            "SESSION_NOT_CONNECTED",
+            "Reconnect and confirm the current terminal before enabling shell logging.",
+        ));
+    }
+    let service = state.inner().clone();
+    let bootstrap = tauri::async_runtime::spawn_blocking(move || service.start(snapshot, consent))
+        .await
+        .map_err(|_| worker_error())??;
+    // Explicit user action, same visible PTY; never repeat an uncertain write.
+    if let Err(error) = ssh
+        .write(&session, &STANDARD.encode(bootstrap.as_bytes()))
+        .await
+    {
+        state.fail_start(&session, error.clone());
+        return Err(error);
+    }
+    Ok(state.status())
+}
+
+#[tauri::command]
+async fn set_shell_log_paused(
+    paused: bool,
+    state: State<'_, ShellLogService>,
+    ssh: State<'_, SessionManager>,
+) -> Result<ShellLogStatus, ApiError> {
+    let service = state.inner().clone();
+    let session = ssh.snapshot().session;
+    tauri::async_runtime::spawn_blocking(move || {
+        if paused {
+            service.pause()
+        } else {
+            let session = session.ok_or_else(|| {
+                ApiError::new(
+                    "SESSION_NOT_CONNECTED",
+                    "Connect before resuming shell logging.",
+                )
+            })?;
+            service.resume(&session)
+        }
+    })
+    .await
+    .map_err(|_| worker_error())?
+}
+
+#[tauri::command]
+async fn query_shell_log(
+    query: ShellLogQuery,
+    state: State<'_, ShellLogService>,
+) -> Result<ShellLogPage, ApiError> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.query(query))
+        .await
+        .map_err(|_| worker_error())?
+}
+
+#[tauri::command]
+async fn export_shell_log(
+    query: ShellLogQuery,
+    format: ExportFormat,
+    state: State<'_, ShellLogService>,
+) -> Result<ShellLogExport, ApiError> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.export(query, format))
+        .await
+        .map_err(|_| worker_error())?
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -348,6 +444,16 @@ fn main() {
                 Arc::new(move |event| handle.emit("ssh:event", event).is_ok()),
                 storage.configuration_root(),
             );
+            let log_handle = app.handle().clone();
+            let shell_log = ShellLogService::new(
+                xyz_core::history::resolve_history_root(),
+                ssh.observation(),
+                Arc::new(move |status| {
+                    let _ = log_handle.emit("shell-log:status", status);
+                }),
+            );
+            ssh.attach_shell_log(shell_log.clone());
+            app.manage(shell_log);
             let task_secrets = storage
                 .configuration_root()
                 .and_then(|root| xyz_core::task_secrets::TaskSecrets::open(&root))
@@ -385,6 +491,11 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_shell_log_status,
+            start_shell_log,
+            set_shell_log_paused,
+            query_shell_log,
+            export_shell_log,
             get_history_status,
             set_history_enabled,
             list_saved_chats,
@@ -428,6 +539,14 @@ fn main() {
         .expect("Unable to start xyzaishell desktop host")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(log) = app.try_state::<ShellLogService>() {
+                    if let Some(ssh) = app.try_state::<SessionManager>() {
+                        if let Some(session) = ssh.snapshot().session {
+                            log.disconnect(&session);
+                        }
+                    }
+                    let _ = log.flush();
+                }
                 if let Some(tasks) = app.try_state::<TaskManager>() {
                     let _ = tasks.flush_history();
                 }

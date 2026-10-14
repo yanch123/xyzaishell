@@ -1,0 +1,13 @@
+.shell-log-dialog { width: min(960px, calc(100vw - 40px)); max-width: 960px; }
+.shell-log-body { overflow: auto; padding: 0 24px 24px; max-height: 76vh; font-size: 13px; line-height: 1.65; }
+.shell-log-consent { display: grid; gap: 10px; margin: 14px 0; }
+.shell-log-consent label { display: flex; align-items: baseline; gap: 8px; }
+.shell-log-consent button { justify-self: start; }
+.shell-log-tools { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin: 16px 0; }
+.shell-log-tools label { display: grid; gap: 4px; flex: 1; }
+.shell-log-tools input, .shell-log-export input { min-width: 160px; width: 100%; padding: 7px; color: inherit; background: transparent; border: 1px solid #7776; border-radius: 4px; }
+.shell-log-entries article { border: 1px solid #7774; padding: 12px; margin: 10px 0; border-radius: 6px; overflow-wrap: anywhere; }
+.shell-log-command, .shell-log-text { white-space: pre-wrap; overflow-wrap: anywhere; unicode-bidi: plaintext; }
+.shell-log-command { max-height: 300px; overflow: auto; padding: 10px; background: #7771; }
+.shell-log-export { display: grid; gap: 8px; }
+.shell-log-body summary { cursor: pointer; }

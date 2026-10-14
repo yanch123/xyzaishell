@@ -394,7 +394,7 @@ impl PrivateDirectory {
     /// Precreates a private database without replacement. Existing zero-length
     /// files return false so the history layer can flag possible data loss.
     pub fn prepare_database_file(&self, filename: &str, max: usize) -> Result<bool> {
-        if filename != "history.sqlite3" {
+        if !matches!(filename, "history.sqlite3" | "shell-log.sqlite3") {
             return Err(E::InvalidPath);
         }
         let identity = checked::Identity::effective().map_err(mapped)?;
@@ -427,6 +427,10 @@ impl PrivateDirectory {
                 | "history.sqlite3-journal"
                 | "history.sqlite3-wal"
                 | "history.sqlite3-shm"
+                | "shell-log.sqlite3"
+                | "shell-log.sqlite3-journal"
+                | "shell-log.sqlite3-wal"
+                | "shell-log.sqlite3-shm"
         ) {
             return Err(E::InvalidPath);
         }

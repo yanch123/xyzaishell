@@ -145,7 +145,7 @@ impl PrivateDirectory {
     /// Securely creates only a new empty SQLite database; never truncates or
     /// replaces an existing file. The caller initializes schema transactionally.
     pub fn prepare_database_file(&self, filename: &str, max: usize) -> Result<bool> {
-        if filename != "history.sqlite3" {
+        if !matches!(filename, "history.sqlite3" | "shell-log.sqlite3") {
             return Err(E::InvalidPath);
         }
         directory(&self.directory, true)?;
@@ -180,6 +180,10 @@ impl PrivateDirectory {
                 | "history.sqlite3-journal"
                 | "history.sqlite3-wal"
                 | "history.sqlite3-shm"
+                | "shell-log.sqlite3"
+                | "shell-log.sqlite3-journal"
+                | "shell-log.sqlite3-wal"
+                | "shell-log.sqlite3-shm"
         ) {
             return Err(E::InvalidPath);
         }
