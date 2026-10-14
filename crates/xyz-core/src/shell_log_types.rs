@@ -20,6 +20,9 @@ pub struct ShellLogEntry {
     pub sequence: String,
     pub session_id: String,
     pub generation: String,
+    /// Immutable saved-profile association; old and temporary sessions remain unknown.
+    #[serde(default)]
+    pub profile_id: Option<String>,
     pub shell_id: String,
     pub shell_sequence: String,
     pub host: String,
@@ -39,6 +42,10 @@ pub struct ShellLogEntry {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellLogQuery {
+    pub profile_id: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub username: Option<String>,
     pub session_id: Option<String>,
     pub from_ms: Option<i64>,
     pub to_ms: Option<i64>,

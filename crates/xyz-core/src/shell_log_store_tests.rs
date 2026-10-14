@@ -23,6 +23,7 @@ fn entry() -> ShellLogEntry {
         sequence: String::new(),
         session_id: id(),
         generation: "1".into(),
+        profile_id: None,
         shell_id: id(),
         shell_sequence: "1".into(),
         host: "synthetic.invalid".into(),
@@ -433,4 +434,103 @@ fn finish_clamps_backwards_local_clock() {
         .entries
         .remove(0);
     assert_eq!(e.finished_at_ms, Some(e.started_at_ms));
+}
+
+#[test]
+fn v1_upgrade_preserves_payload_and_unknown_profile() {
+    let f = Fixture::new();
+    drop(f.open());
+    let c = Connection::open(f.0.join(DATABASE_NAME)).unwrap();
+    c.execute_batch("DROP TABLE shell_logs").unwrap();
+    c.execute_batch(SCHEMA_V1).unwrap();
+    c.pragma_update(None, "user_version", 1).unwrap();
+    let mut e = entry();
+    e.sequence = "1".into();
+    let mut payload = serde_json::to_value(&e).unwrap();
+    payload.as_object_mut().unwrap().remove("profile_id");
+    let raw = serde_json::to_string(&payload).unwrap();
+    c.execute("INSERT INTO shell_logs(sequence,id,session_id,started_ms,command,payload) VALUES(1,?1,?2,?3,?4,?5)", params![e.id,e.session_id,e.started_at_ms,e.command,raw]).unwrap();
+    drop(c);
+    let s = f.open();
+    let page = s.query(&ShellLogQuery::default(), unchanged).unwrap();
+    assert_eq!(page.entries, vec![e]);
+    let raw_after: String = s
+        .connection
+        .query_row("SELECT payload FROM shell_logs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(raw_after, raw);
+    assert_eq!(
+        s.connection
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    drop(s);
+    assert_eq!(f.open().count().unwrap(), 1);
+}
+
+#[test]
+fn profile_and_server_scopes_preserve_historical_targets() {
+    let f = Fixture::new();
+    let mut s = f.open();
+    let profile = id();
+    let mut e = entry();
+    e.profile_id = Some(profile.clone());
+    e.host = "old.invalid".into();
+    s.append(&e, unchanged).unwrap();
+    e.id = id();
+    e.session_id = id();
+    e.host = "new.invalid".into();
+    s.append(&e, unchanged).unwrap();
+    e.id = id();
+    e.session_id = id();
+    e.profile_id = Some(id());
+    s.append(&e, unchanged).unwrap();
+    let q = ShellLogQuery {
+        profile_id: Some(profile),
+        limit: Some(1),
+        ..Default::default()
+    };
+    let page = s.query(&q, unchanged).unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].host, "new.invalid");
+    assert!(page.next_before_seq.is_some());
+    let mut next = q.clone();
+    next.before_seq = page.next_before_seq;
+    next.snapshot_max_seq = Some(page.snapshot_max_seq);
+    let page = s.query(&next, unchanged).unwrap();
+    assert_eq!(page.entries[0].host, "old.invalid");
+    let exported = s.export(&q, ExportFormat::Json, unchanged).unwrap();
+    assert_eq!(exported.records, 2); // Export includes all matching rows, not one page.
+    let server = ShellLogQuery {
+        host: Some("new.invalid".into()),
+        port: Some(22),
+        username: Some("fixture".into()),
+        ..Default::default()
+    };
+    assert_eq!(s.query(&server, unchanged).unwrap().entries.len(), 2);
+    let wrong = ShellLogQuery {
+        port: Some(2222),
+        ..server
+    };
+    assert!(s.query(&wrong, unchanged).unwrap().entries.is_empty());
+}
+
+#[test]
+fn profile_payload_column_mismatch_is_rejected() {
+    let f = Fixture::new();
+    let mut s = f.open();
+    let e = s.append(&entry(), unchanged).unwrap();
+    s.connection
+        .execute(
+            "UPDATE shell_logs SET profile_id=?1 WHERE id=?2",
+            params![id(), e.id],
+        )
+        .unwrap();
+    assert!(matches!(
+        s.query(&ShellLogQuery::default(), unchanged),
+        Err(E::Corrupt)
+    ));
+    drop(s);
+    assert!(matches!(ShellLogStore::open(&f.0), Err(E::Corrupt)));
 }

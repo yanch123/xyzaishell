@@ -26,7 +26,9 @@ pub const MAX_EXPORT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PAYLOAD: usize = 128 * 1024;
 const ACCESS_LOCK: &str = "shell-log.access";
 const APP_ID: i64 = 0x58595a53;
-const SCHEMA: &str = "CREATE TABLE shell_logs (sequence INTEGER PRIMARY KEY CHECK(sequence > 0), id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL, started_ms INTEGER NOT NULL CHECK(started_ms >= 0), command TEXT NOT NULL CHECK(length(CAST(command AS BLOB)) <= 16384), payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 131072)) STRICT";
+const SCHEMA_V1: &str = "CREATE TABLE shell_logs (sequence INTEGER PRIMARY KEY CHECK(sequence > 0), id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL, started_ms INTEGER NOT NULL CHECK(started_ms >= 0), command TEXT NOT NULL CHECK(length(CAST(command AS BLOB)) <= 16384), payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 131072)) STRICT";
+
+const SCHEMA: &str = "CREATE TABLE shell_logs (sequence INTEGER PRIMARY KEY CHECK(sequence > 0), id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL, started_ms INTEGER NOT NULL CHECK(started_ms >= 0), command TEXT NOT NULL CHECK(length(CAST(command AS BLOB)) <= 16384), payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 131072), profile_id TEXT) STRICT";
 
 pub struct ShellLogStore {
     connection: Connection,
@@ -81,8 +83,29 @@ impl ShellLogStore {
             }
             tx.execute_batch(SCHEMA)?;
             tx.pragma_update(None, "application_id", APP_ID)?;
-            tx.pragma_update(None, "user_version", 1)?;
-        } else if version != 1 || app != APP_ID {
+            tx.pragma_update(None, "user_version", 2)?;
+        } else if version == 1 && app == APP_ID {
+            // Validate the old exact schema and every payload before touching it.
+            verify_schema_version(&tx, SCHEMA_V1)?;
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT sequence,id,session_id,started_ms,command,payload,NULL FROM shell_logs",
+                )?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let old = decode(row)?;
+                    if old.profile_id.is_some() {
+                        return Err(E::Corrupt);
+                    }
+                }
+            }
+            // Transactional rebuild preserves every original payload and leaves
+            // historical profile associations unknown, never guessed from labels.
+            tx.execute_batch("ALTER TABLE shell_logs RENAME TO shell_logs_v1")?;
+            tx.execute_batch(SCHEMA)?;
+            tx.execute_batch("INSERT INTO shell_logs(sequence,id,session_id,started_ms,command,payload,profile_id) SELECT sequence,id,session_id,started_ms,command,payload,NULL FROM shell_logs_v1; DROP TABLE shell_logs_v1;")?;
+            tx.pragma_update(None, "user_version", 2)?;
+        } else if version != 2 || app != APP_ID {
             return Err(E::UnsupportedSchema);
         }
         verify_schema(&tx)?;
@@ -106,9 +129,9 @@ impl ShellLogStore {
         tx.commit().map_err(commit_error)?;
         check_files(&store.directory)?;
         // Validate persisted rows without retaining the complete archive in RAM.
-        let mut stmt = store
-            .connection
-            .prepare("SELECT sequence,id,session_id,started_ms,command,payload FROM shell_logs")?;
+        let mut stmt = store.connection.prepare(
+            "SELECT sequence,id,session_id,started_ms,command,payload,profile_id FROM shell_logs",
+        )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             decode(row)?;
@@ -139,7 +162,7 @@ impl ShellLogStore {
         let mode: String = self
             .connection
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
-        if cookie != self.schema_cookie || app != APP_ID || version != 1 || mode != "delete" {
+        if cookie != self.schema_cookie || app != APP_ID || version != 2 || mode != "delete" {
             return Err(E::UnsupportedSchema);
         }
         Ok(())
@@ -162,7 +185,7 @@ impl ShellLogStore {
             let sequence = max.checked_add(1).ok_or(E::LimitReached)?;
             entry.sequence = sequence.to_string();
             let payload = encode(&entry)?;
-            tx.execute("INSERT INTO shell_logs(sequence,id,session_id,started_ms,command,payload) VALUES(?1,?2,?3,?4,?5,?6)", params![sequence,entry.id,entry.session_id,entry.started_at_ms,entry.command,payload])?;
+            tx.execute("INSERT INTO shell_logs(sequence,id,session_id,started_ms,command,payload,profile_id) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![sequence,entry.id,entry.session_id,entry.started_at_ms,entry.command,payload,entry.profile_id])?;
             tx.commit().map_err(commit_error)?;
             Ok(entry)
         })
@@ -183,7 +206,7 @@ impl ShellLogStore {
         self.access_mut(|s| {
             s.guard()?;
             let tx = s.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let mut stmt = tx.prepare("SELECT sequence,id,session_id,started_ms,command,payload FROM shell_logs WHERE id=?1")?;
+            let mut stmt = tx.prepare("SELECT sequence,id,session_id,started_ms,command,payload,profile_id FROM shell_logs WHERE id=?1")?;
             let mut rows = stmt.query([id])?;
             let mut entry = decode(rows.next()?.ok_or(E::NotFound)?)?;
             drop(rows); drop(stmt);
@@ -260,9 +283,9 @@ impl ShellLogStore {
             let mut output = BoundedOutput(Vec::new());
             if matches!(format, ExportFormat::Json) {
                 let exported_at_ms = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| E::Unavailable)?.as_millis()).map_err(|_| E::Unavailable)?;
-                write!(output, "{{\"schema_version\":1,\"exported_at_ms\":{exported_at_ms},\"snapshot_max_seq\":\"{max}\",\"entries\":[").map_err(|_| E::LimitReached)?;
+                write!(output, "{{\"schema_version\":2,\"exported_at_ms\":{exported_at_ms},\"snapshot_max_seq\":\"{max}\",\"entries\":[").map_err(|_| E::LimitReached)?;
             }
-            else { output.write_all(b"id,sequence,session_id,generation,shell_id,shell_sequence,host,port,username,started_at_ms,finished_at_ms,remote_started_at,command,cwd,status,exit_code,redacted\r\n").map_err(|_| E::LimitReached)?; }
+            else { output.write_all(b"id,sequence,session_id,generation,shell_id,shell_sequence,host,port,username,started_at_ms,finished_at_ms,remote_started_at,command,cwd,status,exit_code,redacted,profile_id\r\n").map_err(|_| E::LimitReached)?; }
             let mut count = 0;
             loop {
                 let entries = collect_page(&tx, &query, max, 200)?;
@@ -312,12 +335,15 @@ fn check_files(directory: &PrivateDirectory) -> Result<()> {
     check_sidecars(directory)
 }
 fn verify_schema(connection: &Connection) -> Result<()> {
+    verify_schema_version(connection, SCHEMA)
+}
+fn verify_schema_version(connection: &Connection, schema: &str) -> Result<()> {
     let mut stmt = connection.prepare("SELECT type,name,sql FROM sqlite_schema ORDER BY name")?;
     let actual: Vec<(String, String, Option<String>)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<std::result::Result<_, _>>()?;
     let expected = vec![
-        ("table".into(), "shell_logs".into(), Some(SCHEMA.into())),
+        ("table".into(), "shell_logs".into(), Some(schema.into())),
         ("index".into(), "sqlite_autoindex_shell_logs_1".into(), None),
     ];
     if actual != expected {
@@ -354,6 +380,9 @@ fn number(value: &str, allow_zero: bool) -> Result<i64> {
 fn validate(e: &ShellLogEntry) -> Result<()> {
     valid_id(&e.id)?;
     valid_id(&e.session_id)?;
+    if let Some(id) = &e.profile_id {
+        valid_id(id)?;
+    }
     // shell_id is a bounded integration nonce, not necessarily a UUID.
     if e.shell_id.is_empty()
         || e.shell_id.len() > 128
@@ -417,12 +446,24 @@ fn decode(row: &rusqlite::Row<'_>) -> Result<ShellLogEntry> {
         || e.session_id != row.get::<_, String>(2)?
         || e.started_at_ms != row.get::<_, i64>(3)?
         || e.command != row.get::<_, String>(4)?
+        || e.profile_id != row.get::<_, Option<String>>(6)?
     {
         return Err(E::Corrupt);
     }
     Ok(e)
 }
 fn validate_query(q: &ShellLogQuery) -> Result<()> {
+    if let Some(id) = &q.profile_id {
+        valid_id(id)?;
+    }
+    if q.port == Some(0)
+        || [&q.host, &q.username].iter().any(|v| {
+            v.as_ref()
+                .is_some_and(|s| s.is_empty() || s.len() > 1024 || s.contains('\0'))
+        })
+    {
+        return Err(E::InvalidRecord);
+    }
     if let Some(id) = &q.session_id {
         valid_id(id)?;
     }
@@ -463,7 +504,7 @@ fn collect_page(
         .as_deref()
         .map(|v| number(v, false))
         .transpose()?;
-    let mut stmt = c.prepare("SELECT sequence,id,session_id,started_ms,command,payload FROM shell_logs WHERE sequence<=?1 AND (?2 IS NULL OR sequence<?2) AND (?3 IS NULL OR session_id=?3) AND (?4 IS NULL OR started_ms>=?4) AND (?5 IS NULL OR started_ms<=?5) AND (?6 IS NULL OR instr(command,?6)>0) ORDER BY sequence DESC LIMIT ?7")?;
+    let mut stmt = c.prepare("SELECT sequence,id,session_id,started_ms,command,payload,profile_id FROM shell_logs WHERE sequence<=?1 AND (?2 IS NULL OR sequence<?2) AND (?3 IS NULL OR session_id=?3) AND (?4 IS NULL OR started_ms>=?4) AND (?5 IS NULL OR started_ms<=?5) AND (?6 IS NULL OR instr(command,?6)>0) AND (?8 IS NULL OR profile_id=?8) AND (?9 IS NULL OR json_extract(payload,'$.host')=?9) AND (?10 IS NULL OR json_extract(payload,'$.port')=?10) AND (?11 IS NULL OR json_extract(payload,'$.username')=?11) ORDER BY sequence DESC LIMIT ?7")?;
     let mut rows = stmt.query(params![
         max,
         before,
@@ -471,7 +512,11 @@ fn collect_page(
         q.from_ms,
         q.to_ms,
         q.contains,
-        limit as i64
+        limit as i64,
+        q.profile_id,
+        q.host,
+        q.port,
+        q.username
     ])?;
     let mut result = Vec::new();
     while let Some(row) = rows.next()? {
@@ -516,6 +561,7 @@ fn write_csv(output: &mut BoundedOutput, e: &ShellLogEntry) -> Result<()> {
         .into(),
         e.exit_code.map(|n| n.to_string()).unwrap_or_default(),
         e.redacted.to_string(),
+        e.profile_id.clone().unwrap_or_default(),
     ];
     for (i, field) in fields.iter().enumerate() {
         if i > 0 {

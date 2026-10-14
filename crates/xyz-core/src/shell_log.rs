@@ -475,6 +475,7 @@ impl ShellLogService {
                     || username_clean != snapshot.username.as_deref().unwrap_or_default();
                 let id = Uuid::new_v4().to_string();
                 let entry = ShellLogEntry {
+                    profile_id: None,
                     id: id.clone(),
                     sequence: "0".into(),
                     session_id: session.session_id.clone(),
