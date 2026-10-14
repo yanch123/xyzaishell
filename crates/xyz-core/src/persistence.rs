@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     path::Path,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -52,6 +53,9 @@ const PAGE_SIZE: usize = 4096;
 const APPLICATION_ID: i64 = 0x58595a48;
 const SCHEMA_VERSION: i64 = 1;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+// Keep the original startup lock name so initialization and every subsequent
+// operation participate in one protocol. Never replace/delete this lock file.
+const ACCESS_LOCK: &str = "history.initialize";
 const CHAT_SCHEMA: &str = "CREATE TABLE chats (chat_id TEXT PRIMARY KEY NOT NULL, task_id TEXT UNIQUE NOT NULL, revision INTEGER NOT NULL CHECK(revision > 0), listed INTEGER NOT NULL CHECK(listed IN (0,1)), updated_ms INTEGER NOT NULL CHECK(updated_ms >= 0), payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 2097152)) STRICT";
 const METADATA_SCHEMA: &str = "CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL CHECK(revision >= 0)) STRICT";
 const AUDIT_SCHEMA: &str = "CREATE TABLE audit (event_id TEXT PRIMARY KEY NOT NULL, chat_id TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE, run_id TEXT, kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 8), created_ms INTEGER NOT NULL CHECK(created_ms >= 0)) STRICT";
@@ -89,6 +93,15 @@ impl std::fmt::Display for HistoryError {
 impl std::error::Error for HistoryError {}
 impl From<rusqlite::Error> for HistoryError {
     fn from(error: rusqlite::Error) -> Self {
+        // Test diagnostics contain numeric SQLite codes only, never its raw
+        // message (which can contain SQL, paths or stored text).
+        #[cfg(test)]
+        if let rusqlite::Error::SqliteFailure(code, _) = &error {
+            eprintln!(
+                "history SQLite failure: primary={:?}, extended={}",
+                code.code, code.extended_code
+            );
+        }
         // Never leak SQL, data, paths, credential values or raw SQLite errors.
         match error.sqlite_error_code() {
             Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => Self::Busy,
@@ -101,6 +114,8 @@ impl From<rusqlite::Error> for HistoryError {
 }
 impl From<StorageError> for HistoryError {
     fn from(error: StorageError) -> Self {
+        #[cfg(test)]
+        eprintln!("history private-file failure: {error:?}");
         match error {
             StorageError::InvalidPath => Self::InvalidPath,
             StorageError::UnsafeFile | StorageError::UnsupportedFilesystem => Self::UnsafeFile,
@@ -284,7 +299,7 @@ pub struct AuditRecord {
 pub struct HistoryStore {
     // Drop connection before releasing the directory handles/ancestor pins.
     connection: Connection,
-    directory: PrivateDirectory,
+    directory: Arc<PrivateDirectory>,
     preference: HistoryPreference,
     schema_cookie: i64,
 }
@@ -296,10 +311,10 @@ impl HistoryStore {
             return Err(HistoryError::Disabled);
         }
         let initialization = PrivateDirectory::open_or_create(path)?;
-        // Serialize only startup using a separate stable private lock. This
-        // closes the new-empty-file/schema-init race without ever replacing or
-        // locking through the pathname of a live SQLite database.
-        initialization.update("history.initialize", 0, |_| {
+        // Serialize startup and runtime file checks/transactions together.
+        // Otherwise another instance can delete its rollback journal while we
+        // inspect its metadata, before SQLite's own busy handler can help.
+        initialization.update(ACCESS_LOCK, 0, |_| {
             let directory = PrivateDirectory::open_or_create(path)?;
             Ok((Self::open_initialized(path, directory, preference), None))
         })?
@@ -331,7 +346,7 @@ impl HistoryStore {
         connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=0; PRAGMA secure_delete=ON; PRAGMA synchronous=EXTRA;")?;
         let mut store = Self {
             connection,
-            directory,
+            directory: Arc::new(directory),
             preference,
             schema_cookie: 0,
         };
@@ -400,9 +415,35 @@ impl HistoryStore {
         tx.commit().map_err(commit_error)?;
         // Verify all bounded historical rows now, instead of silently skipping
         // a damaged record and telling the user their transcript is empty.
-        self.list(true)?;
+        self.list_locked(true)?;
         self.validate_all_audit()?;
         Ok(())
+    }
+
+    // The private-file checks must precede SQLite access, but SQLite's locks do
+    // not cover those checks. Hold a separate stable cross-process file lock
+    // until each transaction/statement is dropped, including reads and startup.
+    // This prevents a cooperating writer's journal deletion from racing the
+    // metadata checks (notably Windows STATUS_DELETE_PENDING). SQLite IMMEDIATE
+    // transactions and expected-revision checks remain authoritative for CAS.
+    // The access lock has PrivateDirectory's bounded five-second wait; SQLite
+    // retains its independent two-second busy timeout for foreign connections.
+    // Foreign/noncooperating file changes still fail closed; never retry an
+    // uncertain commit or turn a filesystem error into a revision conflict.
+    fn with_access<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        if self.preference != HistoryPreference::SaveRedactedText {
+            return Err(HistoryError::Disabled);
+        }
+        self.directory
+            .update(ACCESS_LOCK, 0, |_| Ok((operation(self), None)))?
+    }
+
+    fn with_access_mut<T>(&mut self, operation: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if self.preference != HistoryPreference::SaveRedactedText {
+            return Err(HistoryError::Disabled);
+        }
+        let directory = Arc::clone(&self.directory);
+        directory.update(ACCESS_LOCK, 0, |_| Ok((operation(self), None)))?
     }
 
     fn guard(&self) -> Result<()> {
@@ -414,6 +455,10 @@ impl HistoryStore {
     }
 
     pub fn create(&mut self, prepared: &RedactedChat) -> Result<StoredChat> {
+        self.with_access_mut(|store| store.create_locked(prepared))
+    }
+
+    fn create_locked(&mut self, prepared: &RedactedChat) -> Result<StoredChat> {
         self.guard()?;
         let payload = encode(prepared)?;
         let tx = self
@@ -438,6 +483,10 @@ impl HistoryStore {
     }
 
     pub fn read(&self, chat_id: &str) -> Result<StoredChat> {
+        self.with_access(|store| store.read_locked(chat_id))
+    }
+
+    fn read_locked(&self, chat_id: &str) -> Result<StoredChat> {
         self.guard()?;
         require_id(chat_id)?;
         let tx = self.connection.unchecked_transaction()?;
@@ -448,6 +497,10 @@ impl HistoryStore {
 
     /// Delisted chats still count toward the cap until explicitly forgotten.
     pub fn list(&self, include_delisted: bool) -> Result<Vec<StoredChat>> {
+        self.with_access(|store| store.list_locked(include_delisted))
+    }
+
+    fn list_locked(&self, include_delisted: bool) -> Result<Vec<StoredChat>> {
         self.guard()?;
         let tx = self.connection.unchecked_transaction()?;
         check_schema_state(&tx, self.schema_cookie)?;
@@ -465,6 +518,14 @@ impl HistoryStore {
     }
 
     pub fn replace(
+        &mut self,
+        prepared: &RedactedChat,
+        expected_revision: i64,
+    ) -> Result<StoredChat> {
+        self.with_access_mut(|store| store.replace_locked(prepared, expected_revision))
+    }
+
+    fn replace_locked(
         &mut self,
         prepared: &RedactedChat,
         expected_revision: i64,
@@ -508,6 +569,15 @@ impl HistoryStore {
         expected_revision: i64,
         listed: bool,
     ) -> Result<i64> {
+        self.with_access_mut(|store| store.set_listed_locked(chat_id, expected_revision, listed))
+    }
+
+    fn set_listed_locked(
+        &mut self,
+        chat_id: &str,
+        expected_revision: i64,
+        listed: bool,
+    ) -> Result<i64> {
         self.guard()?;
         require_id(chat_id)?;
         valid_revision(expected_revision)?;
@@ -532,6 +602,10 @@ impl HistoryStore {
     /// delete reduces old SQLite page contents, but is not guaranteed erasure
     /// from journals, snapshots, backups, SSDs or other storage layers.
     pub fn forget(&mut self, chat_id: &str, expected_revision: i64) -> Result<()> {
+        self.with_access_mut(|store| store.forget_locked(chat_id, expected_revision))
+    }
+
+    fn forget_locked(&mut self, chat_id: &str, expected_revision: i64) -> Result<()> {
         self.guard()?;
         require_id(chat_id)?;
         valid_revision(expected_revision)?;
@@ -555,6 +629,18 @@ impl HistoryStore {
     /// Factual audit only; records are not usable as approvals or execution input.
     /// Full retention fails visibly at the cap; no records are silently evicted.
     pub fn append_audit(
+        &mut self,
+        chat_id: &str,
+        expected_revision: i64,
+        run_id: Option<&str>,
+        kind: AuditKind,
+    ) -> Result<AuditRecord> {
+        self.with_access_mut(|store| {
+            store.append_audit_locked(chat_id, expected_revision, run_id, kind)
+        })
+    }
+
+    fn append_audit_locked(
         &mut self,
         chat_id: &str,
         expected_revision: i64,
@@ -598,6 +684,10 @@ impl HistoryStore {
     }
 
     pub fn read_audit(&self, chat_id: &str) -> Result<Vec<AuditRecord>> {
+        self.with_access(|store| store.read_audit_locked(chat_id))
+    }
+
+    fn read_audit_locked(&self, chat_id: &str) -> Result<Vec<AuditRecord>> {
         self.guard()?;
         require_id(chat_id)?;
         self.audit_rows(Some(chat_id))

@@ -146,3 +146,9 @@ M5 提交 `30dc4e42664b308f3f4f2858683f1473b105e5fb` 的 [CI 38529158888](https:
 `c3010c373e55ca6b3f7ab7ceb472a9398c7590c2` 的 [CI 38534805293](https://github.com/yanch123/xyzaishell/actions/runs/38534805293) 已在 Windows Server 2022 和 Ubuntu 24.04 完成三个安装后阶段：首次安装／聊天与重启恢复、同版本重装、卸载重装；最后一次卸载与配置指纹保留也通过。两平台打包、普通测试和 Ubuntu 两版本基础安装启动检查继续通过。
 
 Ubuntu 22.04 在有副作用的选项点击时发生 WebDriver 传输断连，测试未自动重放。固定版本 tauri-driver 会将除 Host 外的请求头转发给使用连接池的 native-driver 客户端；本地服务回归确认 urllib 默认发出 `Connection: close`。测试传输改用显式 HTTP/1.1 keep-alive，验证复用单个连接、完整读取响应，以及变更命令被断开时仍只发送一次。该传输不稳定根因属于待原生重测确认的假设，不将 helper 测试成功当作 Ubuntu 22.04 验收完成。
+
+`4f2d06774c0292f1db4d7a840a6784f6c8a47c32` 的 [CI 38536846991](https://github.com/yanch123/xyzaishell/actions/runs/38536846991) 在原生 UI 之前失败：Linux 普通测试通过，但 OpenSSH 启动器存活检查失败且旧日志缺乏退出原因；Windows 并发历史测试确认只有一个保存成功，但另一结果不符合预期 Conflict，旧断言未输出具体错误。故该轮不能验证 WebDriver 传输修复。
+
+OpenSSH 夹具统一使用与启动相同的权限探测／清理 launcher，避免非特权 `kill -0` 对 root 进程的 EPERM 误判，并补充真实退出码和探测诊断，真实 PTY 与零 exec 审计要求不变。旧运行是否正由 EPERM 引起仍待证实。
+
+历史存储发现 BEGIN 前安全文件检查可能与另一实例的 journal 删除重叠。复用稳定历史初始化锁覆盖所有数据库读写操作，从安全检查一直持有到事务释放，避免同版本实例彼此改变检查中的 sidecar；仍保留 SQLite IMMEDIATE、修订 CAS 和严格权限检查，不将其他错误伪装成 Conflict。初始化内部调用避免递归取锁；锁等待 5 秒后显式 Busy。增加 16 轮严格单赢家／Conflict、读写顺序、超时不改变修订、崩溃释放和 Windows delete-pending 测试，以及不包含路径／内容的测试诊断。Linux 188 项普通 Rust 测试、格式及 Clippy 通过；Windows type-check 不是 Windows 运行证明，原失败具体原因与新平台测试仍待 CI 确认。

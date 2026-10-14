@@ -307,6 +307,13 @@ fn open_relative_with_created(
         return Ok((None, false));
     }
     if result < 0 {
+        // Synthetic test diagnostics only: numeric NT status, never a path,
+        // filename, descriptor, credential, or raw system error message.
+        #[cfg(test)]
+        eprintln!(
+            "private-file NtCreateFile failure: NTSTATUS=0x{:08x}",
+            result as u32
+        );
         return Err(E::Unavailable);
     }
     // NtCreateFile documents IO_STATUS_BLOCK.Information == FILE_CREATED (2)

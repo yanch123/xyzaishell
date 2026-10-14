@@ -55,7 +55,7 @@ cleanup() {
     "${as_root[@]}" kill -TERM -- "-$daemon_pid" 2>/dev/null || true
     "${as_root[@]}" kill -TERM "$daemon_pid" 2>/dev/null || true
   elif [[ -n "$launcher_pid" ]]; then
-    kill -TERM "$launcher_pid" 2>/dev/null || true
+    "${as_root[@]}" kill -TERM "$launcher_pid" 2>/dev/null || true
   fi
   if [[ -n "$launcher_pid" ]]; then
     wait "$launcher_pid" 2>/dev/null || true
@@ -165,7 +165,21 @@ CONFIG
 "${as_root[@]}" setsid --wait "$sshd" -D -e -f "$fixture/sshd_config" > "$fixture/sshd.log" 2>&1 &
 launcher_pid=$!
 for _ in $(seq 1 100); do
-  kill -0 "$launcher_pid" 2>/dev/null || { echo 'sshd exited during startup.' >&2; exit 1; }
+  # The sudo/setsid launcher may already run as root. An unprivileged kill -0
+  # can return EPERM for a live process; probe with the launcher's privileges.
+  if ! "${as_root[@]}" kill -0 "$launcher_pid" 2> "$fixture/launcher-status.log"; then
+    # Do not turn an unexpected probe-permission failure into an unbounded wait
+    # on a still-running child. Bash tracks this launcher's job without signals.
+    if jobs -pr | grep -qx "$launcher_pid"; then
+      echo 'Cannot inspect the still-running sshd launcher; refusing ambiguous startup.' >&2
+      cat "$fixture/launcher-status.log" >&2
+      exit 1
+    fi
+    if wait "$launcher_pid"; then launcher_status=0; else launcher_status=$?; fi
+    echo "sshd launcher exited during startup (exit status $launcher_status)." >&2
+    cat "$fixture/launcher-status.log" >&2
+    exit 1
+  fi
   if grep -q "Server listening on 127.0.0.1 port $port" "$fixture/sshd.log" \
     && [[ -f "$fixture/sshd.pid" ]]; then
     daemon_pid=$("${as_root[@]}" cat "$fixture/sshd.pid")

@@ -57,7 +57,7 @@ export default function App() {
   const hasModal = !!modal || !!ssh.challenge || !!consent || !!launch;
   return <>
     <div className="app-shell" inert={hasModal}>
-      <header className="app-header"><div className="brand"><div className="brand-mark"><Icon name="terminal" size={19} /></div><span>xyzai<span className="brand-light">shell</span></span><span className="version-tag">PREVIEW</span></div><div className="header-workspace"><span className={`status-dot ${ssh.snapshot.state === 'connected' ? 'online' : ''}`} /><span>{ssh.snapshot.host || '未连接服务器'}</span><span className="workspace-divider">/</span><span>SSH 工作空间</span></div><button className="header-settings icon-button" aria-label="打开设置" title="工作空间设置" onClick={() => setModal('settings')}><Icon name="settings" size={19} /></button></header>
+      <header className="app-header"><div className="brand"><div className="brand-mark"><Icon name="terminal" size={19} /></div><span>xyzai<span className="brand-light">shell</span></span><span className="version-tag">v0.1</span></div><div className="header-workspace"><span className={`status-dot ${ssh.snapshot.state === 'connected' ? 'online' : ''}`} /><span>{ssh.snapshot.host || '未连接服务器'}</span><span className="workspace-divider">/</span><span>SSH 工作空间</span></div><button className="header-settings icon-button" aria-label="打开设置" title="工作空间设置" onClick={() => setModal('settings')}><Icon name="settings" size={19} /></button></header>
       <div className="workspace-body"><nav className="activity-bar" aria-label="工作空间导航"><button className="activity-button selected" title="SSH 工作空间" aria-label="SSH 工作空间"><Icon name="terminal" size={22} /></button><button className={`activity-button ${history ? 'enabled' : ''}`} title="聊天记录" aria-label="打开聊天列表" onClick={() => setHistory(value => !value)}><Icon name="message" size={21} /></button><div className="activity-spacer" /><button className="activity-button" title="设置" aria-label="工作空间设置" onClick={() => setModal('settings')}><Icon name="settings" size={21} /></button></nav>
         <main className="workspace-main">
           {!ssh.native && <div className="preview-banner"><Icon name="info" size={15} /><span>网页界面预览 · SSH 与模型连接仅在桌面应用可用 · 当前没有连接任何服务器</span></div>}
@@ -70,7 +70,7 @@ export default function App() {
           </div>
         </main>
       </div>
-      <footer className="app-statusbar"><span><Icon name="server" size={12} />{SESSION_LABELS[ssh.snapshot.state]}<span className="status-divider">|</span>单服务器 / 单 PTY</span><span>SSH + 可控任务 <span className="footer-stage">M4</span></span></footer>
+      <footer className="app-statusbar"><span><Icon name="server" size={12} />{SESSION_LABELS[ssh.snapshot.state]}<span className="status-divider">|</span>单服务器 / 单 PTY</span><span>SSH + 可控任务 <span className="footer-stage">v0.1</span></span></footer>
     </div>
     {modal === 'connect' && !ssh.challenge && <ConnectionDialog onProfiles={() => setModal('profiles')} onClose={() => setModal(null)} onConnect={ssh.connect} size={ssh.size.current} available={available} />}
     {modal === 'profiles' && !ssh.challenge && <ProfileDialog available={available} onClose={() => setModal(null)} onConnect={ssh.connectSaved} />}

@@ -649,37 +649,247 @@ fn concurrent_instances_allow_one_revision_winner() {
     let mut store = fixture.open();
     let source = snapshot();
     store.create(&prepared(&source)).unwrap();
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let results = std::thread::scope(|scope| {
-        let handles: Vec<_> = ["Concurrent one", "Concurrent two"]
-            .into_iter()
-            .map(|title| {
-                let path = fixture.path.clone();
-                let barrier = barrier.clone();
-                let mut source = source.clone();
-                scope.spawn(move || {
-                    let mut store =
-                        HistoryStore::open(&path, HistoryPreference::SaveRedactedText).unwrap();
-                    source.title = title.into();
-                    barrier.wait();
-                    store.replace(&prepared(&source), 1).map(|row| row.revision)
+    // Repeat the journal create/delete boundary, rather than relying on one
+    // favorable scheduler interleaving. Every round still requires Conflict,
+    // not an arbitrary filesystem/SQLite error, for the stale writer.
+    for expected_revision in 1..=16 {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = ["Concurrent one", "Concurrent two"]
+                .into_iter()
+                .map(|title| {
+                    let path = fixture.path.clone();
+                    let barrier = barrier.clone();
+                    let mut source = source.clone();
+                    scope.spawn(move || {
+                        let mut store =
+                            HistoryStore::open(&path, HistoryPreference::SaveRedactedText).unwrap();
+                        source.title = title.into();
+                        barrier.wait();
+                        (
+                            title,
+                            store
+                                .replace(&prepared(&source), expected_revision)
+                                .map(|row| row.revision),
+                        )
+                    })
                 })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let next_revision = expected_revision + 1;
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, value)| value == &Ok(next_revision))
+                .count(),
+            1,
+            "exactly one CAS winner required at {expected_revision}; actual results: {results:?}"
+        );
+        assert_eq!(
+            results.iter().filter(|(_, value)| value == &Err(HistoryError::Conflict)).count(),
+            1,
+            "the losing CAS must observe the new revision at {expected_revision}; actual results: {results:?}"
+        );
+        let saved = store.read(&source.chat_id).unwrap();
+        assert_eq!(saved.revision, next_revision);
+        let (winner_title, _) = results.iter().find(|(_, result)| result.is_ok()).unwrap();
+        assert_eq!(saved.chat.title, *winner_title);
+        assert_eq!(saved.chat.task_id, source.task_id);
+        assert!(saved.to_snapshot().active_run_id.is_none());
+    }
+}
+
+#[test]
+fn access_lock_covers_checks_reads_and_transaction_completion() {
+    use std::sync::mpsc;
+    let fixture = Fixture::new();
+    let mut writer = fixture.open();
+    let reader = fixture.open();
+    let mut stale_writer = fixture.open();
+    let source = snapshot();
+    writer.create(&prepared(&source)).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        writer
+            .with_access_mut(|writer| {
+                let tx = writer
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute("UPDATE metadata SET revision=2", [])?;
+                tx.execute("UPDATE chats SET revision=2", [])?;
+                assert!(fixture.path.join("history.sqlite3-journal").exists());
+                let reader_id = source.chat_id.clone();
+                let reader_started = started_tx.clone();
+                let reader_finished = finished_tx.clone();
+                scope.spawn(move || {
+                    reader_started.send(()).unwrap();
+                    reader_finished
+                        .send(("read", reader.read(&reader_id).map(|row| row.revision)))
+                        .unwrap();
+                });
+                let source = source.clone();
+                scope.spawn(move || {
+                    started_tx.send(()).unwrap();
+                    finished_tx
+                        .send((
+                            "replace",
+                            stale_writer
+                                .replace(&prepared(&source), 1)
+                                .map(|row| row.revision),
+                        ))
+                        .unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                // Even a reader must wait before inspecting an active writer's
+                // journal; SQLite's ordinary shared-read lock alone cannot do this.
+                assert_eq!(
+                    finished_rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                );
+                tx.commit().map_err(commit_error)?;
+                assert!(!fixture.path.join("history.sqlite3-journal").exists());
+                assert_eq!(finished_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+                Ok(())
             })
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .collect::<Vec<_>>()
+            .unwrap();
+        let mut results = [
+            finished_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            finished_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ];
+        results.sort_by_key(|(operation, _)| *operation);
+        assert_eq!(
+            results,
+            [("read", Ok(2)), ("replace", Err(HistoryError::Conflict))]
+        );
     });
-    assert_eq!(results.iter().filter(|value| value == &&Ok(2)).count(), 1);
+    // Conflict/transaction-drop also released the access lock.
+    assert_eq!(writer.read(&source.chat_id).unwrap().revision, 2);
+}
+
+#[test]
+fn access_lock_timeout_is_bounded_and_does_not_change_revision() {
+    use std::sync::mpsc;
+    let fixture = Fixture::new();
+    let mut writer = fixture.open();
+    let mut contender = fixture.open();
+    let source = snapshot();
+    writer.create(&prepared(&source)).unwrap();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        writer
+            .with_access_mut(|_| {
+                let source = source.clone();
+                scope.spawn(move || {
+                    finished_tx
+                        .send(
+                            contender
+                                .replace(&prepared(&source), 1)
+                                .map(|row| row.revision),
+                        )
+                        .unwrap();
+                });
+                // PrivateDirectory waits at most five seconds. Give scheduling
+                // additional room without accepting a hang or an arbitrary error.
+                assert_eq!(
+                    finished_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                    Err(HistoryError::Busy)
+                );
+                Ok(())
+            })
+            .unwrap();
+    });
+    assert_eq!(writer.read(&source.chat_id).unwrap().revision, 1);
+    // An error, including a revision conflict, releases rather than abandons
+    // the access lock; a subsequent legitimate CAS can still succeed.
     assert_eq!(
-        results
-            .iter()
-            .filter(|value| value == &&Err(HistoryError::Conflict))
-            .count(),
-        1
+        error(writer.replace(&prepared(&source), 99)),
+        HistoryError::Conflict
     );
-    assert_eq!(store.read(&source.chat_id).unwrap().revision, 2);
+    assert_eq!(writer.replace(&prepared(&source), 1).unwrap().revision, 2);
+}
+
+#[cfg(windows)]
+#[test]
+fn access_lock_avoids_windows_delete_pending_journal_checks() {
+    use std::{
+        os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
+        sync::mpsc,
+    };
+    use windows_sys::Win32::{
+        Foundation::GetLastError,
+        Storage::FileSystem::{DeleteFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE},
+    };
+    let fixture = Fixture::new();
+    let mut writer = fixture.open();
+    let mut contender = fixture.open();
+    let source = snapshot();
+    writer.create(&prepared(&source)).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        writer
+            .with_access_mut(|writer| {
+                let journal = fixture.path.join("history.sqlite3-journal");
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .open(&journal)
+                    .unwrap();
+                let wide: Vec<u16> = journal.as_os_str().encode_wide().chain(Some(0)).collect();
+                // SAFETY: NUL-terminated synthetic fixture path. Keeping the shared
+                // file handle open makes classic DeleteFileW deletion pending.
+                assert_ne!(
+                    unsafe { DeleteFileW(wide.as_ptr()) },
+                    0,
+                    "synthetic DeleteFileW failed: {}",
+                    unsafe { GetLastError() }
+                );
+                let probe = writer
+                    .directory
+                    .validate_database_file("history.sqlite3-journal", MAX_JOURNAL_BYTES);
+                // This is the exact pre-SQLite failure window the access lock must
+                // exclude. Do not classify delete-pending as an absent/safe file.
+                assert_eq!(
+                    probe,
+                    Err(StorageError::Unavailable),
+                    "delete-pending metadata probe: {probe:?}"
+                );
+                let source = source.clone();
+                scope.spawn(move || {
+                    started_tx.send(()).unwrap();
+                    finished_tx
+                        .send(
+                            contender
+                                .replace(&prepared(&source), 1)
+                                .map(|row| row.revision),
+                        )
+                        .unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert_eq!(
+                    finished_rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                );
+                // Finish journal deletion before releasing the same lock that
+                // protected creation, validation and the full SQLite transaction.
+                drop(file);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            finished_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Ok(2)
+        );
+    });
+    assert_eq!(writer.read(&source.chat_id).unwrap().revision, 2);
 }
 
 // Runs only as the synthetic child of crash_rollback_journal_recovers_locally.
@@ -696,11 +906,19 @@ fn synthetic_crash_writer_process() {
         .starts_with("xyz-history-test-"));
     let store = HistoryStore::open(&path, HistoryPreference::SaveRedactedText).unwrap();
     store
-        .connection
-        .execute_batch("PRAGMA cache_size=1; BEGIN IMMEDIATE; UPDATE chats SET payload='{}';")
+        .with_access(|store| -> Result<()> {
+            store
+                .connection
+                .execute_batch(
+                    "PRAGMA cache_size=1; BEGIN IMMEDIATE; UPDATE chats SET payload='{}';",
+                )
+                .unwrap();
+            // Terminate with both SQLite's transaction and the access lock held.
+            // No destructors run; the OS must release the stable cross-process lock
+            // so a future explicit open can safely validate/recover the journal.
+            std::process::exit(0);
+        })
         .unwrap();
-    // Simulate process termination: no transaction/connection destructors run.
-    std::process::exit(0);
 }
 
 #[test]
