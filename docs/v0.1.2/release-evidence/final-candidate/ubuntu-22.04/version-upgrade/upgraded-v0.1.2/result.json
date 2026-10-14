@@ -1,0 +1,24 @@
+{
+  "result": "passed",
+  "phase": "upgrade",
+  "application": "/usr/bin/xyzaishell",
+  "application_sha256": "22421c99a4dc3984ae32421c35b24bb48f75decf584d16f23a89a47f7dc5d0c9",
+  "application_version": "0.1.2",
+  "upgrade_from": "0.1.1",
+  "native_ipc": true,
+  "synthetic_loopback_model": true,
+  "profile_and_history_persisted": true,
+  "restored_task_identity_preserved": true,
+  "history_requires_new_process_consent": true,
+  "restore_model_requests": 0,
+  "shell_log_empty_export_fail_closed": true,
+  "profile_id_preserved": true,
+  "legacy_history_rows_and_protected_profile_backup_verified": true,
+  "model_settings_saved_and_tested_via_ui": false,
+  "not_tested": [
+    "real provider",
+    "SSH via UI",
+    "desktop input methods",
+    "Windows 10/11"
+  ]
+}
