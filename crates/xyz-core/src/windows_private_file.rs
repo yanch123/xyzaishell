@@ -125,7 +125,7 @@ pub fn read_private_file(path: &Path, max_bytes: usize) -> SafeResult<Vec<u8>> {
     Ok(bytes)
 }
 
-fn checked_components(path: &Path) -> SafeResult<(Vec<u16>, Vec<Vec<u16>>)> {
+pub(crate) fn checked_components(path: &Path) -> SafeResult<(Vec<u16>, Vec<Vec<u16>>)> {
     let mut components = path.components();
     let drive = match components.next() {
         Some(Component::Prefix(prefix)) => match prefix.kind() {
@@ -184,7 +184,7 @@ fn reserved_name(name: &[u16]) -> bool {
             && (matches!(upper[3], 0x31..=0x39 | 0xb9 | 0xb2 | 0xb3)))
 }
 
-fn open_drive_root(name: &[u16]) -> SafeResult<OwnedHandle> {
+pub(crate) fn open_drive_root(name: &[u16]) -> SafeResult<OwnedHandle> {
     // SAFETY: checked_components supplies a terminated drive root. No
     // SECURITY_ATTRIBUTES means no inherited handle or changed descriptor.
     let handle = unsafe {
@@ -201,7 +201,7 @@ fn open_drive_root(name: &[u16]) -> SafeResult<OwnedHandle> {
     owned_handle(handle)
 }
 
-fn owned_handle(handle: HANDLE) -> SafeResult<OwnedHandle> {
+pub(crate) fn owned_handle(handle: HANDLE) -> SafeResult<OwnedHandle> {
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         Err(OPEN_FAILED)
     } else {
@@ -259,7 +259,7 @@ fn open_child(parent: &OwnedHandle, name: &[u16], directory: bool) -> SafeResult
     owned_handle(handle)
 }
 
-fn file_information(handle: HANDLE) -> SafeResult<BY_HANDLE_FILE_INFORMATION> {
+pub(crate) fn file_information(handle: HANDLE) -> SafeResult<BY_HANDLE_FILE_INFORMATION> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: handle is live and output points to the complete writable struct.
     if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
@@ -271,7 +271,7 @@ fn file_information(handle: HANDLE) -> SafeResult<BY_HANDLE_FILE_INFORMATION> {
     Ok(info)
 }
 
-fn validate_directory(handle: &OwnedHandle) -> SafeResult<()> {
+pub(crate) fn validate_directory(handle: &OwnedHandle) -> SafeResult<()> {
     let info = file_information(handle.as_raw_handle())?;
     if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
         return Err(UNSAFE_FILE);
@@ -279,7 +279,7 @@ fn validate_directory(handle: &OwnedHandle) -> SafeResult<()> {
     validate_volume(handle.as_raw_handle())
 }
 
-fn validate_file(file: &File, max_bytes: usize) -> SafeResult<()> {
+pub(crate) fn validate_file(file: &File, max_bytes: usize) -> SafeResult<()> {
     let info = file_information(file.as_raw_handle())?;
     if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 || info.nNumberOfLinks != 1 {
         return Err(UNSAFE_FILE);
@@ -339,9 +339,9 @@ impl Drop for LocalAllocation {
     }
 }
 
-struct Identity(Vec<usize>);
+pub(crate) struct Identity(Vec<usize>);
 impl Identity {
-    fn effective() -> SafeResult<Self> {
+    pub(crate) fn effective() -> SafeResult<Self> {
         let mut token = null_mut();
         // SAFETY: pseudo-handles are valid for these token queries; the output
         // transfers an owned token handle. Never modify privileges or identity.
@@ -390,14 +390,14 @@ impl Identity {
         Ok(identity)
     }
 
-    fn sid(&self) -> PSID {
+    pub(crate) fn sid(&self) -> PSID {
         // SAFETY: only effective() constructs Identity after TokenUser succeeds;
         // its aligned allocation remains live and at the same address.
         unsafe { (*(self.0.as_ptr().cast::<TOKEN_USER>())).User.Sid }
     }
 }
 
-fn validate_private_acl(handle: HANDLE, user: PSID) -> SafeResult<()> {
+pub(crate) fn validate_private_acl(handle: HANDLE, user: PSID) -> SafeResult<()> {
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
     // SAFETY: the handle has READ_CONTROL; returned owner/ACL pointers live in
     // the descriptor, whose allocation is retained until validation completes.

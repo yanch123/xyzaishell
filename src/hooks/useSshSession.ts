@@ -1,3 +1,4 @@
+import { storageBridge } from '../lib/storageBridge';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { desktopAvailable, sshBridge } from '../lib/bridge';
 import { INITIAL_SESSION, sameSession, safeError } from '../lib/types';
@@ -58,6 +59,13 @@ export function useSshSession() {
     catch (failure) { if (alive.current) setError(safeError(failure)); return false; }
     finally { operation.current = false; }
   };
+  const connectSaved = async (connectionId: string, profileRevision: string): Promise<boolean> => {
+    if (!ready || operation.current) return false;
+    operation.current = true; setError(null); setHistoryUnavailable(false);
+    try { const next = await storageBridge.connectProfile(connectionId, profileRevision, size.current); if (alive.current) acceptSnapshot(next); return true; }
+    catch (failure) { if (alive.current) setError(safeError(failure)); return false; }
+    finally { operation.current = false; }
+  };
   const disconnect = async (): Promise<void> => {
     const session = snapshotRef.current.session;
     if (!session || operation.current) return;
@@ -77,5 +85,5 @@ export function useSshSession() {
     return () => { outputListeners.current.delete(fn); };
   }, []);
   const reportError = useCallback((failure: unknown) => setError(safeError(failure)), []);
-  return { native, ready, historyUnavailable, snapshot, error, setError, challenge, connect, disconnect, confirmHostKey, subscribeOutput, reportError, size };
+  return { native, ready, historyUnavailable, snapshot, error, setError, challenge, connect, connectSaved, disconnect, confirmHostKey, subscribeOutput, reportError, size };
 }

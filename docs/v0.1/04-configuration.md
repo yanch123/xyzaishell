@@ -123,6 +123,8 @@ Rig 拟承担 provider/model/tool/streaming 的适配；应用仍显式提供 Ke
 | `auth.protected_passphrase` | 可选 DPAPI 密文编码字符串 | 仅 `dpapi_current_user` + `private_key`；不保存口令时省略 |
 | `auth.passphrase_secret_ref` | 可选不透明引用字符串 | 仅 `linux_secret_service` + `private_key`；不保存口令时省略 |
 
+实现允许先保存不含凭据的密码连接档案；界面显示凭据未提供，认证仍返回 `CREDENTIAL_MISSING`，不尝试无密码登录。会话内存凭据的单独设置也必须携带档案期望修订，并与跨实例档案编辑串行校验。
+
 `storage.secret_protection` 对整个连接文件生效，不能在同一文件混用两平台的机密字段。 改变该模式是文件级变更，必须展示所有受影响档案并以整份文件的期望修订提交，不能由保存单个档案悄悄切换；转为 `session_only` 需移除所有持久机密字段，但不会默认删除原安全存储条目。未知认证／保护模式拒绝处理；在错误平台加载持久保护模式返回 `CREDENTIAL_BACKEND_MISMATCH`，不能尝试其他后端或把密文当密码。Windows 保留 `protected_*` 字段，Linux 使用 `*_secret_ref`，两组互斥；`session_only` 禁止这两组所有字段。密码模式不能带私钥路径／私钥口令字段；私钥模式不能带登录密码字段。前端只收到 `credential_present`、档案展示字段和安全错误码；读取配置接口不能返回 `protected_*`、安全存储引用字符串或解密结果。设置凭据的专用 UI 请求可以短暂把用户输入送往 Rust 后端，但不得进入聊天、通用事件或模型工具。
 
 DPAPI CurrentUser 仅是拟定的静态保护机制：后端在当前 Windows 用户上下文保护/解保护密码与私钥口令，不使用 `CRYPTPROTECT_LOCAL_MACHINE`。DPAPI 通常依赖原用户登录身份及机器环境；复制文件到其他环境不保证可解密。它不保护已被控制的同用户进程、解密后的内存或用户选定的私钥文件本身。参考 [Microsoft CryptProtectData](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata)。

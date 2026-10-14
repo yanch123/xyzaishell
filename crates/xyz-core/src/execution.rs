@@ -1,6 +1,7 @@
 //! Host-owned single-writer authority. A queued AI frame is revalidated by the
 //! SSH actor immediately before its first write; UI/model text grants no power.
 use crate::ssh::{ApiError, SessionRef};
+use crate::task_secrets::SecretInput;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::{
@@ -9,6 +10,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const ACTION_TTL: Duration = Duration::from_secs(120);
 pub const MAX_COMMAND_BYTES: usize = 8192;
@@ -18,6 +20,10 @@ const AUTO_READ_COMMANDS: &[&str] = &[
 ];
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreparedAction {
+    #[serde(default = "command_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub secret_field: Option<String>,
     pub action_id: String,
     pub display_revision: String,
     pub command_text: String,
@@ -48,6 +54,7 @@ struct Pending {
     deadline: Instant,
     approved: bool,
     stage: Stage,
+    secret: Option<SecretInput>,
 }
 struct Lease {
     owner: Owner,
@@ -71,9 +78,14 @@ pub(crate) struct DispatchPermit {
     owner: Owner,
     action_id: String,
     digest: String,
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) bytes: Zeroizing<Vec<u8>>,
     pub(crate) started: Arc<AtomicBool>,
     pub(crate) on_started: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    disk_validate: Option<Arc<dyn Fn() -> Result<(), ApiError> + Send + Sync>>,
+    disk_validated: AtomicBool,
+}
+fn command_kind() -> String {
+    "command".into()
 }
 fn stale() -> ApiError {
     ApiError::new(
@@ -129,6 +141,7 @@ impl ExecutionGate {
         let mut bytes = command.as_bytes().to_vec();
         bytes.push(b'\r');
         let action = PreparedAction {
+            kind: "command".into(), secret_field: None,
             action_id: Uuid::new_v4().to_string(), display_revision: "1".into(), command_text: command.into(), append_enter: true,
             digest: format!("{:x}", Sha256::digest(&bytes)),
             policy: if auto { "auto_read_only" } else { "require_approval" }.into(),
@@ -142,6 +155,49 @@ impl ExecutionGate {
             deadline: Instant::now() + ACTION_TTL,
             approved: false,
             stage: Stage::Prepared,
+            secret: None,
+        });
+        Ok(action)
+    }
+    /// Only a host UI-confirmed remote prompt can prepare this adapter. No
+    /// command substitution or model-selected bytes are supported.
+    pub(crate) fn prepare_secret(
+        &self,
+        owner: &Owner,
+        field: &str,
+        purpose: &str,
+        secret: SecretInput,
+    ) -> Result<PreparedAction, ApiError> {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let l = lease(&mut s, owner)?;
+        if l.cancelled
+            || l.pending
+                .as_ref()
+                .is_some_and(|p| p.stage != Stage::Settled)
+        {
+            return Err(stale());
+        }
+        if !(secret.current)() {
+            return Err(stale());
+        }
+        let action = PreparedAction {
+            kind: "secret_input".into(), secret_field: Some(field.into()),
+            action_id: Uuid::new_v4().to_string(), display_revision: secret.snapshot_id.clone(),
+            command_text: format!("[Secret input: {field}]"), append_enter: true,
+            // Random opaque identity, not a password hash/guessing oracle.
+            digest: Uuid::new_v4().to_string(), policy: "require_approval".into(),
+            reason: format!("Send field {field} for: {purpose}. Confirm the visible remote program is waiting for this secret. The remote host receives the value and may echo, record, or misuse it. One Enter is appended. This never verifies remote echo settings or completion."),
+            approval_id: Some(Uuid::new_v4().to_string()),
+            expires_at_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 + ACTION_TTL.as_millis() as u64,
+            displayed: false, delivery: "not_sent".into(),
+        };
+        l.ready = true;
+        l.pending = Some(Pending {
+            action: action.clone(),
+            deadline: Instant::now() + ACTION_TTL,
+            approved: false,
+            stage: Stage::Prepared,
+            secret: Some(secret),
         });
         Ok(action)
     }
@@ -206,10 +262,18 @@ impl ExecutionGate {
                     && Instant::now() < p.deadline
             })
             .ok_or_else(stale)?;
+        let bytes = if let Some(secret) = &p.secret {
+            if !(secret.current)() {
+                return Err(stale());
+            }
+            secret.bytes.clone()
+        } else {
+            let mut bytes = Zeroizing::new(p.action.command_text.as_bytes().to_vec());
+            bytes.push(b'\r');
+            bytes
+        };
         p.stage = Stage::Queued;
         p.action.delivery = "queued".into();
-        let mut bytes = p.action.command_text.as_bytes().to_vec();
-        bytes.push(b'\r');
         Ok(DispatchPermit {
             gate: self.clone(),
             owner: owner.clone(),
@@ -217,6 +281,8 @@ impl ExecutionGate {
             digest: p.action.digest.clone(),
             bytes,
             on_started: None,
+            disk_validate: p.secret.as_ref().map(|secret| secret.validate.clone()),
+            disk_validated: AtomicBool::new(false),
             started: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -273,6 +339,14 @@ impl ExecutionGate {
     pub(crate) fn release(&self, owner: &Owner) {
         self.cancel(owner);
     }
+    pub(crate) fn confirm_unwritten_ready(&self, owner: &Owner) -> Result<bool, ApiError> {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let l = lease(&mut s, owner)?;
+        if l.cancelled || !l.ready || l.pending.is_some() {
+            return Err(stale());
+        }
+        Ok(true)
+    }
     pub(crate) fn confirm_ready(&self, owner: &Owner) -> Result<bool, ApiError> {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.uncertain.as_ref() != Some(owner) {
@@ -296,6 +370,17 @@ impl ExecutionGate {
     }
 }
 impl DispatchPermit {
+    /// Disk reads run on the blocking pool, outside both SSH-state and execution
+    /// locks. The actor then rechecks all in-memory authority at begin().
+    pub(crate) async fn validate_before_begin(&self) -> Result<(), ApiError> {
+        if let Some(validate) = self.disk_validate.clone() {
+            tokio::task::spawn_blocking(move || validate())
+                .await
+                .map_err(|_| stale())??;
+            self.disk_validated.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
     pub(crate) fn begin(&self, actual_session: &SessionRef) -> Result<(), ApiError> {
         let mut s = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
         let l = lease(&mut s, &self.owner)?;
@@ -308,10 +393,19 @@ impl DispatchPermit {
             || Instant::now() >= p.deadline
             || p.action.action_id != self.action_id
             || p.action.digest != self.digest
-            || format!("{:x}", Sha256::digest(&self.bytes)) != self.digest
+            || (p.secret.is_none()
+                && format!("{:x}", Sha256::digest(&self.bytes[..])) != self.digest)
+            || p.secret
+                .as_ref()
+                .is_some_and(|secret| secret.bytes.as_slice() != self.bytes.as_slice())
             || (p.action.approval_id.is_some() && !p.approved)
         {
             return Err(stale());
+        }
+        if let Some(secret) = &p.secret {
+            if !self.disk_validated.load(Ordering::Acquire) || !(secret.current)() {
+                return Err(stale());
+            }
         }
         p.approved = false;
         p.stage = Stage::Started;
@@ -358,6 +452,62 @@ mod tests {
         g.acquire(o.clone(), true).unwrap();
         let a = g.prepare(&o, command).unwrap();
         (g, o, a)
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_disk_validation_never_holds_the_execution_gate() {
+        let gate = ExecutionGate::default();
+        let owner = owner();
+        gate.acquire(owner.clone(), true).unwrap();
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_worker = entered.clone();
+        let (release, receiver) = std::sync::mpsc::channel();
+        let receiver = Mutex::new(receiver);
+        let secret = SecretInput {
+            bytes: Zeroizing::new(b"synthetic\r".to_vec()),
+            snapshot_id: "revision".into(),
+            current: Arc::new(|| true),
+            validate: Arc::new(move || {
+                entered_worker.store(true, Ordering::Release);
+                receiver.lock().unwrap().recv().unwrap();
+                Ok(())
+            }),
+        };
+        let action = gate
+            .prepare_secret(&owner, "password", "fixture", secret)
+            .unwrap();
+        gate.acknowledge(&owner, &action.action_id, &action.display_revision)
+            .unwrap();
+        gate.approve(
+            &owner,
+            &action.action_id,
+            action.approval_id.as_ref().unwrap(),
+        )
+        .unwrap();
+        let permit = gate.queue(&owner).unwrap();
+        let validation = tokio::spawn(async move {
+            permit.validate_before_begin().await.unwrap();
+            permit
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let cancelled_gate = gate.clone();
+        let cancelled_owner = owner.clone();
+        let cancellation = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || cancelled_gate.cancel(&cancelled_owner)),
+        )
+        .await;
+        release.send(()).unwrap();
+        assert!(!cancellation
+            .expect("cancellation must not wait for disk validation")
+            .unwrap());
+        let permit = validation.await.unwrap();
+        assert!(permit.begin(&owner.session).is_err());
     }
     #[test]
     fn approval_display_and_replay_are_enforced() {

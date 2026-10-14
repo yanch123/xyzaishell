@@ -12,7 +12,7 @@ import { MAX_DRAFT_LENGTH, MAX_MESSAGE_BYTES, utf8Length } from '../lib/chats';
 // These native start errors are returned strictly before a run is inserted or
 // launched. Every other failure remains ambiguous and must not be resubmitted.
 const START_PREFLIGHT_ERRORS = new Set(['TASK_INPUT_INVALID', 'MODEL_CONFIG_CHANGED', 'MODEL_CONFIG_UNAVAILABLE', 'SESSION_STALE', 'CHAT_BUSY', 'CHAT_NOT_FOUND', 'AI_OWNER_BUSY', 'TERMINAL_OUTCOME_UNKNOWN', 'TERMINAL_READINESS_REQUIRED']);
-type Pending = 'starting' | 'acknowledging' | 'deciding' | 'cancelling' | 'continuing';
+type Pending = 'starting' | 'acknowledging' | 'deciding' | 'cancelling' | 'continuing' | 'preparing_secret';
 export function useTerminalAgent(config: ModelConfigStatus, session: SessionSnapshot) {
   const native = desktopAvailable();
   const [tasks, setTasks] = useState<Record<string, TerminalTaskSnapshot>>({});
@@ -157,13 +157,18 @@ export function useTerminalAgent(config: ModelConfigStatus, session: SessionSnap
   };
   const continueTask = async (taskId: string, runId: string) => {
     const task = tasksRef.current[taskId];
-    if (!task || task.run_id !== runId || !connected(task) || (task.phase !== 'needs_user' && !(task.phase === 'cancelled' && !task.terminal_ready))) return;
+    if (!task || task.run_id !== runId || !connected(task) || (task.phase !== 'needs_user' && task.phase !== 'needs_secrets' && !(task.phase === 'cancelled' && !task.terminal_ready))) return;
     await mutate(taskId, `continue:${runId}:${task.revision}`, 'continuing', () => agentBridge.continue({ task_id: taskId, run_id: runId, readiness_confirmed: true }));
+  };
+  const prepareSecret = async (taskId: string, runId: string, fieldName: string, purpose: string) => {
+    const task = tasksRef.current[taskId];
+    if (!task || task.run_id !== runId || !task.owner || !connected(task) || !['needs_user', 'needs_secrets'].includes(task.phase) || !fieldName || !purpose.trim()) return;
+    await mutate(taskId, `secret:${runId}:${task.revision}:${fieldName}`, 'preparing_secret', () => agentBridge.prepareSecret({ task_id: taskId, run_id: runId, field_name: fieldName, purpose: purpose.trim(), prompt_confirmed: true }));
   };
   const owner = Object.values(tasks).find(task => task.owner) ?? null;
   const unresolved = Object.values(tasks).some(task => task.phase === 'cancelled' && !task.terminal_ready && connected(task));
   const blocked = !!owner || unresolved || Object.keys(pending).length > 0 || Object.keys(uncertain).length > 0;
   const retryLoad = () => { if (native && !ready) setLoadAttempt(value => value + 1); };
-  return { native, ready, tasks, owner, blocked, error, errors, pending, uncertain, drafts, updateDraft, start, acknowledge, decide, cancel, continueTask, refresh, retryLoad, actionIdentity };
+  return { native, ready, tasks, owner, blocked, error, errors, pending, uncertain, drafts, updateDraft, start, acknowledge, decide, cancel, continueTask, prepareSecret, refresh, retryLoad, actionIdentity };
 }
 export type TerminalAgentController = ReturnType<typeof useTerminalAgent>;

@@ -14,7 +14,7 @@ describe('terminal task visible workflow', () => {
     expect(document.querySelector('script')).toBeNull();
     const button = screen.getByRole('button', { name: '确认就绪并继续分析' });
     expect(button.hasAttribute('disabled')).toBe(true); expect(continueTask).not.toHaveBeenCalled();
-    await user.click(screen.getByRole('checkbox')); await user.click(button);
+    await user.click(screen.getByRole('checkbox', { name: '我已检查终端，并确认当前可接收下一步命令。' })); await user.click(button);
     expect(continueTask).toHaveBeenCalledExactlyOnceWith('chat-a', 'run-a');
     expect(button.hasAttribute('disabled')).toBe(true);
   });
@@ -33,7 +33,7 @@ describe('terminal task visible workflow', () => {
     const current = task({ phase: 'cancelled', owner: false, remote_outcome: 'unknown', terminal_ready: false });
     const continueTask = vi.fn(); const user = userEvent.setup();
     const view = render(<TerminalTaskPane {...common} agent={controller({ tasks: { 'chat-a': current }, continueTask })} />);
-    await user.click(screen.getByRole('checkbox')); await user.click(screen.getByRole('button', { name: '确认终端就绪 · 不重启 AI' }));
+    await user.click(screen.getByRole('checkbox', { name: '我已检查终端，并确认当前可接收下一步命令。' })); await user.click(screen.getByRole('button', { name: '确认终端就绪 · 不重启 AI' }));
     expect(continueTask).toHaveBeenCalledExactlyOnceWith('chat-a', 'run-a');
     view.rerender(<TerminalTaskPane {...common} agent={controller({ tasks: { 'chat-a': { ...current, revision: '2', terminal_ready: true } }, continueTask })} />);
     expect(screen.queryByRole('checkbox')).toBeNull(); expect(screen.getByText('AI 已停止')).toBeDefined();

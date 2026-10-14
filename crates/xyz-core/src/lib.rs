@@ -12,3 +12,10 @@ pub mod agent;
 pub mod decision;
 mod execution;
 pub mod observation;
+
+pub mod host_storage;
+pub mod storage;
+
+pub mod history;
+pub mod persistence;
+pub mod task_secrets;

@@ -15,6 +15,8 @@ A separate Playwright/Chromium job runs the browser preview with synthetic/mock 
 
 The Linux build job explicitly runs the normally ignored real-OpenSSH integration test using `.github/scripts/openssh-test.sh --disposable-user`. It creates fresh temporary host/client keys and a temporary unprivileged account only on a disposable `CI=true` runner, binds the isolated daemon to loopback, checks real PTY/shell/resize behavior and the absence of hidden exec/subsystem requests, and cleans up. It does not use a production SSH server or credentials. The CI result must be checked before claiming this interoperability test passed; ordinary `cargo test` reports it as ignored.
 
+The Linux build job also runs `.github/scripts/secret-service-test.sh`: it builds the locked core test executable, then runs the two explicitly ignored native Secret Service tests under a new D-Bus session, synthetic GNOME login keyring, and private temporary HOME/XDG directories. The session receives a cleared environment, never an existing desktop bus or keyring. It verifies store/load/delete first and locked-provider fail-closed behavior last, bounds execution time, stops the daemon/session, and removes the fixture. Windows runs the synthetic CurrentUser DPAPI roundtrip and binding-failure test in the ordinary Rust suite. Neither test uses a user's real credential. These are provider-runtime checks, not native application/UI acceptance.
+
 `linux-install-smoke` downloads the actual Ubuntu 22.04-built DEB into fresh Ubuntu 22.04 and 24.04 jobs, checks its checksum, installs its declared dependencies, checks binary linkage and desktop entry, and launches it with an isolated configuration in Xvfb. It requires a visible top-level window and a live process. Evidence is retained separately for each OS.
 
 This is **headless startup smoke**, not a real-desktop acceptance result. It does not establish rendering correctness, Chinese input/clipboard, X11/Wayland behavior, SSH/model integration, keyring behavior, installation on a clean end-user desktop, upgrade, or uninstall. A Windows Server build is not Windows 10/11 runtime testing. Complete and record the acceptance matrix in `docs/v0.1/06-testing.md` before promising v0.1 support.
@@ -37,6 +39,8 @@ From the repository root:
 python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
 python3 .github/scripts/artifacts.py check-version --tag v0.1.0
 bash -n .github/scripts/linux-install-smoke.sh
+bash -n .github/scripts/openssh-test.sh
+bash -n .github/scripts/secret-service-test.sh
 actionlint .github/workflows/*.yml
 ```
 

@@ -109,6 +109,12 @@ jobs:
         run: |
           sudo apt-get install --no-install-recommends -y openssh-server
           bash .github/scripts/openssh-test.sh --disposable-user
+      - name: Test native Secret Service in an isolated disposable keyring
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: |
+          sudo apt-get install --no-install-recommends -y gnome-keyring dbus
+          bash .github/scripts/secret-service-test.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build installer from locked dependencies
         env:

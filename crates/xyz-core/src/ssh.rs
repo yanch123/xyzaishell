@@ -8,9 +8,10 @@ use russh::{
     ChannelMsg, Disconnect,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(not(windows))]
+use std::io::Read;
 use std::{
     collections::{HashMap, VecDeque},
-    io::Read,
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
@@ -136,7 +137,6 @@ impl ConnectRequest {
                         "Choose an absolute private-key path.",
                     ));
                 }
-                validate_private_key_platform()?;
                 if passphrase.as_ref().is_some_and(|p| p.0.len() > 16384) {
                     return Err(ApiError::new(
                         "SSH_CREDENTIAL_INVALID",
@@ -261,6 +261,7 @@ struct Inner {
     state: Mutex<ManagerState>,
     sink: EventSink,
     observation: crate::observation::ObservationBuffer,
+    trust: Result<Option<Arc<crate::storage::trust::KnownHostsStore>>, ApiError>,
 }
 struct ManagerState {
     snapshot: SessionSnapshot,
@@ -290,9 +291,28 @@ enum Command {
 }
 impl SessionManager {
     pub fn new(sink: EventSink) -> Self {
+        Self::with_trust(sink, Ok(None))
+    }
+    pub fn with_persistent_trust(
+        sink: EventSink,
+        root: Result<std::path::PathBuf, ApiError>,
+    ) -> Self {
+        let trust = root.and_then(|root| {
+            crate::storage::trust::KnownHostsStore::open(&root)
+                .map(Arc::new)
+                .map(Some)
+                .map_err(crate::host_storage::storage_error)
+        });
+        Self::with_trust(sink, trust)
+    }
+    fn with_trust(
+        sink: EventSink,
+        trust: Result<Option<Arc<crate::storage::trust::KnownHostsStore>>, ApiError>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 sink,
+                trust,
                 observation: crate::observation::ObservationBuffer::default(),
                 state: Mutex::new(ManagerState {
                     snapshot: SessionSnapshot {
@@ -317,7 +337,7 @@ impl SessionManager {
     fn lock(&self) -> MutexGuard<'_, ManagerState> {
         self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
     }
-    pub(crate) fn observation(&self) -> crate::observation::ObservationBuffer {
+    pub fn observation(&self) -> crate::observation::ObservationBuffer {
         self.inner.observation.clone()
     }
     pub(crate) fn begin_task_context(
@@ -350,6 +370,9 @@ impl SessionManager {
     }
     pub fn connect(&self, request: ConnectRequest) -> Result<SessionSnapshot, ApiError> {
         request.validate()?;
+        if let Err(error) = &self.inner.trust {
+            return Err(error.clone());
+        }
         let (commands, receiver) = mpsc::channel(INPUT_QUEUE_FRAMES);
         let (cancel, cancelled) = watch::channel(false);
         let snapshot = {
@@ -360,7 +383,7 @@ impl SessionManager {
                     "Disconnect the current server before opening another connection.",
                 ));
             }
-            self.inner.observation.reset();
+            self.inner.observation.reset_capture_preserving_secrets();
             match &request.auth {
                 Authentication::Password { password } => {
                     self.inner.observation.add_known_secret(&password.0)?
@@ -814,10 +837,11 @@ impl SessionManager {
                     Some(Command::AiWrite { permit, reply }) => {
                         // Final gate is in this single SSH actor, at dequeue time.
                         // Cancellation/session/expiry/approval are checked again here.
-                        let began = {
+                        let validated = permit.validate_before_begin().await;
+                        let began = validated.and_then(|_| {
                             let state = self.lock();
                             require_connected(&state,session_ref).and_then(|_| permit.begin(session_ref))
-                        };
+                        });
                         if began.is_err() || permit.notify_started().is_err() {
                             let _ = reply.send(Err(ApiError::new("NOT_SENT", "The queued AI action expired, was cancelled, or no longer matches its approval. Nothing was sent.")));
                             continue;
@@ -969,68 +993,60 @@ fn decode_input(encoded: &str) -> Result<Zeroizing<Vec<u8>>, ApiError> {
     }
     Ok(bytes)
 }
-fn validate_private_key_platform() -> Result<(), ApiError> {
-    #[cfg(windows)]
-    {
-        Err(ApiError::new("SSH_KEY_PLATFORM_UNSUPPORTED", "Windows private-key authentication is unavailable until ownership and ACL validation is implemented. Use session-only password authentication for this milestone."))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(())
-    }
-}
 
 fn read_private_key(
     path: &str,
     passphrase: Option<&str>,
 ) -> Result<russh::keys::PrivateKey, ApiError> {
-    validate_private_key_platform()?;
     let invalid = || {
         ApiError::new(
             "LOCAL_FILE_PERMISSION_DENIED",
             "The selected key must be a readable, private, regular file owned by this user.",
         )
     };
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
     #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // Open the reparse point itself, then reject it using handle metadata.
-        options.custom_flags(0x0020_0000);
-    }
-    let file = options.open(path).map_err(|_| invalid())?;
-    let metadata = file.metadata().map_err(|_| invalid())?;
-    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
-        return Err(invalid());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        // SAFETY: geteuid has no preconditions and does not mutate memory.
-        if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+    let text = {
+        let bytes = Zeroizing::new(
+            crate::windows_private_file::read_private_file(Path::new(path), 1024 * 1024)
+                .map_err(|_| invalid())?,
+        );
+        Zeroizing::new(
+            std::str::from_utf8(&bytes)
+                .map_err(|_| invalid())?
+                .to_owned(),
+        )
+    };
+    #[cfg(not(windows))]
+    let text = {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(path).map_err(|_| invalid())?;
+        let metadata = file.metadata().map_err(|_| invalid())?;
+        if !metadata.is_file() || metadata.len() > 1024 * 1024 {
             return Err(invalid());
         }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions and does not mutate memory.
+            if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(invalid());
+            }
+        }
+        let mut text = Zeroizing::new(String::new());
+        file.take(1024 * 1024 + 1)
+            .read_to_string(&mut text)
+            .map_err(|_| invalid())?;
+        if text.len() > 1024 * 1024 {
             return Err(invalid());
         }
-    }
-    let mut text = Zeroizing::new(String::new());
-    file.take(1024 * 1024 + 1)
-        .read_to_string(&mut text)
-        .map_err(|_| invalid())?;
-    if text.len() > 1024 * 1024 {
-        return Err(invalid());
-    }
+        text
+    };
     russh::keys::decode_secret_key(&text, passphrase).map_err(|_| {
         ApiError::new(
             "SSH_KEY_FAILED",
@@ -1058,18 +1074,47 @@ impl client::Handler for ClientHandler {
         }
         let key = key.public_key();
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+        let persistent = match &self.manager.inner.trust {
+            Err(_) => return Ok(false),
+            Ok(None) => None,
+            Ok(Some(store)) => {
+                let store = store.clone();
+                let host = self.host.clone();
+                let port = self.port;
+                let fingerprint = fingerprint.clone();
+                match tokio::task::spawn_blocking(move || store.check(&host, port, &fingerprint))
+                    .await
+                {
+                    Ok(Ok(crate::storage::trust::HostTrustCheck::Trusted)) => {
+                        return Ok(!*self.cancelled.borrow())
+                    }
+                    Ok(Ok(crate::storage::trust::HostTrustCheck::ApprovalRequired {
+                        challenge_id,
+                        previous_fingerprint,
+                        ..
+                    })) => Some((challenge_id, previous_fingerprint)),
+                    _ => return Ok(false),
+                }
+            }
+        };
         let (sender, response) = oneshot::channel();
         let (challenge, previous_state) = {
             let mut state = self.manager.lock();
             if require_live(&state, &self.session).is_err() || *self.cancelled.borrow() {
                 return Ok(false);
             }
-            let previous = state.trusted.get(&(self.host.clone(), self.port)).cloned();
+            let previous = persistent
+                .as_ref()
+                .map(|(_, previous)| previous.clone())
+                .unwrap_or_else(|| state.trusted.get(&(self.host.clone(), self.port)).cloned());
             if previous.as_ref() == Some(&fingerprint) {
                 return Ok(true);
             }
             let challenge = HostKeyChallenge {
-                challenge_id: Uuid::new_v4().to_string(),
+                challenge_id: persistent
+                    .as_ref()
+                    .map(|(id, _)| id.clone())
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
                 session: self.session.clone(),
                 host: self.host.clone(),
                 port: self.port,
@@ -1094,6 +1139,31 @@ impl client::Handler for ClientHandler {
             biased;
             _ = self.cancelled.changed() => false,
             result = tokio::time::timeout(Duration::from_secs(120), response) => matches!(result, Ok(Ok(true))),
+        };
+        let accepted = if accepted {
+            if let (Some((challenge_id, _)), Ok(Some(store))) =
+                (persistent, &self.manager.inner.trust)
+            {
+                let store = store.clone();
+                let host = self.host.clone();
+                let port = self.port;
+                let fingerprint = fingerprint.clone();
+                !*self.cancelled.borrow()
+                    && matches!(
+                        tokio::task::spawn_blocking(move || store.accept_from_trust_ui(
+                            &challenge_id,
+                            &host,
+                            port,
+                            &fingerprint
+                        ))
+                        .await,
+                        Ok(Ok(()))
+                    )
+            } else {
+                true
+            }
+        } else {
+            false
         };
         let accepted = {
             let mut state = self.manager.lock();
@@ -1383,6 +1453,43 @@ mod tests {
         );
         std::fs::remove_dir_all(base).unwrap();
     }
+    #[cfg(windows)]
+    #[test]
+    fn windows_ssh_key_reader_uses_private_acl_adapter_with_synthetic_encrypted_key() {
+        let root = std::env::temp_dir().join(format!("xyz-ssh-key-{}", Uuid::new_v4()));
+        let directory =
+            crate::storage::private_files::PrivateDirectory::open_or_create(&root).unwrap();
+        let key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let encrypted = key
+            .encrypt(&mut rand::rng(), "synthetic-native-key-passphrase")
+            .unwrap();
+        let encoded = encrypted
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap();
+        directory
+            .update("fixture-key", 1024 * 1024, |_| {
+                Ok(((), Some(Zeroizing::new(encoded.as_bytes().to_vec()))))
+            })
+            .unwrap();
+        drop(directory);
+        let path = root.join("fixture-key");
+        let decoded = read_private_key(
+            path.to_str().unwrap(),
+            Some("synthetic-native-key-passphrase"),
+        )
+        .unwrap();
+        assert_eq!(decoded.public_key(), key.public_key());
+        assert_eq!(
+            read_private_key(path.to_str().unwrap(), Some("synthetic-wrong-passphrase"))
+                .unwrap_err()
+                .code,
+            "SSH_KEY_FAILED"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn dropped_ai_receipt_distinguishes_before_and_after_actor_begin() {
         use crate::execution::{ExecutionGate, Owner};

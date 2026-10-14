@@ -189,7 +189,12 @@ export function useModelChat() {
     } catch (failure) { if (alive.current) setError(safeError(failure)); return false; }
     finally { creatingRef.current = false; if (alive.current) setCreating(false); }
   };
+  const restoreChat = (chat: ChatSnapshot) => {
+    // Native restore only returns inactive text. Never issue send, start, or reconnect.
+    if (chat.active_run_id) return;
+    acceptChat(chat); setSelected(chat.chat_id);
+  };
   const runningCount = chats.filter(chat => chat.active_run_id || pending[chat.chat_id] === 'sending').length;
-  return { native, ready, config, chats, current, drafts, errors, error, pending, creating, configBusy, runningCount, updateDraft, createChat, selectChat, send, cancel, reloadConfig, confirmDestination, probe, retryLoad };
+  return { native, ready, config, chats, current, drafts, errors, error, pending, creating, configBusy, runningCount, updateDraft, createChat, selectChat, send, cancel, reloadConfig, confirmDestination, probe, retryLoad, restoreChat };
 }
 export type ModelChatController = ReturnType<typeof useModelChat>;

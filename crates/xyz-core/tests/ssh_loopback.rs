@@ -37,6 +37,21 @@ impl Client {
         }
     }
 
+    fn persistent(root: Result<std::path::PathBuf, xyz_core::ssh::ApiError>) -> Self {
+        let (sender, incoming) = mpsc::unbounded_channel();
+        Self {
+            manager: SessionManager::with_persistent_trust(
+                Arc::new(move |event| sender.send(event).is_ok()),
+                root,
+            ),
+            incoming,
+            events: Vec::new(),
+            output: Vec::new(),
+            output_seq: 0,
+            acknowledge_output: true,
+        }
+    }
+
     fn request(server: &LoopbackServer, password: &str) -> ConnectRequest {
         ConnectRequest {
             host: server.addr.ip().to_string(),
@@ -852,4 +867,49 @@ async fn concurrent_input_frames_preserve_accepted_transport_order_without_inter
     assert_eq!(observed, expected, "rejected frames must not reach the SSH server, and accepted frames must keep transport order");
     assert_eq!(trace.channels.len(), 1);
     client.disconnect(&session).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_trust_survives_manager_restart_without_reapproving_exact_target() {
+    let root = std::env::temp_dir().join(format!("xyz-trust-integration-{}", uuid::Uuid::new_v4()));
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let mut first = Client::persistent(Ok(root.clone()));
+    let session = first.trusted_connection(&server).await;
+    first.disconnect(&session).await;
+    drop(first);
+    let mut second = Client::persistent(Ok(root.clone()));
+    let session = second.connect(&server);
+    second.state(SessionState::Connected).await;
+    assert!(!second
+        .events
+        .iter()
+        .any(|event| matches!(event, SshEvent::HostKey { .. })));
+    second.disconnect(&session).await;
+    drop(second);
+    let text = std::fs::read_to_string(root.join("known_hosts")).unwrap();
+    assert!(text.contains(&server.fingerprint));
+    assert!(!text.contains(PASSWORD));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_persistent_trust_never_falls_back_or_authenticates() {
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let client = Client::persistent(Err(xyz_core::ssh::ApiError::new(
+        "STORAGE_UNAVAILABLE",
+        "Secure trust storage unavailable.",
+    )));
+    assert_eq!(
+        client
+            .manager
+            .connect(Client::request(&server, PASSWORD))
+            .unwrap_err()
+            .code,
+        "STORAGE_UNAVAILABLE"
+    );
+    assert!(server.trace().authentications.is_empty());
+    assert!(!client
+        .events
+        .iter()
+        .any(|event| matches!(event, SshEvent::HostKey { .. })));
 }

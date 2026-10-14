@@ -14,5 +14,5 @@ export function startRequest(overrides: Partial<StartTerminalTask> = {}): StartT
   return { chat_id: 'chat-a', session: connectedSession.session!, instruction: '检查服务器状态', readiness_confirmed: true, context_consent: { revision: modelConfig.revision!, destination: modelConfig.destination! }, ...overrides };
 }
 export function controller(overrides: Partial<TerminalAgentController> = {}): TerminalAgentController {
-  return { native: true, ready: true, tasks: {}, owner: null, blocked: false, error: null, errors: {}, pending: {}, uncertain: {}, drafts: {}, updateDraft: () => {}, start: async () => true, acknowledge: async () => {}, decide: async () => {}, cancel: async () => {}, continueTask: async () => {}, refresh: async () => {}, retryLoad: () => {}, actionIdentity, ...overrides };
+  return { native: true, ready: true, tasks: {}, owner: null, blocked: false, error: null, errors: {}, pending: {}, uncertain: {}, drafts: {}, updateDraft: () => {}, start: async () => true, acknowledge: async () => {}, decide: async () => {}, cancel: async () => {}, continueTask: async () => {}, prepareSecret: async () => {}, refresh: async () => {}, retryLoad: () => {}, actionIdentity, ...overrides };
 }

@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use xyz_core::agent::{
-    AckTerminalAction, AgentManager, ContinueTerminalTask, DecideTerminalAction, StartTerminalTask,
-    TaskRunRequest, TerminalTaskSnapshot,
+    AckTerminalAction, AgentManager, ContinueTerminalTask, DecideTerminalAction, EnsureTaskSecrets,
+    PrepareSecretInput, StartTerminalTask, TaskRunRequest, TaskSecretsView, TerminalTaskSnapshot,
 };
 use xyz_core::ssh::{
     ApiError, ConnectRequest, HostKeyDecision, SessionManager, SessionRef, SessionSnapshot,
@@ -14,6 +14,74 @@ use xyz_core::{
     model::{ModelConfigManager, ModelConfigStatus},
     tasks::{ChatSnapshot, TaskManager},
 };
+
+use xyz_core::host_storage::{CredentialText, HostStorage, ProfileStatus, SaveProfileRequest};
+use xyz_core::storage::credentials::CredentialMode;
+
+fn worker_error() -> ApiError {
+    ApiError::new(
+        "HOST_WORKER_FAILED",
+        "The storage worker could not complete this operation. Reload status before retrying.",
+    )
+}
+#[tauri::command]
+async fn get_profile_status(state: State<'_, HostStorage>) -> Result<ProfileStatus, ApiError> {
+    let storage = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || storage.status())
+        .await
+        .map_err(|_| worker_error())?
+}
+#[tauri::command]
+async fn save_connection_profile(
+    request: SaveProfileRequest,
+    state: State<'_, HostStorage>,
+) -> Result<ProfileStatus, ApiError> {
+    let storage = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || storage.save(request))
+        .await
+        .map_err(|_| worker_error())?
+}
+#[tauri::command]
+async fn set_session_credential(
+    connection_id: String,
+    expected_revision: String,
+    value: Option<CredentialText>,
+    state: State<'_, HostStorage>,
+) -> Result<ProfileStatus, ApiError> {
+    let storage = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        storage.set_session(&connection_id, &expected_revision, value)
+    })
+    .await
+    .map_err(|_| worker_error())?
+}
+#[tauri::command]
+async fn set_credential_mode(
+    expected_revision: String,
+    mode: CredentialMode,
+    state: State<'_, HostStorage>,
+) -> Result<ProfileStatus, ApiError> {
+    let storage = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || storage.set_mode(&expected_revision, mode))
+        .await
+        .map_err(|_| worker_error())?
+}
+#[tauri::command]
+async fn connect_saved_profile(
+    connection_id: String,
+    profile_revision: String,
+    size: TerminalSize,
+    storage: State<'_, HostStorage>,
+    state: State<'_, SessionManager>,
+) -> Result<SessionSnapshot, ApiError> {
+    let storage = storage.inner().clone();
+    let request = tauri::async_runtime::spawn_blocking(move || {
+        storage.connection(&connection_id, &profile_revision, size)
+    })
+    .await
+    .map_err(|_| worker_error())??;
+    state.connect(request)
+}
 
 #[tauri::command]
 fn get_session_snapshot(state: State<'_, SessionManager>) -> SessionSnapshot {
@@ -146,7 +214,10 @@ async fn start_terminal_task(
     request: StartTerminalTask,
     state: State<'_, AgentManager>,
 ) -> Result<TerminalTaskSnapshot, ApiError> {
-    state.start(request)
+    let agent = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || agent.start(request))
+        .await
+        .map_err(|_| worker_error())?
 }
 #[tauri::command]
 async fn ack_terminal_action(
@@ -177,31 +248,153 @@ async fn continue_terminal_task(
     state.continue_task(request)
 }
 
+#[tauri::command]
+async fn get_task_secrets(
+    request: TaskRunRequest,
+    state: State<'_, AgentManager>,
+) -> Result<TaskSecretsView, ApiError> {
+    let agent = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || agent.get_task_secrets(request))
+        .await
+        .map_err(|_| worker_error())?
+}
+#[tauri::command]
+async fn ensure_task_secrets(
+    request: EnsureTaskSecrets,
+    state: State<'_, AgentManager>,
+) -> Result<TaskSecretsView, ApiError> {
+    let agent = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || agent.ensure_task_secrets(request))
+        .await
+        .map_err(|_| worker_error())?
+}
+#[tauri::command]
+async fn reload_task_secrets(
+    request: TaskRunRequest,
+    state: State<'_, AgentManager>,
+) -> Result<TaskSecretsView, ApiError> {
+    let agent = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || agent.reload_task_secrets(request))
+        .await
+        .map_err(|_| worker_error())?
+}
+#[tauri::command]
+async fn prepare_secret_input(
+    request: PrepareSecretInput,
+    state: State<'_, AgentManager>,
+) -> Result<TerminalTaskSnapshot, ApiError> {
+    let agent = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || agent.prepare_secret_input(request))
+        .await
+        .map_err(|_| worker_error())?
+}
+
+#[tauri::command]
+fn get_history_status(state: State<'_, TaskManager>) -> xyz_core::history::HistoryStatus {
+    state.history_status()
+}
+#[tauri::command]
+async fn set_history_enabled(
+    enabled: bool,
+    state: State<'_, TaskManager>,
+) -> Result<xyz_core::history::HistoryStatus, ApiError> {
+    let tasks = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || tasks.set_history_enabled(enabled))
+        .await
+        .map_err(|_| worker_error())?
+}
+#[tauri::command]
+async fn list_saved_chats(
+    state: State<'_, TaskManager>,
+) -> Result<Vec<xyz_core::history::HistoryEntry>, ApiError> {
+    let tasks = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || tasks.list_saved_chats())
+        .await
+        .map_err(|_| worker_error())?
+}
+#[tauri::command]
+async fn restore_saved_chat(
+    chat_id: String,
+    expected_revision: String,
+    state: State<'_, TaskManager>,
+) -> Result<ChatSnapshot, ApiError> {
+    let tasks = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        tasks.restore_saved_chat(&chat_id, &expected_revision)
+    })
+    .await
+    .map_err(|_| worker_error())?
+}
+#[tauri::command]
+async fn forget_saved_chat(
+    chat_id: String,
+    expected_revision: String,
+    state: State<'_, TaskManager>,
+) -> Result<xyz_core::history::HistoryStatus, ApiError> {
+    let tasks = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        tasks.forget_saved_chat(&chat_id, &expected_revision)
+    })
+    .await
+    .map_err(|_| worker_error())?
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle().clone();
-            let ssh = SessionManager::new(Arc::new(move |event| {
-                handle.emit("ssh:event", event).is_ok()
-            }));
+            let storage = HostStorage::new();
+            let ssh = SessionManager::with_persistent_trust(
+                Arc::new(move |event| handle.emit("ssh:event", event).is_ok()),
+                storage.configuration_root(),
+            );
+            let task_secrets = storage
+                .configuration_root()
+                .and_then(|root| xyz_core::task_secrets::TaskSecrets::open(&root))
+                .map(Arc::new);
+            app.manage(storage);
             let handle = app.handle().clone();
             let config = ModelConfigManager::new();
-            let chats = TaskManager::new(
+            let history_handle = app.handle().clone();
+            let history = xyz_core::history::HistoryService::new(
+                xyz_core::history::resolve_history_root(),
+                ssh.observation(),
+                Arc::new(move |status| {
+                    let _ = history_handle.emit("history:event", status);
+                }),
+            );
+            let chats = TaskManager::with_history(
                 config.clone(),
                 Arc::new(move |event| handle.emit("model:event", event).is_ok()),
+                history,
             );
             let handle = app.handle().clone();
-            app.manage(AgentManager::new(
+            let agent = AgentManager::new(
                 config,
                 chats.clone(),
                 ssh.clone(),
                 Arc::new(move |event| handle.emit("agent:event", event).is_ok()),
-            ));
+            );
+            let agent = match task_secrets {
+                Ok(secrets) => agent.with_task_secrets(secrets),
+                Err(_) => agent,
+            };
+            app.manage(agent);
             app.manage(ssh);
             app.manage(chats);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_history_status,
+            set_history_enabled,
+            list_saved_chats,
+            restore_saved_chat,
+            forget_saved_chat,
+            get_profile_status,
+            save_connection_profile,
+            set_session_credential,
+            set_credential_mode,
+            connect_saved_profile,
             get_session_snapshot,
             connect_server,
             confirm_host_key,
@@ -225,8 +418,19 @@ fn main() {
             ack_terminal_action,
             decide_terminal_action,
             cancel_terminal_task,
-            continue_terminal_task
+            continue_terminal_task,
+            get_task_secrets,
+            ensure_task_secrets,
+            reload_task_secrets,
+            prepare_secret_input
         ])
-        .run(tauri::generate_context!())
-        .expect("Unable to start xyzaishell desktop host");
+        .build(tauri::generate_context!())
+        .expect("Unable to start xyzaishell desktop host")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(tasks) = app.try_state::<TaskManager>() {
+                    let _ = tasks.flush_history();
+                }
+            }
+        });
 }

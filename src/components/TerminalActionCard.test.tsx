@@ -10,6 +10,16 @@ beforeEach(() => {
 });
 afterEach(() => vi.restoreAllMocks());
 describe('exact command display barrier and approval', () => {
+  it('labels secret input explicitly and approves only its exact action identity', async () => {
+    const current = task({ phase: 'waiting_approval', action: action({ kind: 'secret_input', secret_field: 'service_password', command_text: '[Secret input: service_password]', displayed: true, policy: 'require_approval', approval_id: 'single-secret-approval', reason: 'Service authentication; remote echo can expose the value.' }) });
+    const decide = vi.fn(); const user = userEvent.setup();
+    render(<TerminalActionCard task={current} connected agent={controller({ decide })} />);
+    expect(screen.getByLabelText('秘密输入预览（不含值）').textContent).toBe('[Secret input: service_password]');
+    expect(screen.getByText('附加按键：Enter 一次')).toBeDefined(); expect(decide).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '仅批准本次秘密输入' }));
+    expect(decide).toHaveBeenCalledExactlyOnceWith(actionIdentity(current), 'single-secret-approval', 'approve');
+  });
+
   it('renders exact target and command before acknowledging a low-risk action', async () => {
     const prepared = task({ phase: 'awaiting_display', action: action() });
     const acknowledge = vi.fn(async () => {

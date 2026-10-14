@@ -620,3 +620,199 @@ async fn reconnect_during_model_response_keeps_old_run_secret_redactor() {
     response.await.unwrap();
     f.ssh.disconnect(&new).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_secret_file_value_only_reaches_approved_visible_pty_and_never_model() {
+    use xyz_core::{
+        agent::{EnsureTaskSecrets, PrepareSecretInput},
+        storage::task_credentials::SecretFieldRequest,
+        task_secrets::TaskSecrets,
+    };
+    let ssh_server = LoopbackServer::start(Behavior::default()).await;
+    let (http, base) = listener().await;
+    let mut f = Fixture::new(&ssh_server, &base).await;
+    let secrets = Arc::new(TaskSecrets::open(&f.directory.join("task-storage")).unwrap());
+    f.agent = f.agent.clone().with_task_secrets(secrets);
+    let responder = tokio::spawn(async move {
+        let (mut socket, _) = http.accept().await.unwrap();
+        let first = read_request(&mut socket).await;
+        reply(&mut socket, &tool_body("task_secret_request", r#"{"fields":[{"name":"service_password","required":true}],"purpose":"Synthetic remote password prompt"}"#, "tool_calls")).await;
+        let (mut socket, _) = http.accept().await.unwrap();
+        let second = read_request(&mut socket).await;
+        let body = chunk(
+            serde_json::json!({"role":"assistant","content":"The remote outcome remains unknown."}),
+            serde_json::Value::Null,
+        ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+            + "data: [DONE]\n\n";
+        reply(&mut socket, &body).await;
+        (first, second)
+    });
+    let started = f.start();
+    let requested = phase(&f.agent, &started.task_id, "needs_secrets").await;
+    assert_eq!(
+        requested.secret_request.as_ref().unwrap().fields[0].name,
+        "service_password"
+    );
+    let view = f
+        .agent
+        .ensure_task_secrets(EnsureTaskSecrets {
+            task_id: started.task_id.clone(),
+            run_id: started.run_id.clone(),
+            fields: vec![SecretFieldRequest {
+                name: "service_password".into(),
+                required: true,
+            }],
+            expected_snapshot_id: None,
+        })
+        .unwrap();
+    let synthetic = "only-fixture-secret-83927";
+    fs::write(&view.local_edit_path, format!("schema_version = 1\n[task]\nid = \"{}\"\n[secrets.service_password]\nrequired = true\nvalue = \"{synthetic}\"\n", started.task_id)).unwrap();
+    let status = f
+        .agent
+        .reload_task_secrets(TaskRunRequest {
+            task_id: started.task_id.clone(),
+            run_id: started.run_id.clone(),
+        })
+        .unwrap();
+    assert!(status.fields[0].present);
+    assert!(!serde_json::to_string(&status).unwrap().contains(synthetic));
+    let action = f
+        .agent
+        .prepare_secret_input(PrepareSecretInput {
+            task_id: started.task_id.clone(),
+            run_id: started.run_id.clone(),
+            field_name: "service_password".into(),
+            purpose: "Synthetic remote password prompt".into(),
+            prompt_confirmed: true,
+        })
+        .unwrap();
+    assert!(!serde_json::to_string(&action).unwrap().contains(synthetic));
+    assert!(ssh_server.trace().input.is_empty());
+    ack(&f.agent, &action);
+    let waiting = phase(&f.agent, &started.task_id, "waiting_approval").await;
+    let a = waiting.action.as_ref().unwrap();
+    f.agent
+        .decide(DecideTerminalAction {
+            task_id: started.task_id.clone(),
+            run_id: started.run_id.clone(),
+            action_id: a.action_id.clone(),
+            approval_id: a.approval_id.clone().unwrap(),
+            decision: "approve".into(),
+        })
+        .unwrap();
+    ssh_server
+        .wait_for("approved secret on visible PTY", |trace| {
+            trace.input.len() == 1
+        })
+        .await;
+    assert_eq!(
+        ssh_server.trace().input[0].1,
+        format!("{synthetic}\r").as_bytes()
+    );
+    phase(&f.agent, &started.task_id, "needs_user").await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    f.agent
+        .continue_task(ContinueTerminalTask {
+            task_id: started.task_id.clone(),
+            run_id: started.run_id.clone(),
+            readiness_confirmed: true,
+        })
+        .unwrap();
+    let (first, second) = responder.await.unwrap();
+    assert!(!first.contains(synthetic));
+    assert!(!second.contains(synthetic));
+    assert!(!second.contains(&view.local_edit_path));
+    assert!(second.contains("service_password"));
+    assert!(second.contains("[REDACTED]"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edited_secret_after_preview_fails_not_sent_and_releases_the_task() {
+    use xyz_core::{
+        agent::{EnsureTaskSecrets, PrepareSecretInput},
+        storage::task_credentials::SecretFieldRequest,
+        task_secrets::TaskSecrets,
+    };
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let (http, base) = listener().await;
+    let mut f = Fixture::new(&server, &base).await;
+    let secrets = Arc::new(TaskSecrets::open(&f.directory.join("task-storage")).unwrap());
+    f.agent = f.agent.clone().with_task_secrets(secrets);
+    let responder = tokio::spawn(async move {
+        let (mut socket, _) = http.accept().await.unwrap();
+        read_request(&mut socket).await;
+        reply(
+            &mut socket,
+            &tool_body(
+                "task_secret_request",
+                r#"{"fields":[{"name":"password","required":true}],"purpose":"Fixture prompt"}"#,
+                "tool_calls",
+            ),
+        )
+        .await;
+    });
+    let task = f.start();
+    phase(&f.agent, &task.task_id, "needs_secrets").await;
+    let view = f
+        .agent
+        .ensure_task_secrets(EnsureTaskSecrets {
+            task_id: task.task_id.clone(),
+            run_id: task.run_id.clone(),
+            fields: vec![SecretFieldRequest {
+                name: "password".into(),
+                required: true,
+            }],
+            expected_snapshot_id: None,
+        })
+        .unwrap();
+    let content = |value: &str| {
+        format!("schema_version=1\n[task]\nid='{}'\n[secrets.password]\nrequired=true\nvalue='{value}'\n",task.task_id)
+    };
+    fs::write(&view.local_edit_path, content("synthetic-approved")).unwrap();
+    f.agent
+        .reload_task_secrets(TaskRunRequest {
+            task_id: task.task_id.clone(),
+            run_id: task.run_id.clone(),
+        })
+        .unwrap();
+    let preview = f
+        .agent
+        .prepare_secret_input(PrepareSecretInput {
+            task_id: task.task_id.clone(),
+            run_id: task.run_id.clone(),
+            field_name: "password".into(),
+            purpose: "Fixture prompt".into(),
+            prompt_confirmed: true,
+        })
+        .unwrap();
+    fs::write(
+        &view.local_edit_path,
+        content("synthetic-edited-after-preview"),
+    )
+    .unwrap();
+    ack(&f.agent, &preview);
+    let action = preview.action.unwrap();
+    f.agent
+        .decide(DecideTerminalAction {
+            task_id: task.task_id.clone(),
+            run_id: task.run_id.clone(),
+            action_id: action.action_id,
+            approval_id: action.approval_id.unwrap(),
+            decision: "approve".into(),
+        })
+        .unwrap();
+    let failed = phase(&f.agent, &task.task_id, "failed").await;
+    assert!(!failed.owner);
+    assert_eq!(failed.action.unwrap().delivery, "not_sent");
+    assert_eq!(failed.remote_outcome, "not_sent");
+    assert!(server.trace().input.is_empty());
+    // A fresh run can reserve the same task; the failed approval is not stranded.
+    let new_run = f.agent.start(f.request(&task.chat_id)).unwrap();
+    f.agent
+        .cancel(TaskRunRequest {
+            task_id: new_run.task_id,
+            run_id: new_run.run_id,
+        })
+        .unwrap();
+    responder.await.unwrap();
+}

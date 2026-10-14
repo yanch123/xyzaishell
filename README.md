@@ -21,6 +21,7 @@
 | [07 开发计划与决策](docs/v0.1/07-roadmap.md) | 分阶段实现、待确认选项、延后范围 |
 | [08 文档审查记录](docs/v0.1/08-review.md) | 文档检查结果及尚未进行的应用验证 |
 | [09 开发记录](docs/v0.1/09-development.md) | 分支流程、阶段进度、验证证据及阻塞 |
+| [11 使用指南](docs/v0.1/11-user-guide.md) | 模型配置、SSH 档案、终端任务、秘密与历史 |
 
 示例配置：[模型](config/examples/model.example.toml)、[Windows SSH 连接](config/examples/connections.example.toml)、[Linux SSH 连接](config/examples/connections.linux.example.toml)、[任务](config/examples/task.example.toml)。示例不含可用凭据；具体字段以配置规范为准。
 

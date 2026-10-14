@@ -1,3 +1,4 @@
+import { TaskSecretPanel } from './TaskSecretPanel';
 import { useEffect, useRef, useState } from 'react';
 import type { ChatSnapshot, ModelConfigStatus } from '../lib/model';
 import type { SessionSnapshot } from '../lib/types';
@@ -33,13 +34,13 @@ export function TerminalTaskPane({ agent, current, config, session, onStart, onS
     scroll.scrollTo({ top });
   }, [id, task?.revision, task?.phase]);
   const submit = () => { if (canStart && current) onStart(current, draft.trim()); };
-  const needsInspection = task && (task.phase === 'needs_user' || (task.phase === 'cancelled' && !task.terminal_ready && !task.owner));
+  const needsInspection = task && (task.phase === 'needs_user' || task.phase === 'needs_secrets' || (task.phase === 'cancelled' && !task.terminal_ready && !task.owner));
   return <>
     <div className="execution-mode-note"><Icon name="terminal" size={15} /><span>真实终端任务 · 与文字聊天分开 · 每次启动单独确认</span></div>
     {agent.error && <div className="chat-error" role="alert"><span>{agent.error}</span><button className="button secondary" onClick={() => agent.ready ? void agent.refresh() : agent.retryLoad()}>{agent.ready ? '核对任务状态' : '重试加载'}</button></div>}
     {attention && attention.chat_id !== current?.chat_id && <div className="owner-banner" role="status"><span>{attention.owner ? '另一个聊天拥有 AI 写入权。切换页面不会转移或停止任务。' : '另一个聊天的终端状态仍待核实，请先检查并确认就绪。'}</span><button className="button secondary" onClick={() => onSelectChat(attention.chat_id)}>{attention.owner ? '查看正在执行的任务' : '查看待核实的任务'}</button></div>}
     <div className="chat-scroll execution-scroll" ref={body} onScroll={event => { const element = event.currentTarget; following.current = element.scrollHeight - element.scrollTop - element.clientHeight < 64; }}>
-      {!task ? <div className="execution-welcome"><div className="ai-symbol"><Icon name="terminal" size={24} /></div><h2>让每一步操作可见</h2><p>输入具体任务，再确认模型接收方与当前终端状态。命令卡片显示后，基础策略允许的检查可发送；风险或无法判断的命令会等待你的单次批准。</p><p>普通 SSH 无法可靠判断命令完成。每次写入后，AI 会停下来等你检查终端，再明确继续。不会推测退出码，也不会重发未知命令。</p><p>手动终端始终可用，请自行避免与 AI 输入冲突。密码或密钥只在专用连接界面或终端中手动输入；任务机密配置尚未提供。</p>{!agent.native && <div className="notice">网页预览不能启动真实执行，不会模拟命令结果。</div>}{session.state !== 'connected' && <div className="notice">先连接 SSH，再启动终端任务。</div>}</div> : <section className="terminal-task" aria-label="当前终端任务">
+      {!task ? <div className="execution-welcome"><div className="ai-symbol"><Icon name="terminal" size={24} /></div><h2>让每一步操作可见</h2><p>输入具体任务，再确认模型接收方与当前终端状态。命令卡片显示后，基础策略允许的检查可发送；风险或无法判断的命令会等待你的单次批准。</p><p>普通 SSH 无法可靠判断命令完成。每次写入后，AI 会停下来等你检查终端，再明确继续。不会推测退出码，也不会重发未知命令。</p><p>手动终端始终可用，请自行避免与 AI 输入冲突。密码或密钥只在专用连接界面、本机任务秘密文件或终端中填写；不要输入聊天。</p>{!agent.native && <div className="notice">网页预览不能启动真实执行，不会模拟命令结果。</div>}{session.state !== 'connected' && <div className="notice">先连接 SSH，再启动终端任务。</div>}</div> : <section className="terminal-task" aria-label="当前终端任务">
         <div className="task-heading"><span className="task-phase" role="status">{task.phase === 'cancelled' && task.owner ? '停止请求已发出 · 等待发送边界' : TASK_PHASE_LABELS[task.phase]}</span><span>第 {task.round} 轮</span></div>
         <p className="task-instruction">{task.instruction}</p>
         <div className="task-identity" title={`任务 ${task.task_id}\n运行 ${task.run_id}`}>当前任务与运行固定绑定 · {task.target.username}@{task.target.host}:{task.target.port}</div>
@@ -47,6 +48,7 @@ export function TerminalTaskPane({ agent, current, config, session, onStart, onS
         {!task.assistant_text && task.phase === 'preparing' && <p className="task-waiting">正在等待模型分析，不代表已执行命令。</p>}
         {task.actions.length > 0 && <details className="previous-actions"><summary>查看之前 {task.actions.length} 条命令的发送记录</summary>{task.actions.map(action => <TerminalActionCard key={action.action_id} task={{ ...task, action, phase: 'completed', owner: false }} agent={agent} connected={connected} displayEnabled={false} />)}</details>}
         {task.action && <TerminalActionCard key={`${task.run_id}:${task.action.action_id}`} task={task} agent={agent} connected={connected} displayEnabled={displayEnabled} />}
+        {connected && task.owner && ['needs_user', 'needs_secrets'].includes(task.phase) && <TaskSecretPanel key={`${task.task_id}:${task.run_id}`} task={task} agent={agent} connected={connected} />}
         {task.error && <div className="inline-error" role="alert">{task.error.safe_message}</div>}
         {!connected && <div className="notice warning">此任务绑定的 SSH 连接已不可用。重连不会恢复旧批准或重发命令。请核实远端状态，并明确开始新任务。</div>}
         {task.phase === 'cancelled' && task.owner && <div className="notice warning">正在等待本地写入操作到达可判定边界。在此之前不会释放 AI 写入权，也不能继续或启动另一个任务。</div>}

@@ -1,0 +1,86 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { HistorySettings } from './HistorySettings';
+import { historyBridge } from '../lib/storageBridge';
+import { chat } from '../test/modelFixtures';
+vi.mock('../lib/storageBridge', () => ({ historyBridge: { status: vi.fn(), enable: vi.fn(), list: vi.fn(), restore: vi.fn(), forget: vi.fn(), listen: vi.fn() } }));
+const status = { enabled: false, available: true, plaintext: true as const, revision: '1', error: null };
+describe('explicit plaintext history', () => {
+  beforeEach(() => { vi.clearAllMocks(); vi.mocked(historyBridge.listen).mockResolvedValue(() => {}); vi.mocked(historyBridge.status).mockResolvedValue(status); vi.mocked(historyBridge.list).mockResolvedValue([]); });
+  it('never enables automatically, requires disclosure checkbox and restores only through explicit click', async () => {
+    const restored = { ...chat('stable-id'), messages: [] };
+    vi.mocked(historyBridge.enable).mockResolvedValue({ ...status, enabled: true });
+    vi.mocked(historyBridge.list).mockResolvedValue([{ chat_id: 'stable-id', task_id: 'stable-id', title: '历史任务', message_count: 2, revision: '5', updated_ms: 1, listed: true }]);
+    vi.mocked(historyBridge.restore).mockResolvedValue(restored);
+    const onRestore = vi.fn(); const user = userEvent.setup(); render(<HistorySettings native onRestore={onRestore} />);
+    await waitFor(() => expect(historyBridge.status).toHaveBeenCalledOnce());
+    expect((screen.getByRole('button', { name: '启用明文聊天历史' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(historyBridge.enable).not.toHaveBeenCalled(); expect(historyBridge.restore).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('checkbox')); await user.click(screen.getByRole('button', { name: '启用明文聊天历史' }));
+    expect(historyBridge.enable).toHaveBeenCalledExactlyOnceWith(true);
+    await user.click(await screen.findByRole('button', { name: '仅恢复文字' }));
+    expect(historyBridge.restore).toHaveBeenCalledExactlyOnceWith('stable-id', '5'); expect(onRestore).toHaveBeenCalledExactlyOnceWith(restored);
+  });
+  it('refuses an active restore and never exposes raw error text', async () => {
+    vi.mocked(historyBridge.status).mockResolvedValue({ ...status, enabled: true });
+    vi.mocked(historyBridge.list).mockResolvedValue([{ chat_id: 'a', task_id: 'a', title: '旧聊天', message_count: 1, revision: '1', updated_ms: 1, listed: true }]);
+    vi.mocked(historyBridge.restore).mockResolvedValue({ ...chat('a'), active_run_id: 'must-not-resume' });
+    const onRestore = vi.fn(); const user = userEvent.setup(); render(<HistorySettings native onRestore={onRestore} />);
+    await user.click(await screen.findByRole('button', { name: '仅恢复文字' }));
+    expect(onRestore).not.toHaveBeenCalled(); expect(screen.getByRole('alert')).toBeDefined(); expect(screen.queryByText(/Active history rejected/)).toBeNull();
+  });
+  it('ignores a late restore after settings are replaced by a newer dialog', async () => {
+    vi.mocked(historyBridge.status).mockResolvedValue({ ...status, enabled: true });
+    vi.mocked(historyBridge.list).mockResolvedValue([{ chat_id: 'old', task_id: 'old', title: 'Old chat', message_count: 1, revision: '1', updated_ms: 1, listed: true }]);
+    let finish!: (value: ReturnType<typeof chat>) => void;
+    vi.mocked(historyBridge.restore).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const onRestore = vi.fn(); const user = userEvent.setup();
+    const view = render(<HistorySettings native onRestore={onRestore} />);
+    await user.click(await screen.findByRole('button', { name: '仅恢复文字' }));
+    view.rerender(<div role="dialog" aria-label="New SSH dialog">Newer dialog remains open</div>);
+    await act(async () => { finish(chat('old')); });
+    expect(onRestore).not.toHaveBeenCalled(); expect(screen.getByRole('dialog', { name: 'New SSH dialog' })).toBeDefined();
+  });
+  it('ignores a late enable callback after settings are unmounted', async () => {
+    let finish!: (value: typeof status) => void;
+    vi.mocked(historyBridge.enable).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const onStatus = vi.fn(); const user = userEvent.setup();
+    const view = render(<HistorySettings native onRestore={vi.fn()} onStatus={onStatus} />);
+    await waitFor(() => expect((screen.getByRole('checkbox') as HTMLInputElement).disabled).toBe(false));
+    await user.click(screen.getByRole('checkbox')); await user.click(screen.getByRole('button', { name: '启用明文聊天历史' }));
+    view.unmount(); await act(async () => { finish({ ...status, enabled: true }); });
+    expect(onStatus).not.toHaveBeenCalled(); expect(historyBridge.list).not.toHaveBeenCalled();
+  });
+  it('allows capacity-recovery management without re-enabling saving and requires exact forget confirmation', async () => {
+    const recovery = { ...status, manageable: true, error: { code: 'HISTORY_FULL', safe_message: 'Archive full.', retry: 'after_user_action' as const } };
+    vi.mocked(historyBridge.status).mockResolvedValue(recovery);
+    vi.mocked(historyBridge.list).mockResolvedValue([{ chat_id: 'saved-id', task_id: 'task-id', title: 'History to remove', message_count: 2, revision: '9', updated_ms: 1, listed: true }]);
+    let finish!: (value: typeof recovery) => void;
+    vi.mocked(historyBridge.forget).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const user = userEvent.setup(); render(<HistorySettings native onRestore={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: '移除历史：History to remove' }));
+    expect(historyBridge.forget).not.toHaveBeenCalled(); expect(screen.getByRole('group', { name: '确认移除单条历史' }).textContent).toContain('saved-id');
+    expect(screen.getByRole('group', { name: '确认移除单条历史' }).textContent).toContain('不保证');
+    await user.click(screen.getByRole('button', { name: '取消移除' })); expect(historyBridge.forget).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '移除历史：History to remove' }));
+    await user.dblClick(screen.getByRole('button', { name: '确认移除此条历史' }));
+    expect(historyBridge.forget).toHaveBeenCalledExactlyOnceWith('saved-id', '9'); expect(historyBridge.enable).not.toHaveBeenCalled();
+    vi.mocked(historyBridge.list).mockResolvedValue([]);
+    await act(async () => { finish(recovery); });
+    expect(screen.queryByRole('button', { name: '移除历史：History to remove' })).toBeNull();
+  });
+  it('blocks ambiguous forget replay until a read-only list refresh', async () => {
+    vi.mocked(historyBridge.status).mockResolvedValue({ ...status, manageable: true });
+    vi.mocked(historyBridge.list).mockResolvedValue([{ chat_id: 'a', task_id: 'a', title: 'Old', message_count: 1, revision: '2', updated_ms: 1, listed: true }]);
+    vi.mocked(historyBridge.forget).mockRejectedValueOnce(new Error('private transport error'));
+    const user = userEvent.setup(); render(<HistorySettings native onRestore={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: '移除历史：Old' })); await user.click(screen.getByRole('button', { name: '确认移除此条历史' }));
+    expect((screen.getByRole('button', { name: '确认移除此条历史' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByText('private transport error')).toBeNull();
+    await user.click(screen.getByRole('button', { name: '重新读取历史列表' }));
+    await waitFor(() => expect(screen.queryByRole('group', { name: '确认移除单条历史' })).toBeNull());
+    expect(historyBridge.forget).toHaveBeenCalledOnce(); expect(historyBridge.enable).not.toHaveBeenCalled();
+  });
+  it('preview never reads or writes local storage', () => { render(<HistorySettings native={false} onRestore={vi.fn()} />); expect(historyBridge.status).not.toHaveBeenCalled(); expect(localStorage.length).toBe(0); });
+});

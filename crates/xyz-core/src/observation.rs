@@ -47,6 +47,23 @@ impl ObservationBuffer {
         let mut secrets = Zeroizing::new(known_secrets);
         let mut current = self.lock();
         let same_stream = current.stream_session.as_ref() == Some(&session);
+        // A later model/run must not unmask a prior run's known values in chat,
+        // archives or a still-visible shared terminal. Deduplicate new inputs.
+        for secret in std::mem::take(&mut current.run_secrets) {
+            if !current
+                .registered
+                .iter()
+                .any(|known| known.as_str() == secret.as_str())
+            {
+                current.registered.push(secret);
+            }
+        }
+        secrets.retain(|secret| {
+            !current
+                .registered
+                .iter()
+                .any(|known| known.as_str() == secret.as_str())
+        });
         let mut context = Zeroizing::new(String::new());
         let mut state = State {
             session: Some(session.clone()),
@@ -254,6 +271,31 @@ impl ObservationBuffer {
             gap: std::mem::take(&mut state.tail.gap) || state.blocked,
             untrusted: true,
         }
+    }
+
+    /// Start another connection without forgetting secrets already known to
+    /// this process. Raw output, parser state and every capture cursor are
+    /// discarded. Registration limits stay fail-closed; no plaintext fallback.
+    pub fn reset_capture_preserving_secrets(&self) {
+        let mut current = self.lock();
+        let mut registered = std::mem::take(&mut current.registered);
+        for secret in std::mem::take(&mut current.run_secrets) {
+            if !registered
+                .iter()
+                .any(|known| known.as_str() == secret.as_str())
+            {
+                registered.push(secret);
+            }
+        }
+        let mut next = State {
+            registered,
+            blocked: current.blocked,
+            ..State::default()
+        };
+        if !next.blocked {
+            next.rebuild_redactor();
+        }
+        *current = next;
     }
 
     /// Stop capture and discard all text, parser state, and known secrets.
@@ -1037,5 +1079,48 @@ mod tests {
             observer.redact_prose("prefix fixture-"),
             "prefix [REDACTED]"
         );
+    }
+    #[test]
+    fn reconnect_resets_capture_but_preserves_all_known_secret_rules() {
+        let buffer = ObservationBuffer::new();
+        buffer.add_known_secret("prior-ssh-credential").unwrap();
+        let session = SessionRef {
+            session_id: "synthetic-old-session".into(),
+            generation: "1".into(),
+        };
+        buffer.begin(session.clone(), vec!["prior-model-credential".into()]);
+        buffer.push(&session, b"ordinary old output");
+        buffer.reset_capture_preserving_secrets();
+        assert!(buffer.read().text.is_empty());
+        let safe = buffer.redact_prose("prior-ssh-credential prior-model-credential");
+        assert!(!safe.contains("prior-ssh-credential"));
+        assert!(!safe.contains("prior-model-credential"));
+        let next = SessionRef {
+            session_id: "synthetic-new-session".into(),
+            generation: "2".into(),
+        };
+        buffer.begin(next.clone(), vec!["new-model-credential".into()]);
+        buffer.push(
+            &next,
+            b"prior-ssh-credential prior-model-credential new-model-credential ",
+        );
+        let safe = buffer.read().text;
+        assert!(!safe.contains("credential"));
+        assert!(!safe.contains("ordinary old output"));
+    }
+    #[test]
+    fn next_capture_epoch_keeps_previous_model_secret_without_duplicate_growth() {
+        let buffer = ObservationBuffer::new();
+        let session = SessionRef {
+            session_id: "synthetic-session".into(),
+            generation: "1".into(),
+        };
+        for _ in 0..200 {
+            buffer.begin(session.clone(), vec!["old-model-secret".into()]);
+        }
+        buffer.begin(session, vec!["new-model-secret".into()]);
+        let safe = buffer.redact_prose("visible old-model-secret new-model-secret");
+        assert!(safe.contains("visible"));
+        assert!(!safe.contains("model-secret"));
     }
 }

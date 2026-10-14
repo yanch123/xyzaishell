@@ -86,7 +86,7 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
   expect(await page.evaluate(() => (window as unknown as { unsafe?: boolean }).unsafe)).toBeUndefined();
   const proceed = page.getByRole('button', { name: '确认就绪并继续分析' });
   await expect(proceed).toBeDisabled();
-  await page.getByRole('checkbox').check(); await proceed.click();
+  await page.getByRole('checkbox', { name: '我已检查终端，并确认当前可接收下一步命令。' }).check(); await proceed.click();
   await card.scrollIntoViewIfNeeded();
   await expect(page.getByRole('button', { name: '仅批准这条命令' })).toBeEnabled();
   await expect(card.getByLabel('准确命令文本')).toHaveText('touch ./synthetic-marker');

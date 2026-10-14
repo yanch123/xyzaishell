@@ -148,6 +148,18 @@ impl ModelConfigManager {
         this.reload();
         this
     }
+    /// Host-only filtering registration, not model-destination authorization.
+    /// The key never leaves the shared in-memory redactor through this API.
+    pub(crate) fn register_history_secrets(
+        &self,
+        redactor: &crate::observation::ObservationBuffer,
+    ) -> Result<(), ApiError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(snapshot) = &state.snapshot {
+            redactor.add_known_secret(snapshot.api_key.as_str())?;
+        }
+        Ok(())
+    }
     pub fn status(&self) -> ModelConfigStatus {
         self.state
             .lock()

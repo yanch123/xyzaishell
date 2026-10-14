@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import type { ActionIdentity, AgentEvent, StartTerminalTask, TaskIdentity, TerminalTaskSnapshot } from './agent';
 
 export const agentBridge = {
+  prepareSecret: (request: { task_id: string; run_id: string; field_name: string; purpose: string; prompt_confirmed: true }) => invoke<TerminalTaskSnapshot>('prepare_secret_input', { request }),
   list: () => invoke<TerminalTaskSnapshot[]>('list_terminal_tasks'),
   get: (taskId: string) => invoke<TerminalTaskSnapshot | null>('get_terminal_task', { taskId }),
   start: (request: StartTerminalTask) => invoke<TerminalTaskSnapshot>('start_terminal_task', { request }),

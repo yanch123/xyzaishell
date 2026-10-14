@@ -1,6 +1,7 @@
-//! Ephemeral, backend-owned chat transcripts. M2 exposes no executable tools,
-//! terminal context, local files, SSH credentials or cross-chat history.
+//! Backend-owned chat transcripts. Optional host-owned history restores only
+//! inert text and stable task identities; it never restores a live run.
 use crate::{
+    history::{HistoryEntry, HistoryService, HistoryStatus},
     model::{ModelConfigManager, ModelConfigStatus, ModelSnapshot},
     ssh::ApiError,
 };
@@ -13,7 +14,7 @@ use rig_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -74,6 +75,7 @@ struct ChatRecord {
     revision: u64,
     cancel: Option<watch::Sender<bool>>,
     terminal_run: Option<String>,
+    summarized_terminal_runs: BTreeSet<String>,
 }
 impl ChatRecord {
     fn changed(&mut self) {
@@ -87,6 +89,7 @@ pub struct TaskManager {
     chats: Arc<Mutex<BTreeMap<String, ChatRecord>>>,
     permits: Arc<Semaphore>,
     events: ModelEventSink,
+    history: Option<HistoryService>,
 }
 impl TaskManager {
     pub fn new(config: ModelConfigManager, events: ModelEventSink) -> Self {
@@ -95,7 +98,218 @@ impl TaskManager {
             chats: Arc::new(Mutex::new(BTreeMap::new())),
             permits: Arc::new(Semaphore::new(MAX_ACTIVE_RUNS)),
             events,
+            history: None,
         }
+    }
+    pub fn with_history(
+        config: ModelConfigManager,
+        events: ModelEventSink,
+        history: HistoryService,
+    ) -> Self {
+        let mut manager = Self::new(config, events);
+        if let Err(error) = manager.config.register_history_secrets(history.redactor()) {
+            history.fail(error);
+        }
+        manager.history = Some(history);
+        manager
+    }
+    fn history(&self) -> Result<&HistoryService, ApiError> {
+        self.history.as_ref().ok_or_else(|| {
+            ApiError::new(
+                "HISTORY_UNAVAILABLE",
+                "Local history is not configured in this host.",
+            )
+        })
+    }
+    pub fn history_status(&self) -> HistoryStatus {
+        self.history
+            .as_ref()
+            .map(HistoryService::status)
+            .unwrap_or(HistoryStatus {
+                enabled: false,
+                manageable: false,
+                available: false,
+                plaintext: true,
+                revision: "0".into(),
+                error: None,
+            })
+    }
+    /// Blocking host command; invoke off the UI thread.
+    pub fn set_history_enabled(&self, enabled: bool) -> Result<HistoryStatus, ApiError> {
+        let history = self.history()?;
+        if enabled {
+            self.config.register_history_secrets(history.redactor())?;
+        }
+        if !enabled {
+            return history.set_enabled(false, &[]);
+        }
+        // Hold the mutation lock through the opt-in handoff. A completed chat
+        // change cannot fall between the initial snapshot and enabling capture.
+        let chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshots: Vec<_> = chats
+            .values()
+            .map(|record| record.snapshot.clone())
+            .collect();
+        history.set_enabled(true, &snapshots)
+    }
+    pub fn list_saved_chats(&self) -> Result<Vec<HistoryEntry>, ApiError> {
+        self.history()?.list()
+    }
+    pub fn restore_saved_chat(
+        &self,
+        chat_id: &str,
+        expected_revision: &str,
+    ) -> Result<ChatSnapshot, ApiError> {
+        let history = self.history()?;
+        let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        if chats.contains_key(chat_id) {
+            return Err(ApiError::new(
+                "CHAT_ALREADY_OPEN",
+                "This chat is already open. Its current messages and runs were not replaced.",
+            ));
+        }
+        if chats.len() >= MAX_CHATS {
+            return Err(ApiError::new(
+                "CHAT_LIMIT",
+                "This process supports at most 32 open chats.",
+            ));
+        }
+        // Keep the slot reserved while the blocking worker reads. No live chat,
+        // cancellation sender, terminal owner, or approval map is overwritten.
+        let snapshot = history.restore(chat_id, expected_revision)?;
+        let revision = snapshot.revision.parse::<u64>().map_err(|_| {
+            ApiError::new("HISTORY_INVALID_RECORD", "The saved revision is invalid.")
+        })?;
+        chats.insert(
+            snapshot.chat_id.clone(),
+            ChatRecord {
+                snapshot: snapshot.clone(),
+                revision,
+                cancel: None,
+                terminal_run: None,
+                summarized_terminal_runs: BTreeSet::new(),
+            },
+        );
+        drop(chats);
+        self.emit_chat(snapshot.clone());
+        Ok(self.sanitize_snapshot(snapshot))
+    }
+    pub fn forget_saved_chat(
+        &self,
+        chat_id: &str,
+        expected_revision: &str,
+    ) -> Result<HistoryStatus, ApiError> {
+        self.history()?.forget(chat_id, expected_revision)
+    }
+    pub fn flush_history(&self) -> Result<(), ApiError> {
+        self.history.as_ref().map_or(Ok(()), HistoryService::flush)
+    }
+    fn sanitize_snapshot(&self, mut chat: ChatSnapshot) -> ChatSnapshot {
+        if let Some(history) = &self.history {
+            let redactor = history.redactor();
+            chat.title = redactor.redact_prose(&chat.title);
+            for message in &mut chat.messages {
+                message.text = redactor.redact_prose(&message.text);
+                message.destination = message
+                    .destination
+                    .as_ref()
+                    .map(|text| redactor.redact_prose(text));
+                message.model = message
+                    .model
+                    .as_ref()
+                    .map(|text| redactor.redact_prose(text));
+            }
+        }
+        chat
+    }
+    fn chat_redactor(&self) -> crate::observation::ObservationBuffer {
+        self.history
+            .as_ref()
+            .map(|history| history.redactor().clone())
+            .unwrap_or_default()
+    }
+    fn emit_chat(&self, chat: ChatSnapshot) -> bool {
+        let chat = self.sanitize_snapshot(chat);
+        if let Some(history) = &self.history {
+            history.capture(&chat);
+        }
+        (self.events)(ModelEvent::ChatUpdated { chat })
+    }
+    /// Final terminal conversations become bounded, inert prose only. Runtime
+    /// identifiers are used solely for in-memory duplicate suppression and are
+    /// never copied into the resulting message or persistence payload.
+    pub(crate) fn record_terminal_summary(
+        &self,
+        task: &crate::agent::TerminalTaskSnapshot,
+    ) -> Result<(), ApiError> {
+        if !matches!(task.phase.as_str(), "completed" | "failed" | "cancelled") {
+            return Ok(());
+        }
+        let result = self.record_terminal_summary_inner(task);
+        if let Err(error) = &result {
+            if let Some(history) = &self.history {
+                history.fail(error.clone());
+            }
+        }
+        result
+    }
+    fn record_terminal_summary_inner(
+        &self,
+        task: &crate::agent::TerminalTaskSnapshot,
+    ) -> Result<(), ApiError> {
+        let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        let record = chats.get_mut(&task.chat_id).ok_or_else(chat_missing)?;
+        if task.task_id != record.snapshot.task_id || Uuid::parse_str(&task.run_id).is_err() {
+            return Err(ApiError::new(
+                "HISTORY_TASK_MISMATCH",
+                "The terminal summary does not match this chat's stable task.",
+            ));
+        }
+        if record.summarized_terminal_runs.contains(&task.run_id) {
+            return Ok(());
+        }
+        let redactor = self.chat_redactor();
+        let instruction =
+            bounded_history_excerpt(&redactor.redact_prose(&task.instruction), 6 * 1024);
+        let assistant =
+            bounded_history_excerpt(&redactor.redact_prose(&task.assistant_text), 8 * 1024);
+        let outcome = if task.remote_outcome == "not_sent" && !task.owner {
+            "No remote delivery recorded."
+        } else {
+            "Unknown. Verify the actual server state; this record is not proof of success."
+        };
+        let count = task
+            .actions
+            .len()
+            .saturating_add(usize::from(task.action.is_some()));
+        let text = format!("Historical terminal task (inert record)\nStatus: {}\nRemote result: {outcome}\nActions proposed: {count}. Command payloads and raw terminal output are not included.\n\nInstruction:\n{instruction}\n\nAssistant notes:\n{assistant}", task.phase);
+        let bytes: usize = record
+            .snapshot
+            .messages
+            .iter()
+            .map(|message| message.text.len())
+            .sum();
+        if record.snapshot.messages.len() >= MAX_MESSAGES
+            || bytes.saturating_add(text.len()) > MAX_TRANSCRIPT_BYTES
+        {
+            return Err(ApiError::new("HISTORY_SUMMARY_LIMIT", "This chat cannot fit another terminal summary. Existing text was not trimmed; the terminal view retains the current result in memory."));
+        }
+        record.summarized_terminal_runs.insert(task.run_id.clone());
+        record.snapshot.messages.push(ChatMessage {
+            id: Uuid::new_v4().to_string(),
+            role: MessageRole::Assistant,
+            text,
+            run_id: String::new(),
+            state: MessageState::Complete,
+            error: None,
+            destination: None,
+            model: None,
+        });
+        record.changed();
+        let chat = record.snapshot.clone();
+        drop(chats);
+        self.emit_chat(chat);
+        Ok(())
     }
     pub(crate) fn reserve_terminal(
         &self,
@@ -126,6 +340,11 @@ impl TaskManager {
     }
     pub fn reload_config(&self) -> ModelConfigStatus {
         let config = self.config.reload();
+        if let Some(history) = &self.history {
+            if let Err(error) = self.config.register_history_secrets(history.redactor()) {
+                history.fail(error);
+            }
+        }
         (self.events)(ModelEvent::ConfigUpdated {
             config: config.clone(),
         });
@@ -143,20 +362,27 @@ impl TaskManager {
         Ok(config)
     }
     pub fn list_chats(&self) -> Vec<ChatSnapshot> {
-        self.chats
+        let snapshots: Vec<_> = self
+            .chats
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|c| c.snapshot.clone())
+            .map(|record| record.snapshot.clone())
+            .collect();
+        snapshots
+            .into_iter()
+            .map(|chat| self.sanitize_snapshot(chat))
             .collect()
     }
     pub fn get_chat(&self, chat_id: &str) -> Result<ChatSnapshot, ApiError> {
-        self.chats
+        let chat = self
+            .chats
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(chat_id)
-            .map(|c| c.snapshot.clone())
-            .ok_or_else(chat_missing)
+            .map(|record| record.snapshot.clone())
+            .ok_or_else(chat_missing)?;
+        Ok(self.sanitize_snapshot(chat))
     }
     pub fn create_chat(&self, title: &str) -> Result<ChatSnapshot, ApiError> {
         self.create_chat_inner(title, true)
@@ -172,7 +398,7 @@ impl TaskManager {
         if chats.len() >= MAX_CHATS {
             return Err(ApiError::new(
                 "CHAT_LIMIT",
-                "This process supports at most 32 chats. Histories are memory-only in M2.",
+                "This process supports at most 32 open chats.",
             ));
         }
         let id = Uuid::new_v4().to_string();
@@ -191,13 +417,14 @@ impl TaskManager {
                 revision: 1,
                 cancel: None,
                 terminal_run: None,
+                summarized_terminal_runs: BTreeSet::new(),
             },
         );
         drop(chats);
         if announce {
-            (self.events)(ModelEvent::ChatUpdated { chat: chat.clone() });
+            self.emit_chat(chat.clone());
         }
-        Ok(chat)
+        Ok(self.sanitize_snapshot(chat))
     }
     pub fn probe(&self) -> Result<ChatSnapshot, ApiError> {
         // Check consent before even creating the local diagnostic chat.
@@ -227,7 +454,7 @@ impl TaskManager {
         // The immutable snapshot and destination consent are resolved before
         // any client/connection is constructed. Reload cannot redirect a run.
         let config = self.config.authorized_snapshot()?;
-        let redactor = crate::observation::ObservationBuffer::new();
+        let redactor = self.chat_redactor();
         redactor.add_known_secret(config.api_key.as_str())?;
         let safe_text = redactor.redact_prose(text);
         let text = safe_text.as_str();
@@ -252,6 +479,11 @@ impl TaskManager {
             return Err(ApiError::new("CHAT_CONTEXT_FULL", "This chat reached its bounded context limit. Create a new chat; history is never silently trimmed."));
         }
         let run_id = Uuid::new_v4().to_string();
+        // New task credentials may have been learned after older prose was
+        // written. Re-filter the entire current-task context before transmission.
+        for message in &mut record.snapshot.messages {
+            message.text = redactor.redact_prose(&message.text);
+        }
         let history = record
             .snapshot
             .messages
@@ -288,9 +520,7 @@ impl TaskManager {
         record.changed();
         let snapshot = record.snapshot.clone();
         drop(chats);
-        if !(self.events)(ModelEvent::ChatUpdated {
-            chat: snapshot.clone(),
-        }) {
+        if !self.emit_chat(snapshot.clone()) {
             self.finish_run(
                 chat_id,
                 &run_id,
@@ -315,7 +545,7 @@ impl TaskManager {
             };
             this.finish_run(&chat_id, &run_id, result);
         });
-        Ok(snapshot)
+        Ok(self.sanitize_snapshot(snapshot))
     }
     pub fn cancel_run(&self, chat_id: &str, run_id: &str) -> Result<ChatSnapshot, ApiError> {
         let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
@@ -337,8 +567,8 @@ impl TaskManager {
         record.changed();
         let chat = record.snapshot.clone();
         drop(chats);
-        (self.events)(ModelEvent::ChatUpdated { chat: chat.clone() });
-        Ok(chat)
+        self.emit_chat(chat.clone());
+        Ok(self.sanitize_snapshot(chat))
     }
     fn append_text(
         &self,
@@ -366,7 +596,7 @@ impl TaskManager {
         let snapshot = emit.then(|| record.snapshot.clone());
         drop(chats);
         if let Some(chat) = snapshot {
-            if !(self.events)(ModelEvent::ChatUpdated { chat }) {
+            if !self.emit_chat(chat) {
                 return Err(ApiError::new(
                     "MODEL_DELIVERY_FAILED",
                     "The chat view stopped accepting updates. The model request was stopped.",
@@ -402,7 +632,7 @@ impl TaskManager {
         record.changed();
         let chat = record.snapshot.clone();
         drop(chats);
-        (self.events)(ModelEvent::ChatUpdated { chat });
+        self.emit_chat(chat);
     }
     async fn stream_reply(
         &self,
@@ -426,7 +656,7 @@ impl TaskManager {
             .chat(&config.model);
         let request = CompletionRequest::new(text).messages(history).preamble("You are xyzaishell's text-chat assistant. You have no terminal, file, credential, or execution tools in this milestone. Never claim to have run commands. Previous assistant text may be partial if its response was interrupted.").max_tokens(config.request.max_output_tokens);
         let mut stream = model.stream(request).map_err(|_| safe_provider_error())?;
-        let redactor = crate::observation::ObservationBuffer::new();
+        let redactor = self.chat_redactor();
         redactor.add_known_secret(config.api_key.as_str())?;
         let mut raw_output = zeroize::Zeroizing::new(String::new());
         let mut last_emit = Instant::now() - Duration::from_secs(1);
@@ -477,6 +707,19 @@ impl TaskManager {
             )),
         }
     }
+}
+fn bounded_history_excerpt(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[Summary excerpt truncated at its size limit]",
+        &text[..end]
+    )
 }
 async fn wait_cancelled(receiver: &mut watch::Receiver<bool>) {
     loop {

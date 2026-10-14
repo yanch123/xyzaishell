@@ -1,8 +1,10 @@
 import type { ApiError, SessionRef } from './types';
 
 /** All execution authority lives in the native dispatcher; these are display DTOs. */
-export type TaskPhase = 'preparing' | 'awaiting_display' | 'waiting_approval' | 'dispatching' | 'needs_user' | 'completed' | 'cancelled' | 'failed';
+export type TaskPhase = 'preparing' | 'awaiting_display' | 'waiting_approval' | 'dispatching' | 'needs_user' | 'needs_secrets' | 'completed' | 'cancelled' | 'failed';
 export type TerminalAction = {
+  kind?: 'command' | 'secret_input';
+  secret_field?: string | null;
   action_id: string;
   display_revision: string;
   command_text: string;
@@ -32,6 +34,7 @@ export type TerminalTaskSnapshot = {
   owner: boolean;
   remote_outcome: 'unknown' | 'not_sent';
   round: number;
+  secret_request?: { fields: { name: string; required: boolean }[]; purpose: string } | null;
 };
 export type StartTerminalTask = {
   chat_id: string;
@@ -45,7 +48,7 @@ export type ActionIdentity = TaskIdentity & { action_id: string; display_revisio
 export type AgentEvent = { kind: 'task_updated'; task: TerminalTaskSnapshot };
 export const TASK_PHASE_LABELS: Record<TaskPhase, string> = {
   preparing: '模型分析中', awaiting_display: '命令已准备 · 等待显示', waiting_approval: '等待本次批准',
-  dispatching: '正在派发', needs_user: '需你核实终端', completed: 'AI 流程已结束', cancelled: 'AI 已停止', failed: 'AI 流程出错',
+  needs_secrets: '需要任务秘密 · 等待本机填写', dispatching: '正在派发', needs_user: '需你核实终端', completed: 'AI 流程已结束', cancelled: 'AI 已停止', failed: 'AI 流程出错',
 };
 export const DELIVERY_LABELS: Record<TerminalAction['delivery'], string> = {
   not_sent: '尚未发送', queued: '已排队 · 尚未写入', dispatch_started: '已开始写入 · 结果未知',

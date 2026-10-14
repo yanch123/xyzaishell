@@ -6,7 +6,7 @@ import { actionIdentity } from '../lib/agent';
 import type { SessionSnapshot } from '../lib/types';
 import { chat, modelConfig } from '../test/modelFixtures';
 import { action, connectedSession, startRequest, task } from '../test/agentFixtures';
-const mocks = vi.hoisted(() => ({ native: vi.fn(), listen: vi.fn(), list: vi.fn(), get: vi.fn(), start: vi.fn(), ack: vi.fn(), decide: vi.fn(), cancel: vi.fn(), continue: vi.fn() }));
+const mocks = vi.hoisted(() => ({ native: vi.fn(), listen: vi.fn(), list: vi.fn(), get: vi.fn(), start: vi.fn(), ack: vi.fn(), decide: vi.fn(), cancel: vi.fn(), continue: vi.fn(), prepareSecret: vi.fn() }));
 vi.mock('../lib/bridge', () => ({ desktopAvailable: mocks.native }));
 vi.mock('../lib/agentBridge', () => ({ agentBridge: mocks }));
 import { useTerminalAgent } from './useTerminalAgent';
@@ -23,6 +23,21 @@ async function ready(saved: TerminalTaskSnapshot[] = []) {
   return hook;
 }
 describe('M3 terminal agent authority and recovery', () => {
+  it('binds prepared secret input to the paused owned run, prevents duplicate mutation and rejects stale connection', async () => {
+    const paused = task({ phase: 'needs_secrets' });
+    const { result, rerender } = await ready([paused]);
+    mocks.prepareSecret.mockResolvedValue(task({ revision: '2', phase: 'awaiting_display', action: action({ policy: 'require_approval', command_text: '[Secret input: service_password]' }) }));
+    await act(async () => { await result.current.prepareSecret('chat-a', 'wrong-run', 'service_password', 'Auth'); });
+    expect(mocks.prepareSecret).not.toHaveBeenCalled();
+    await act(async () => { await result.current.prepareSecret('chat-a', 'run-a', 'service_password', 'Auth'); });
+    expect(mocks.prepareSecret).toHaveBeenCalledExactlyOnceWith({ task_id: 'chat-a', run_id: 'run-a', field_name: 'service_password', purpose: 'Auth', prompt_confirmed: true });
+    await act(async () => { await result.current.prepareSecret('chat-a', 'run-a', 'service_password', 'Auth'); });
+    expect(mocks.prepareSecret).toHaveBeenCalledOnce(); expect(mocks.decide).not.toHaveBeenCalled();
+    rerender({ session: { ...connectedSession, session: { session_id: 'other', generation: '2' } } });
+    await act(async () => { await result.current.prepareSecret('chat-a', 'run-a', 'service_password', 'Auth'); });
+    expect(mocks.prepareSecret).toHaveBeenCalledOnce();
+  });
+
   it('subscribes before recovery, including StrictMode, without starting or acknowledging any task', async () => {
     mocks.list.mockResolvedValue([task({ phase: 'awaiting_display', action: action() })]);
     const { result } = renderHook(() => useTerminalAgent(modelConfig, connectedSession), { wrapper: StrictMode });

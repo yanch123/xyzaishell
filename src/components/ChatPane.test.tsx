@@ -39,7 +39,7 @@ describe('M2 model chat UI', () => {
     act(() => emit({ kind: 'chat_updated', chat: stream('chat-a', '3', 'This is a streamed response.') }));
     expect(screen.getByText('This is a streamed response.')).toBeDefined();
     expect(screen.getByRole('button', { name: '停止生成' })).toBeDefined();
-    expect(screen.getByText(/未执行任何终端操作/)).toBeDefined();
+    expect(screen.getByText(/文字回复本身不会执行命令/)).toBeDefined();
   });
   it('asks for consent before a first send instead of calling the provider', async () => {
     mocks.config.mockResolvedValue({ ...modelConfig, consented: false });
