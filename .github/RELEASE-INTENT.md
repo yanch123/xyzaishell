@@ -1,7 +1,7 @@
 # Explicit release-intent procedure
 
 This document does not activate a release. The existing `.github/release-intent.json`
-records the completed v0.1.0 release; leave it unchanged during development.
+records the most recently activated release; leave it unchanged during development.
 Replace it only after the release owner has approved the new exact version,
 source commit, publication mode and acceptance evidence.
 

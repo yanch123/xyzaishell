@@ -1,0 +1,130 @@
+{
+  "reviewed_at": "2026-10-15",
+  "release_url": "https://github.com/yanch123/xyzaishell/releases/tag/v0.1.2",
+  "release_api_url": "https://api.github.com/repos/yanch123/xyzaishell/releases/412925486",
+  "release_id": 412925486,
+  "tag": "v0.1.2",
+  "source_commit": "423fc24242ca6b168afc151d7b9f3985a92c1566",
+  "baseline_version": "0.1.2",
+  "target_version": "0.1.3",
+  "workflow_run": "38594474625",
+  "workflow_attempt": "1",
+  "note": "Public release asset sizes/digests independently read through GitHub release and tag API. Installer and manifest bytes downloaded from the release workflow artifacts below match those public pins. Application identities read from the same run's native acceptance; Linux also independently extracted from the matching DEB. No binary was executed locally.",
+  "artifacts": [
+    {
+      "id": 11909762552,
+      "name": "installers-windows-x64",
+      "sha256": "4076212913404e4ee91e8c19ea3bb39a52f47f6f72fc5992b71a85a35ccc90ed",
+      "url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11909762552/zip"
+    },
+    {
+      "id": 11909423397,
+      "name": "native-acceptance-ubuntu-22.04",
+      "sha256": "5e7f378374032edd493df4c667133a0afe2739fc1ae9e3c687bf28d81775dc41",
+      "url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11909423397/zip"
+    },
+    {
+      "id": 11909358403,
+      "name": "native-acceptance-windows-2022",
+      "sha256": "f9f99850a6a9f8793665bd3af10fee0c06e2771277135c5aeecb0324a2e1db8a",
+      "url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11909358403/zip"
+    },
+    {
+      "id": 11909308077,
+      "name": "installers-linux-x64",
+      "sha256": "0cea1728ba72bb5a719c8c6e8b90624478d80a594c7c66500338fe96266461b8",
+      "url": "https://api.github.com/repos/yanch123/xyzaishell/actions/artifacts/11909308077/zip"
+    }
+  ],
+  "platforms": {
+    "linux-x64": {
+      "assets": [
+        {
+          "id": 640915986,
+          "name": "build-linux-x64.json",
+          "size": 1107,
+          "sha256": "85f4cbbb26c3618ef3120113188768ced9a280a57b9efd7c3bd930e15118e600",
+          "url": "https://github.com/yanch123/xyzaishell/releases/download/v0.1.2/build-linux-x64.json"
+        },
+        {
+          "id": 640915987,
+          "name": "xyzaishell-0.1.2-linux-x64.deb",
+          "size": 11965316,
+          "sha256": "67a8323a3cbe19c5b876c2abe9a9a3cde69a2f03f7506525d1026f37c36ad984",
+          "url": "https://github.com/yanch123/xyzaishell/releases/download/v0.1.2/xyzaishell-0.1.2-linux-x64.deb"
+        }
+      ],
+      "manifest_bytes_base64": "ewogICJzY2hlbWFfdmVyc2lvbiI6IDEsCiAgInNvdXJjZV9jb21taXQiOiAiNDIzZmMyNDI0MmNhNmIxNjhhZmMxNTFkN2I5ZjM5ODVhOTJjMTU2NiIsCiAgInZlcnNpb24iOiAiMC4xLjIiLAogICJwbGF0Zm9ybSI6ICJsaW51eC14NjQiLAogICJidW5kbGUiOiAiZGViIiwKICAicGFja2FnZV9maWxlIjogInh5emFpc2hlbGwtMC4xLjItbGludXgteDY0LmRlYiIsCiAgInBhY2thZ2Vfc2hhMjU2IjogIjY3YTgzMjNhM2NiZTE5YzViODc2YzJhYmU5YTlhM2NkZTY5YTJmMDNmNzUwNjUyNWQxMDI2ZjM3YzM2YWQ5ODQiLAogICJsb2NrZmlsZXMiOiB7CiAgICAiQ2FyZ28ubG9jayI6ICJjNzAyMTM5MTg1ZGMwZDFkZmJjYzQyZTgwZmI3MzljMDM2NDYzZDQwYzkwNjkxMmE0MGIwNzRmZjRjOTlmZjcwIiwKICAgICJwYWNrYWdlLWxvY2suanNvbiI6ICI3YmI1ZTQ4ZTlkZDZiYTQ2YmUxOGM4Mzg3NzA1NzY0OWRkNThjZTQ5ZjAyMTc2NmY2YjQwYjc0NGVhMTRjMTcwIgogIH0sCiAgInJ1c3RjIjogInJ1c3RjIDEuOTkuMCAoYjk0MDA4NGQ3IDIwMjYtMDktMjgpXG5iaW5hcnk6IHJ1c3RjXG5jb21taXQtaGFzaDogYjk0MDA4NGQ3ZWI2YTI5OWViNGJmZWI4ZTM0OTAxYmMwNTFlN2FjNFxuY29tbWl0LWRhdGU6IDIwMjYtMDktMjhcbmhvc3Q6IHg4Nl82NC11bmtub3duLWxpbnV4LWdudVxucmVsZWFzZTogMS45OS4wXG5MTFZNIHZlcnNpb246IDIzLjEuMSIsCiAgImNhcmdvIjogImNhcmdvIDEuOTkuMCAoNWY5NGRmNDc4IDIwMjYtMDgtMjcpIiwKICAibm9kZSI6ICJ2MjIuMjMuMyIsCiAgInJ1bm5lcl9vcyI6ICJMaW51eCIsCiAgInJ1bm5lcl9pbWFnZSI6ICJ1YnVudHUyMiIsCiAgInJ1bm5lcl9pbWFnZV92ZXJzaW9uIjogIjIwMjYxMDEyLjMyMi4xIiwKICAid29ya2Zsb3dfcnVuIjogIjM4NTk0NDc0NjI1IiwKICAid29ya2Zsb3dfYXR0ZW1wdCI6ICIxIiwKICAic2lnbmluZyI6ICJObyBzaWduaW5nIGNyZWRlbnRpYWwgaXMgc3VwcGxpZWQgYnkgdGhpcyB3b3JrZmxvdy4iLAogICJhY2NlcHRhbmNlIjogIkJ1aWxkIGFuZCBhdXRvbWF0ZWQgY2hlY2tzIG9ubHk7IGludGVyYWN0aXZlIGRlc2t0b3AgYWNjZXB0YW5jZSBpcyBzZXBhcmF0ZS4iCn0K",
+      "installed_evidence_path": "first-install-and-restart/result.json",
+      "installed_evidence": {
+        "result": "passed",
+        "phase": "seed",
+        "application_sha256": "22421c99a4dc3984ae32421c35b24bb48f75decf584d16f23a89a47f7dc5d0c9",
+        "application_version": "0.1.2",
+        "upgrade_from": null,
+        "native_ipc": true,
+        "synthetic_loopback_model": true,
+        "profile_and_history_persisted": true,
+        "restored_task_identity_preserved": true,
+        "history_requires_new_process_consent": true,
+        "restore_model_requests": 0,
+        "shell_log_empty_export_fail_closed": true,
+        "profile_id_preserved": true,
+        "legacy_history_rows_and_protected_profile_backup_verified": false,
+        "model_settings_saved_and_tested_via_ui": true,
+        "not_tested": [
+          "real provider",
+          "SSH via UI",
+          "desktop input methods",
+          "Windows 10/11",
+          "version upgrade in this phase"
+        ]
+      },
+      "independently_extracted_application_sha256": "22421c99a4dc3984ae32421c35b24bb48f75decf584d16f23a89a47f7dc5d0c9"
+    },
+    "windows-x64": {
+      "assets": [
+        {
+          "id": 640915995,
+          "name": "build-windows-x64.json",
+          "size": 1132,
+          "sha256": "334cd446aa04915d4c6f8b5e0f4801df88e921eba585effd6a7689f7cfdbabe4",
+          "url": "https://github.com/yanch123/xyzaishell/releases/download/v0.1.2/build-windows-x64.json"
+        },
+        {
+          "id": 640916030,
+          "name": "xyzaishell-0.1.2-windows-x64.exe",
+          "size": 6532549,
+          "sha256": "f1fdb819a23e30f767fabbc16ae916d4d8b254a978b980fb2ae624e5fa6a99c9",
+          "url": "https://github.com/yanch123/xyzaishell/releases/download/v0.1.2/xyzaishell-0.1.2-windows-x64.exe"
+        }
+      ],
+      "manifest_bytes_base64": "ew0KICAic2NoZW1hX3ZlcnNpb24iOiAxLA0KICAic291cmNlX2NvbW1pdCI6ICI0MjNmYzI0MjQyY2E2YjE2OGFmYzE1MWQ3YjlmMzk4NWE5MmMxNTY2IiwNCiAgInZlcnNpb24iOiAiMC4xLjIiLA0KICAicGxhdGZvcm0iOiAid2luZG93cy14NjQiLA0KICAiYnVuZGxlIjogIm5zaXMiLA0KICAicGFja2FnZV9maWxlIjogInh5emFpc2hlbGwtMC4xLjItd2luZG93cy14NjQuZXhlIiwNCiAgInBhY2thZ2Vfc2hhMjU2IjogImYxZmRiODE5YTIzZTMwZjc2N2ZhYmJjMTZhZTkxNmQ0ZDhiMjU0YTk3OGI5ODBmYjJhZTYyNGU1ZmE2YTk5YzkiLA0KICAibG9ja2ZpbGVzIjogew0KICAgICJDYXJnby5sb2NrIjogImM3MDIxMzkxODVkYzBkMWRmYmNjNDJlODBmYjczOWMwMzY0NjNkNDBjOTA2OTEyYTQwYjA3NGZmNGM5OWZmNzAiLA0KICAgICJwYWNrYWdlLWxvY2suanNvbiI6ICI3YmI1ZTQ4ZTlkZDZiYTQ2YmUxOGM4Mzg3NzA1NzY0OWRkNThjZTQ5ZjAyMTc2NmY2YjQwYjc0NGVhMTRjMTcwIg0KICB9LA0KICAicnVzdGMiOiAicnVzdGMgMS45OS4wIChiOTQwMDg0ZDcgMjAyNi0wOS0yOClcbmJpbmFyeTogcnVzdGNcbmNvbW1pdC1oYXNoOiBiOTQwMDg0ZDdlYjZhMjk5ZWI0YmZlYjhlMzQ5MDFiYzA1MWU3YWM0XG5jb21taXQtZGF0ZTogMjAyNi0wOS0yOFxuaG9zdDogeDg2XzY0LXBjLXdpbmRvd3MtbXN2Y1xucmVsZWFzZTogMS45OS4wXG5MTFZNIHZlcnNpb246IDIzLjEuMSIsDQogICJjYXJnbyI6ICJjYXJnbyAxLjk5LjAgKDVmOTRkZjQ3OCAyMDI2LTA4LTI3KSIsDQogICJub2RlIjogInYyMi4yMy4zIiwNCiAgInJ1bm5lcl9vcyI6ICJXaW5kb3dzIiwNCiAgInJ1bm5lcl9pbWFnZSI6ICJ3aW4yMiIsDQogICJydW5uZXJfaW1hZ2VfdmVyc2lvbiI6ICIyMDI2MTAxMi4zMzMuMSIsDQogICJ3b3JrZmxvd19ydW4iOiAiMzg1OTQ0NzQ2MjUiLA0KICAid29ya2Zsb3dfYXR0ZW1wdCI6ICIxIiwNCiAgInNpZ25pbmciOiAiTm8gc2lnbmluZyBjcmVkZW50aWFsIGlzIHN1cHBsaWVkIGJ5IHRoaXMgd29ya2Zsb3cuIiwNCiAgImFjY2VwdGFuY2UiOiAiQnVpbGQgYW5kIGF1dG9tYXRlZCBjaGVja3Mgb25seTsgaW50ZXJhY3RpdmUgZGVza3RvcCBhY2NlcHRhbmNlIGlzIHNlcGFyYXRlLiINCn0NCg==",
+      "installed_evidence_path": "first-install-and-restart/result.json",
+      "installed_evidence": {
+        "result": "passed",
+        "phase": "seed",
+        "application_sha256": "b22b65610ed7ea26bda03144249e7f40862d1e7b7b3463bcd0a170bcc2f9d62d",
+        "application_version": "0.1.2",
+        "upgrade_from": null,
+        "native_ipc": true,
+        "synthetic_loopback_model": true,
+        "profile_and_history_persisted": true,
+        "restored_task_identity_preserved": true,
+        "history_requires_new_process_consent": true,
+        "restore_model_requests": 0,
+        "shell_log_empty_export_fail_closed": true,
+        "profile_id_preserved": true,
+        "legacy_history_rows_and_protected_profile_backup_verified": false,
+        "model_settings_saved_and_tested_via_ui": true,
+        "not_tested": [
+          "real provider",
+          "SSH via UI",
+          "desktop input methods",
+          "Windows 10/11",
+          "version upgrade in this phase"
+        ]
+      }
+    }
+  }
+}

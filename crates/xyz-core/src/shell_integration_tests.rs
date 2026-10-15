@@ -78,6 +78,61 @@ fn connected_is_not_ready_and_install_requires_one_explicit_confirmation() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn unsupported_reasons_have_specific_safe_diagnostics_and_never_restore_readiness() {
+    for (reason, code, hint) in [
+        (
+            "unsupported_bash",
+            "SHELL_UNSUPPORTED_BASH",
+            "Bash 5.1 or 5.2",
+        ),
+        (
+            "namespace_conflict",
+            "SHELL_UNSUPPORTED_NAMESPACE",
+            "__xyz_",
+        ),
+        (
+            "unsupported_options",
+            "SHELL_UNSUPPORTED_OPTIONS",
+            "HISTIGNORE",
+        ),
+        ("unsupported_trap", "SHELL_UNSUPPORTED_TRAP", "EXIT"),
+        ("dynamic_prompt", "SHELL_UNSUPPORTED_DYNAMIC_PROMPT", "PS1"),
+        (
+            "unsupported_hook_attributes",
+            "SHELL_UNSUPPORTED_HOOK_ATTRIBUTES",
+            "PROMPT_COMMAND",
+        ),
+        ("missing_tools", "SHELL_UNSUPPORTED_MISSING_TOOLS", "base64"),
+        (
+            "private_unrecognized_reason",
+            "SHELL_UNSUPPORTED",
+            "unrecognized",
+        ),
+    ] {
+        let f = Fixture::new();
+        f.event(&format!("U;{reason}"));
+        let status = f.service.status();
+        assert_eq!(status.phase, IntegrationPhase::Unsupported, "{reason}");
+        let diagnostic = status.error.unwrap();
+        assert_eq!(diagnostic.code, code);
+        assert!(
+            diagnostic.safe_message.contains(hint),
+            "{}",
+            diagnostic.safe_message
+        );
+        assert!(diagnostic.safe_message.contains("manual terminal"));
+        assert!(!diagnostic
+            .safe_message
+            .contains("private_unrecognized_reason"));
+        assert!(f.service.ready_snapshot(f.session()).is_err());
+        assert!(f.service.confirm_install(f.snapshot.clone(), true).is_err());
+        // Later remote text cannot turn an unsupported session into readiness.
+        f.ready();
+        assert_eq!(f.service.status().phase, IntegrationPhase::Unsupported);
+    }
+}
 #[test]
 fn matched_end_is_not_ready_and_never_approves_another_action() {
     let f = Fixture::new();

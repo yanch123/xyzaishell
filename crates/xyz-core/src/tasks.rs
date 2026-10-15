@@ -314,7 +314,15 @@ impl TaskManager {
         let instruction =
             bounded_history_excerpt(&redactor.redact_prose(&task.instruction), 6 * 1024);
         let assistant =
-            bounded_history_excerpt(&redactor.redact_prose(&task.assistant_text), 8 * 1024);
+            bounded_history_excerpt(&redactor.redact_prose(&task.assistant_text), 4 * 1024);
+        let retained = task
+            .task_context
+            .as_ref()
+            .filter(|context| context.matches(&task.task_id, &task.run_id, &task.session))
+            .map(|context| {
+                bounded_history_excerpt(&redactor.redact_prose(&context.history_text()), 4 * 1024)
+            })
+            .unwrap_or_default();
         let outcome = if task.remote_outcome == "not_sent" && !task.owner {
             "No remote delivery recorded."
         } else {
@@ -324,7 +332,7 @@ impl TaskManager {
             .actions
             .len()
             .saturating_add(usize::from(task.action.is_some()));
-        let text = format!("Historical terminal task (inert record)\nStatus: {}\nRemote result: {outcome}\nActions proposed: {count}. Command payloads and raw terminal output are not included.\n\nInstruction:\n{instruction}\n\nAssistant notes:\n{assistant}", task.phase);
+        let text = format!("Historical terminal task (inert record)\nStatus: {}\nRemote result: {outcome}\nActions proposed: {count}. Command payloads and raw terminal output are not included.\n\nInstruction:\n{instruction}\n\nAssistant notes:\n{assistant}\n\n{retained}", task.phase);
         let bytes: usize = record
             .snapshot
             .messages

@@ -1,0 +1,26 @@
+.terminal-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; padding: 5px 12px; border-bottom: 1px solid var(--border, #27303e); background: #14171e; }
+.terminal-tools button { padding: 4px 7px; border: 1px solid #303948; border-radius: 4px; background: transparent; color: #b9c6d8; font-size: 11px; }
+.terminal-tools button:hover:not(:disabled) { background: #263044; }
+.terminal-tools button:disabled { opacity: .45; }
+.terminal-search { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; padding: 7px 12px; border-bottom: 1px solid #35445b; background: #1d2533; }
+.terminal-search input { min-width: 100px; flex: 1; width: 120px; color: #e8ecf4; background: #111720; border: 1px solid #44516a; border-radius: 4px; padding: 5px 8px; }
+.terminal-search button { border: 1px solid #46536b; border-radius: 4px; padding: 4px 7px; background: #283448; color: #e0e7f3; }
+.terminal-search [role=status] { font-size: 11px; color: #c7d1e2; }
+.terminal-clipboard-preview { padding: 10px 12px; border-bottom: 1px solid #46546b; background: #1b2431; color: #d2d8e3; font-size: 12px; }
+.terminal-clipboard-preview p { margin: 4px 0 8px; }
+.terminal-clipboard-preview textarea { width: 100%; height: 85px; resize: vertical; color: #d2d8e3; background: #101217; border: 1px solid #43516a; }
+.terminal-tools-status { padding: 4px 12px; font-size: 11px; color: #b9c9de; background: #192333; }
+.terminal-settings { padding: 12px 0; max-width: 540px; }
+.terminal-settings h3 { margin-top: 0; }
+.terminal-settings .field { margin: 12px 0; }
+.terminal-settings select { width: 100%; padding: 9px; border: 1px solid #d4dce7; border-radius: 5px; background: white; }
+.terminal-settings p { font-size: 12px; line-height: 1.6; color: #617086; }
+.terminal-attachment { max-height: min(280px, 30vh); overflow: auto; margin-bottom: 8px; padding: 10px; border: 1px solid #43516a; border-radius: 7px; background: #18212e; color: #d8e3f5; font-size: 11px; }
+.terminal-attachment p { margin: 6px 0; line-height: 1.5; overflow-wrap: anywhere; }
+.attachment-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.attachment-heading .button { padding: 3px 6px; font-size: 11px; }
+.terminal-attachment textarea { display: block; width: 100%; min-height: 75px; max-height: 180px; resize: vertical; border: 1px solid #43516a; border-radius: 4px; background: #101722; color: #d8e3f5; font: 11px/1.5 monospace; padding: 6px; }
+.attachment-count { text-align: right; font-size: 10px; margin-top: 3px; }
+.terminal-attachment .check-field { align-items: flex-start; font-size: 11px; line-height: 1.5; }
+
+.composer-area:has(.terminal-attachment) { min-height: 150px; overflow-y: auto; }

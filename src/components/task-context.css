@@ -1,0 +1,10 @@
+.task-context-panel { margin: 12px 0; padding: 10px 12px; border: 1px solid #334155; border-radius: 8px; background: #111b2a; color: #e2e8f0; overflow-wrap: anywhere; }
+.task-context-panel > summary { cursor: pointer; font-weight: 600; }
+.task-context-panel > summary span { display: block; font-size: 11px; color: #b6c3d6; margin-top: 5px; }
+.task-context-panel h4 { font-size: 13px; margin: 14px 0 6px; }
+.task-context-panel p, .task-context-panel li { font-size: 12px; line-height: 1.6; }
+.task-context-panel ul, .task-context-panel ol { padding-left: 20px; }
+.task-context-panel .context-scope, .task-context-panel .context-caveat { color: #b6c3d6; font-size: 11px; }
+.context-evidence-list details { padding: 5px 0; }
+.context-evidence-list summary { cursor: pointer; white-space: pre-wrap; }
+.context-evidence-list pre { white-space: pre-wrap; max-height: 200px; overflow: auto; background: #0b1220; padding: 8px; }

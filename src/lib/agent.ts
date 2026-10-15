@@ -21,6 +21,16 @@ export type TerminalAction = {
   displayed: boolean;
   delivery: 'not_sent' | 'queued' | 'dispatch_started' | 'write_accepted' | 'unknown';
 };
+export type TaskContext = {
+  task_id: string; run_id: string; session: SessionRef;
+  summary: string;
+  confirmed_facts: { command_id: string; kind: 'foreground_returned'; exit_code: number }[];
+  findings: { id: string; text: string; evidence_command_ids: string[] }[];
+  hypotheses: { id: string; text: string; evidence_command_ids: string[] }[];
+  remaining_steps: { id: string; text: string; status: 'pending' | 'in_progress' | 'blocked' | 'completed'; evidence_command_ids: string[] }[];
+  evidence: { command_id: string; command_text: string; delivery: string; command_completed: boolean; exit_code: number | null; output_excerpt: string; output_truncated: boolean; output_gap: boolean; untrusted: true }[];
+  truncated: boolean;
+};
 export type TerminalTaskSnapshot = {
   chat_id: string;
   task_id: string;
@@ -38,6 +48,7 @@ export type TerminalTaskSnapshot = {
   owner: boolean;
   remote_outcome: 'unknown' | 'not_sent' | 'foreground_returned';
   round: number;
+  task_context?: TaskContext | null;
   secret_request?: { fields: { name: string; required: boolean }[]; purpose: string } | null;
 };
 export type StartTerminalTask = {

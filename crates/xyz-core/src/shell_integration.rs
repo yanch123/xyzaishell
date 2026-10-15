@@ -120,6 +120,45 @@ pub struct ShellIntegrationService {
 fn error(code: &str, message: &str) -> ApiError {
     ApiError::new(code, message)
 }
+/// Remote reason strings are untrusted. Only locally defined descriptions are
+/// exposed; an unknown reason never becomes UI text or a repair command.
+fn unsupported_shell(reason: &str) -> ApiError {
+    let (code, message) = match reason {
+        "unsupported_bash" => (
+            "SHELL_UNSUPPORTED_BASH",
+            "Task integration requires an interactive Bash 5.1 or 5.2 prompt. Use the manual terminal, or open a supported Bash session yourself and reconnect before confirming an idle prompt. No shell settings were changed.",
+        ),
+        "namespace_conflict" => (
+            "SHELL_UNSUPPORTED_NAMESPACE",
+            "The current shell already defines a variable, function, or alias beginning with __xyz_. Use the manual terminal or review the conflict in a fresh session yourself, then reconnect. Existing definitions were preserved.",
+        ),
+        "unsupported_options" => (
+            "SHELL_UNSUPPORTED_OPTIONS",
+            "The shell options or history settings cannot safely track task commands. Integration requires history, cmdhist, promptvars and interactive_comments, positive HISTSIZE, empty HISTIGNORE and standard histchars; errexit, functrace, allexport, restricted mode, extdebug and POSIX mode are unsupported. Review these settings yourself or use the manual terminal. No options or history settings were changed.",
+        ),
+        "unsupported_trap" => (
+            "SHELL_UNSUPPORTED_TRAP",
+            "The shell has a trap other than EXIT, which can interfere with command lifecycle evidence. Review the traps yourself or use the manual terminal; integration will not remove them. Existing traps were preserved.",
+        ),
+        "dynamic_prompt" => (
+            "SHELL_UNSUPPORTED_DYNAMIC_PROMPT",
+            "PS1 contains a dynamic or unsupported prompt expansion, so the application cannot establish a safe ready boundary. Use the manual terminal or choose a simple non-executing prompt yourself in a fresh supported session. The existing prompt was preserved.",
+        ),
+        "unsupported_hook_attributes" => (
+            "SHELL_UNSUPPORTED_HOOK_ATTRIBUTES",
+            "PROMPT_COMMAND or PS0 has unsupported variable attributes, such as readonly, export, nameref or an unsupported array type. Review the hook declarations yourself or use the manual terminal. Existing hooks and attributes were preserved.",
+        ),
+        "missing_tools" => (
+            "SHELL_UNSUPPORTED_MISSING_TOOLS",
+            "The current shell cannot find base64, which is required for bounded command metadata. Ask the server administrator to make it available, or use the manual terminal. The application did not install software or change PATH.",
+        ),
+        _ => (
+            "SHELL_UNSUPPORTED",
+            "The shell reported an unrecognized integration limitation. Use the manual terminal and review the supported Bash requirements before reconnecting. No automatic repair or retry was attempted.",
+        ),
+    };
+    error(code, message)
+}
 /// Correlation-only metadata for a host-validated COMPLETE single-line command.
 /// The inert comment is visible in the PTY and makes repeated actions distinct
 /// under Bash's default ignoredups. It does not wrap/evaluate executable text.
@@ -446,10 +485,13 @@ impl ShellIntegrationService {
                 c.status.phase = AwaitingReady;
                 self.publish(c);
             }
-            WireEvent::Unsupported { .. } => {
+            WireEvent::Unsupported { reason } => {
                 c.status.phase = Unsupported;
-                c.status.error = Some(error("SHELL_UNSUPPORTED", "This shell, prompt, history configuration, or trap combination is not supported. Existing shell settings were preserved; use the manual terminal."));
+                c.status.error = Some(unsupported_shell(reason));
                 c.deadline = None;
+                c.pending = None;
+                c.active_sequence = None;
+                c.status.shadowed_commands.clear();
                 self.publish(c);
             }
             WireEvent::Ready { sequence, shadowed_commands, .. } => {

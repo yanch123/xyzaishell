@@ -10,7 +10,7 @@
   --settings-placeholder: #91a3bf;
   --settings-error: #ffb5c2;
 }
-.settings-categories { display: flex; gap: 6px; padding: 12px 22px; border-bottom: 1px solid var(--settings-border); }
+.settings-categories { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 22px; border-bottom: 1px solid var(--settings-border); }
 .settings-categories button { border: 0; background: transparent; color: var(--settings-secondary); padding: 8px 14px; border-radius: 6px; cursor: pointer; }
 .settings-categories button[aria-current="page"] { background: #2a3b59; color: #d9e6ff; font-weight: 600; }
 .settings-model-editor { padding: 20px 24px; }
@@ -36,6 +36,23 @@
 .settings-save-status, .settings-test-result { font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; }
 .settings-test-result { padding: 12px 14px; border: 1px solid var(--settings-border); background: var(--settings-surface); color: var(--settings-text); border-radius: 8px; margin: 12px 0; }
 .settings-test-result p { margin: 5px 0; color: var(--settings-secondary); }
+.settings-test-kinds { border: 1px solid var(--settings-border); border-radius: 8px; padding: 12px 14px; margin: 12px 0 16px; min-width: 0; color: var(--settings-text); }
+.settings-test-kinds legend { padding: 0 5px; font-size: 13px; font-weight: 600; }
+.settings-test-kind { display: flex; align-items: flex-start; gap: 9px; margin: 5px 0 12px; font-size: 13px; line-height: 1.6; cursor: pointer; }
+.settings-test-kind input { margin: 4px 0 0; accent-color: #93b7ff; }
+.settings-test-kind span span { display: block; color: var(--settings-secondary); }
+.settings-test-kinds > p { margin: 4px 0 0; color: var(--settings-secondary); font-size: 12px; line-height: 1.7; }
+.settings-test-kinds:disabled .settings-test-kind { cursor: default; }
+.settings-test-payload { margin: 10px 0; }
+.settings-test-payload p { white-space: pre-wrap; padding: 8px 10px; background: var(--settings-input); border: 1px solid var(--settings-border); border-radius: 6px; }
+.settings-test-result[data-outcome="inconclusive"] { border-color: #927947; }
+.settings-test-result[data-outcome="unsupported"] { border-color: #a87382; }
+.settings-modal .terminal-settings { display: grid; gap: 16px; padding: 20px 24px; color: var(--settings-text); }
+.settings-modal .terminal-settings h3 { margin: 0; }
+.settings-modal .terminal-settings .field { display: grid; gap: 7px; color: var(--settings-text); font-size: 13px; }
+.settings-modal .terminal-settings input, .settings-modal .terminal-settings select { padding: 10px 12px; border: 1px solid var(--settings-border); border-radius: 6px; background: var(--settings-input); color: var(--settings-text); }
+.settings-modal .terminal-settings > p { color: var(--settings-secondary); font-size: 13px; line-height: 1.7; margin: 0; }
+.settings-modal .terminal-settings > button { justify-self: start; }
 .model-reuse { align-items: flex-start; line-height: 1.6; overflow-wrap: anywhere; }
 .settings-modal > .settings-decision { margin: 14px 24px; }
 .settings-modal .config-guide { margin-top: 20px; line-height: 1.7; }

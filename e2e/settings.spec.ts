@@ -31,7 +31,7 @@ async function expectReadable(locator: Locator, pseudo: string | null = null) {
 
 for (const colorScheme of ['dark', 'light'] as const) {
 
-test(`synthetic settings (${colorScheme} OS): save, readable consent, key non-echo and unsaved close`, async ({ page }, testInfo) => {
+test(`synthetic settings (${colorScheme} OS): save, kind-bound consent, terminal preferences and unsaved close`, async ({ page }, testInfo) => {
   await page.emulateMedia({ colorScheme });
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -62,9 +62,9 @@ test(`synthetic settings (${colorScheme} OS): save, readable consent, key non-ec
           return structuredClone(config);
         }
         if (command === 'test_model_config') {
-          const request = args.request as { test_id: string; file_revision: string; destination: string; model: string; consent: boolean };
-          if (request.file_revision !== config.file_revision || request.destination !== config.destination || request.model !== config.model || !request.consent) throw new Error('Unexpected test identity');
-          return { ...request, success: true, error: null };
+          const request = args.request as { test_id: string; file_revision: string; destination: string; model: string; kind: string; consent: boolean };
+          if (request.file_revision !== config.file_revision || request.destination !== config.destination || request.model !== config.model || !request.consent || !['chat_connectivity', 'task_capability'].includes(request.kind)) throw new Error('Unexpected test identity');
+          return { ...request, outcome: 'supported', success: true, error: null };
         }
         throw new Error(`Unexpected settings IPC: ${command}`);
       },
@@ -95,6 +95,33 @@ test(`synthetic settings (${colorScheme} OS): save, readable consent, key non-ec
   await expect(settings.getByText('设置已保存，流式聊天测试通过。未验证工具调用。')).toBeVisible();
   for (const text of await settings.locator('.settings-test-result strong, .settings-test-result p').all()) await expectReadable(text);
   await page.screenshot({ path: testInfo.outputPath('settings-minimal-test-complete.png'), fullPage: true });
+  await settings.getByRole('button', { name: '测试已保存配置', exact: true }).click();
+  await consent.getByRole('checkbox').check();
+  await settings.getByRole('radio', { name: /任务工具调用/ }).check();
+  await expect(consent).toBeHidden();
+  await settings.getByRole('button', { name: '测试已保存配置', exact: true }).click();
+  await expect(consent.getByRole('checkbox')).not.toBeChecked();
+  await expect(consent.getByRole('button', { name: '确认并测试', exact: true })).toBeDisabled();
+  await expect(consent).toContainText('不连接 SSH，不执行任何工具或命令');
+  await expect(consent).not.toContainText('Reply with OK.');
+  await consent.getByText('查看将发送的合成数据', { exact: true }).click();
+  await expect(consent).toContainText('xyz_capability_probe');
+  await expect(consent).toContainText('xyz-task-capability');
+  for (const text of await consent.locator('h4, p, .check-field span, summary').all()) await expectReadable(text);
+  await page.screenshot({ path: testInfo.outputPath('settings-tool-test-consent.png'), fullPage: true });
+  await consent.getByRole('checkbox').check();
+  await consent.getByRole('button', { name: '确认并测试', exact: true }).click();
+  await expect(settings.getByText('合成工具调用格式已验证', { exact: true })).toBeVisible();
+  await expect(settings.locator('.settings-test-result')).toContainText('通过不代表真实任务一定可执行、安全或可靠');
+  await page.screenshot({ path: testInfo.outputPath('settings-tool-test-complete.png'), fullPage: true });
+  await settings.getByRole('button', { name: '终端', exact: true }).click();
+  await expect(settings.getByRole('region', { name: '终端显示设置' })).toBeVisible();
+  await settings.getByLabel('终端字体大小', { exact: true }).fill('18');
+  await settings.getByLabel('终端回滚行数', { exact: true }).selectOption('1000');
+  await expectReadable(settings.getByLabel('终端字体大小', { exact: true }));
+  await expectReadable(settings.getByLabel('终端回滚行数', { exact: true }));
+  await page.screenshot({ path: testInfo.outputPath('settings-terminal-preferences.png'), fullPage: true });
+  await settings.getByRole('button', { name: '模型', exact: true }).click();
   await settings.getByLabel('模型名').fill('unsaved-model');
   await settings.getByRole('button', { name: '关闭设置', exact: true }).click();
   const discard = settings.getByRole('group', { name: '处理未保存修改' });
@@ -104,9 +131,9 @@ test(`synthetic settings (${colorScheme} OS): save, readable consent, key non-ec
   await settings.getByRole('button', { name: '关闭设置', exact: true }).click();
   await discard.getByRole('button', { name: '放弃修改并关闭', exact: true }).click();
   await expect(settings).toBeHidden();
-  const calls = await page.evaluate(() => (window as unknown as { __SETTINGS_CALLS__: { command: string }[] }).__SETTINGS_CALLS__);
+  const calls = await page.evaluate(() => (window as unknown as { __SETTINGS_CALLS__: { command: string; args: { request?: { kind?: string } } }[] }).__SETTINGS_CALLS__);
   expect(calls.filter(item => item.command === 'save_model_config')).toHaveLength(1);
-  expect(calls.filter(item => item.command === 'test_model_config')).toHaveLength(1);
+  expect(calls.filter(item => item.command === 'test_model_config').map(item => item.args.request?.kind)).toEqual(['chat_connectivity', 'task_capability']);
   expect(calls.some(item => ['send_chat_message', 'connect_server', 'connect_saved_profile', 'send_user_input'].includes(item.command))).toBe(false);
   expect(errors).toEqual([]);
 });

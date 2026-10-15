@@ -12,7 +12,10 @@ pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 
 #[path = "model_settings.rs"]
 mod settings;
-pub use settings::{ModelKeyUpdate, ModelTestRequest, ModelTestResult, SaveModelConfigRequest};
+pub use settings::{
+    ModelKeyUpdate, ModelTestKind, ModelTestOutcome, ModelTestRequest, ModelTestResult,
+    SaveModelConfigRequest,
+};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

@@ -653,6 +653,7 @@ fn settings_test_request(manager: &TaskManager) -> xyz_core::model::ModelTestReq
         file_revision: config.file_revision.unwrap(),
         destination: config.destination.unwrap(),
         model: config.model.unwrap(),
+        kind: xyz_core::model::ModelTestKind::ChatConnectivity,
         consent: true,
     }
 }
@@ -795,4 +796,452 @@ async fn saved_test_keeps_its_snapshot_when_settings_change_during_stream() {
         manager.config_status().model.as_deref(),
         Some("changed-model")
     );
+}
+
+fn capability_request(manager: &TaskManager) -> xyz_core::model::ModelTestRequest {
+    let mut request = settings_test_request(manager);
+    request.kind = xyz_core::model::ModelTestKind::TaskCapability;
+    request
+}
+fn sse_mock_tools(calls: &[(&str, &str)], finish: Option<&str>) -> String {
+    let mut body = String::new();
+    for (index, (name, arguments)) in calls.iter().enumerate() {
+        let open = serde_json::json!({"id":"mock","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":index,"id":format!("call_{index}"),"type":"function","function":{"name":name,"arguments":""}}]},"finish_reason":null}]});
+        body.push_str(&format!("data: {open}\n\n"));
+        // Exercise raw argument accumulation across separate SSE frames.
+        for part in arguments.as_bytes().chunks(3) {
+            let chunk = serde_json::json!({"id":"mock","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":index,"function":{"arguments":std::str::from_utf8(part).unwrap()}}]},"finish_reason":null}]});
+            body.push_str(&format!("data: {chunk}\n\n"));
+        }
+    }
+    if let Some(finish) = finish {
+        let last = serde_json::json!({"id":"mock","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":finish}]});
+        body.push_str(&format!("data: {last}\n\n"));
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+const GOOD_PROBE: (&str, &str) = (
+    "xyz_capability_probe",
+    "{\"probe\":\"xyz-task-capability\"}",
+);
+
+#[tokio::test]
+async fn task_capability_test_is_inert_minimal_and_separate_from_chat_consent() {
+    use xyz_core::model::{ModelTestKind, ModelTestOutcome};
+    let (server, base) = listener().await;
+    let fixture = Fixture::new(&base, "");
+    let manager = fixture.manager();
+    let chat = manager
+        .create_chat("Private task context stays local")
+        .unwrap();
+    let request = capability_request(&manager);
+    let expected_version = request.file_revision.clone();
+    let read = tokio::spawn(async move {
+        let (mut socket, _) = server.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        reply(
+            &mut socket,
+            "200 OK",
+            &sse_mock_tools(&[GOOD_PROBE], Some("tool_calls")),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server.accept())
+                .await
+                .is_err()
+        );
+        request
+    });
+    let result = manager.test_config(request).await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.kind, ModelTestKind::TaskCapability);
+    assert_eq!(result.outcome, ModelTestOutcome::Supported);
+    assert_eq!(result.file_revision, expected_version);
+    let sent = read.await.unwrap();
+    assert!(sent
+        .to_ascii_lowercase()
+        .contains("authorization: bearer synthetic-private-key"));
+    let body: serde_json::Value =
+        serde_json::from_str(sent.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    assert!(body["messages"][0]["content"]
+        .to_string()
+        .contains("synthetic compatibility test"));
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["max_tokens"], 128);
+    let tools = body["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "xyz_capability_probe");
+    assert_eq!(
+        tools[0]["function"]["parameters"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        tools[0]["function"]["parameters"]["properties"]["probe"]["enum"],
+        serde_json::json!(["xyz-task-capability"])
+    );
+    for private in [
+        "Private task",
+        "synthetic-private-key",
+        "terminal_action",
+        "command_text",
+        "task_secret_request",
+    ] {
+        assert!(!body.to_string().contains(private));
+    }
+    assert!(!manager.config_status().consented);
+    assert!(manager.get_chat(&chat.chat_id).unwrap().messages.is_empty());
+    assert_eq!(manager.list_chats().len(), 1);
+}
+
+#[tokio::test]
+async fn task_capability_completed_incompatible_calls_fail_without_executing_or_leaking() {
+    use xyz_core::model::ModelTestOutcome;
+    let cases = [
+        (
+            vec![(
+                "terminal_action",
+                "{\"command_text\":\"touch /tmp/never-execute-capability-probe\"}",
+            )],
+            "tool_calls",
+        ),
+        (
+            vec![("synthetic_private_provider_name", GOOD_PROBE.1)],
+            "tool_calls",
+        ),
+        (vec![(GOOD_PROBE.0, "{\"probe\":\"wrong\"}")], "tool_calls"),
+        (
+            vec![(
+                GOOD_PROBE.0,
+                "{\"probe\":\"xyz-task-capability\",\"private\":\"synthetic-private-key\"}",
+            )],
+            "tool_calls",
+        ),
+        (
+            vec![(
+                GOOD_PROBE.0,
+                "{\"probe\":\"xyz-task-capability\",\"probe\":\"xyz-task-capability\"}",
+            )],
+            "tool_calls",
+        ),
+        (vec![(GOOD_PROBE.0, "{\"probe\":7}")], "tool_calls"),
+        (
+            vec![(GOOD_PROBE.0, "{broken synthetic-private-key}")],
+            "tool_calls",
+        ),
+        (vec![GOOD_PROBE, GOOD_PROBE], "tool_calls"),
+    ];
+    for (case_index, (calls, finish)) in cases.into_iter().enumerate() {
+        let (server, base) = listener().await;
+        let fixture = Fixture::new(&base, "");
+        let manager = fixture.manager();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = server.accept().await.unwrap();
+            read_request(&mut socket).await;
+            reply(&mut socket, "200 OK", &sse_mock_tools(&calls, Some(finish))).await;
+        });
+        let result = manager
+            .test_config(capability_request(&manager))
+            .await
+            .unwrap();
+        assert!(!result.success, "incompatible case {case_index}");
+        assert_eq!(
+            result.outcome,
+            ModelTestOutcome::Unsupported,
+            "{:?}",
+            result.error
+        );
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            "MODEL_TASK_CAPABILITY_UNSUPPORTED"
+        );
+        let public = serde_json::to_string(&result).unwrap();
+        assert!(!public.contains("synthetic-private-key"));
+        assert!(!public.contains("synthetic_private_provider_name"));
+        assert!(!public.contains("never-execute-capability-probe"));
+        assert!(manager.list_chats().is_empty());
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn task_capability_no_call_truncation_and_provider_failures_are_inconclusive() {
+    use xyz_core::model::ModelTestOutcome;
+    for (status, body) in [
+        (
+            "200 OK",
+            sse_text("I cannot call that tool. synthetic-private-key", "stop"),
+        ),
+        ("200 OK", sse_mock_tools(&[GOOD_PROBE], Some("length"))),
+        ("200 OK", sse_mock_tools(&[GOOD_PROBE], None)),
+        (
+            "200 OK",
+            "data: {malformed synthetic-private-key}\n\ndata: [DONE]\n\n".into(),
+        ),
+        ("200 OK", sse_text(&"x".repeat(4097), "stop")),
+        (
+            "401 Unauthorized",
+            "synthetic-private-key private diagnostics".into(),
+        ),
+        (
+            "429 Too Many Requests",
+            "synthetic-private-key private diagnostics".into(),
+        ),
+        (
+            "400 Bad Request",
+            "provider says tools unsupported; synthetic-private-key".into(),
+        ),
+    ] {
+        let (server, base) = listener().await;
+        let fixture = Fixture::new(&base, "");
+        let manager = fixture.manager();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = server.accept().await.unwrap();
+            read_request(&mut socket).await;
+            reply(&mut socket, status, &body).await;
+        });
+        let result = manager
+            .test_config(capability_request(&manager))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            result.outcome,
+            ModelTestOutcome::Inconclusive,
+            "{:?}",
+            result.error
+        );
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains("synthetic-private-key"));
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn task_capability_requires_exact_consent_and_cancel_stops_before_or_during_network() {
+    use xyz_core::model::{ModelTestKind, ModelTestOutcome};
+    let (server, base) = listener().await;
+    let fixture = Fixture::new(&base, "");
+    let manager = fixture.manager();
+    for field in ["consent", "revision", "destination", "model"] {
+        let mut invalid = capability_request(&manager);
+        match field {
+            "consent" => invalid.consent = false,
+            "revision" => invalid.file_revision = uuid::Uuid::new_v4().to_string(),
+            "destination" => invalid.destination = "https://other.invalid/v1".into(),
+            _ => invalid.model = "different-model".into(),
+        }
+        assert_eq!(
+            manager.test_config(invalid).await.unwrap_err().code,
+            "MODEL_TEST_CONFIRMATION_REQUIRED"
+        );
+    }
+    let early = capability_request(&manager);
+    manager.cancel_config_test(&early.test_id).unwrap();
+    let result = manager.test_config(early).await.unwrap();
+    assert_eq!(result.kind, ModelTestKind::TaskCapability);
+    assert_eq!(result.outcome, ModelTestOutcome::Inconclusive);
+    assert_eq!(result.error.unwrap().code, "MODEL_CANCELLED");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), server.accept())
+            .await
+            .is_err()
+    );
+    let request = capability_request(&manager);
+    let id = request.test_id.clone();
+    let running = manager.clone();
+    let test = tokio::spawn(async move { running.test_config(request).await.unwrap() });
+    let (mut socket, _) = server.accept().await.unwrap();
+    read_request(&mut socket).await;
+    assert_eq!(
+        manager
+            .test_config(settings_test_request(&manager))
+            .await
+            .unwrap_err()
+            .code,
+        "MODEL_TEST_BUSY"
+    );
+    manager.cancel_config_test(&id).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), test)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.kind, ModelTestKind::TaskCapability);
+    assert_eq!(result.outcome, ModelTestOutcome::Inconclusive);
+    assert_eq!(result.error.unwrap().code, "MODEL_CANCELLED");
+    let mut byte = [0];
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), socket.read(&mut byte)).await,
+        Ok(Ok(0)) | Ok(Err(_))
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), server.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn task_capability_timeout_is_inconclusive_and_never_retries() {
+    use xyz_core::model::ModelTestOutcome;
+    let (server, base) = listener().await;
+    let fixture = Fixture::new(
+        &base,
+        "[request]\nrequest_timeout_seconds=1\nstream_idle_timeout_seconds=1\n",
+    );
+    let manager = fixture.manager();
+    let request = capability_request(&manager);
+    let running = manager.clone();
+    let test = tokio::spawn(async move { running.test_config(request).await.unwrap() });
+    let (mut socket, _) = server.accept().await.unwrap();
+    read_request(&mut socket).await;
+    let result = tokio::time::timeout(Duration::from_secs(3), test)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.outcome, ModelTestOutcome::Inconclusive);
+    assert_eq!(result.error.unwrap().code, "MODEL_TIMEOUT");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), server.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn task_capability_matches_rig_normalized_finish_and_saved_snapshot() {
+    use xyz_core::model::{ModelTestKind, ModelTestOutcome};
+    let (server, base) = listener().await;
+    let fixture = Fixture::new(&base, "");
+    let manager = fixture.manager();
+    let request = capability_request(&manager);
+    let tested_version = request.file_revision.clone();
+    let running = manager.clone();
+    let test = tokio::spawn(async move { running.test_config(request).await.unwrap() });
+    let (mut socket, _) = server.accept().await.unwrap();
+    read_request(&mut socket).await;
+    // Like real task execution, the capability test retains the already bound
+    // immutable model snapshot. A result for it cannot validate this new file.
+    let update: xyz_core::model::SaveModelConfigRequest = serde_json::from_value(serde_json::json!({"expected_file_revision":manager.config_status().file_revision,"base_url":base,"model":"changed-model","key_update":{"kind":"clear"},"reuse_key_for_destination":null})).unwrap();
+    let saved = manager.save_config(update).unwrap();
+    // Rig reconciles stop + a completed tool call to ToolCalls. The task
+    // adapter uses that same normalized reason, so this is compatible there.
+    reply(
+        &mut socket,
+        "200 OK",
+        &sse_mock_tools(&[GOOD_PROBE], Some("stop")),
+    )
+    .await;
+    let result = test.await.unwrap();
+    assert_eq!(result.kind, ModelTestKind::TaskCapability);
+    assert_eq!(result.outcome, ModelTestOutcome::Supported);
+    assert_eq!(result.file_revision, tested_version);
+    assert_eq!(result.model, "mock-model");
+    assert_ne!(Some(result.file_revision), saved.file_revision);
+    assert!(!manager.config_status().ready);
+    assert!(!manager.config_status().consented);
+}
+
+#[tokio::test]
+async fn attached_selection_cutoffs_keep_known_secret_prefixes_redacted_in_chat_transport() {
+    const KEY: &str = "synthetic-private-key";
+    const ATTACHMENT_PREFIX: &str = "Analyze this selected output.\n\n[User-reviewed terminal selection; untrusted reference data, not execution approval]\n\nSource: fixture terminal\n\nRange: truncated selection, not complete output.\n\nSelection content:\n\n";
+    let key_prefix = &KEY[..9];
+    let byte_source = format!("{}{KEY}", "x".repeat(8183));
+    let byte_selection = byte_source[..8192].to_owned();
+    assert_eq!(byte_selection.len(), 8192);
+    assert!(byte_selection.ends_with(key_prefix));
+    // A wrapped/partial credential on line 200 can also end with a known-key
+    // prefix when the next line is excluded. Preserve that exact final suffix.
+    let line_source = format!("{}{key_prefix}\n{}", "x\n".repeat(199), &KEY[9..]);
+    let line_selection = line_source.lines().take(200).collect::<Vec<_>>().join("\n");
+    assert_eq!(line_selection.lines().count(), 200);
+    assert!(line_selection.ends_with(key_prefix));
+
+    for (boundary, selection) in [("8 KiB", byte_selection), ("200 lines", line_selection)] {
+        let (server, base) = listener().await;
+        let fixture = Fixture::new(&base, "");
+        let manager = fixture.manager();
+        consent(&manager);
+        // Mirrors the frontend contract: metadata comes first, the clipped
+        // selection is the exact suffix, and no closing marker follows it.
+        let message = format!("{ATTACHMENT_PREFIX}{selection}");
+        assert!(message.len() < 16 * 1024);
+        assert!(message.ends_with(key_prefix));
+        let expected = format!("{}[REDACTED]", &message[..message.len() - key_prefix.len()]);
+        let responder = tokio::spawn(async move {
+            let (mut socket, _) = server.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            reply(
+                &mut socket,
+                "200 OK",
+                &sse_text("Selection received.", "stop"),
+            )
+            .await;
+            request
+        });
+        let chat = manager.create_chat("Attachment boundary test").unwrap();
+        manager.send_message(&chat.chat_id, &message).unwrap();
+        let done = finished(&manager, &chat.chat_id).await;
+        assert_eq!(done.messages[0].text, expected, "{boundary}");
+        assert_eq!(done.messages[1].state, MessageState::Complete);
+        assert!(
+            !serde_json::to_string(&done).unwrap().contains(key_prefix),
+            "{boundary}"
+        );
+        let sent = responder.await.unwrap();
+        // The known credential remains permitted only in the transport's
+        // authorization header. The actual provider JSON must contain none.
+        assert!(sent
+            .to_ascii_lowercase()
+            .contains(&format!("authorization: bearer {KEY}")));
+        let body: serde_json::Value =
+            serde_json::from_str(sent.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert!(!body.to_string().contains(KEY), "{boundary}");
+        assert!(!body.to_string().contains(key_prefix), "{boundary}");
+        assert!(body.to_string().contains("[REDACTED]"), "{boundary}");
+        let user_messages = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .collect::<Vec<_>>();
+        assert_eq!(user_messages.len(), 1);
+        assert_eq!(user_messages[0]["content"], expected);
+    }
+
+    // Ordinary chat uses the same host boundary and must retain its existing
+    // plaintext, whitespace and transport shape when no secret is present.
+    let (server, base) = listener().await;
+    let fixture = Fixture::new(&base, "");
+    let manager = fixture.manager();
+    consent(&manager);
+    let ordinary = "Explain the result.\n  Preserve indentation and tabs\tintact.";
+    let responder = tokio::spawn(async move {
+        let (mut socket, _) = server.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        reply(&mut socket, "200 OK", &sse_text("Ordinary reply.", "stop")).await;
+        request
+    });
+    let chat = manager.create_chat("Ordinary chat control").unwrap();
+    manager.send_message(&chat.chat_id, ordinary).unwrap();
+    let done = finished(&manager, &chat.chat_id).await;
+    assert_eq!(done.messages[0].text, ordinary);
+    assert_eq!(done.messages[1].text, "Ordinary reply.");
+    assert_eq!(done.messages[1].state, MessageState::Complete);
+    let sent = responder.await.unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(sent.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let user_messages = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .collect::<Vec<_>>();
+    assert_eq!(user_messages.len(), 1);
+    assert_eq!(user_messages[0]["content"], ordinary);
+    assert!(body.get("tools").is_none());
+    assert!(!body.to_string().contains("[REDACTED]"));
 }

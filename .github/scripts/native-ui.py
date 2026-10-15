@@ -315,22 +315,19 @@ class Driver:
 
 
 def open_profiles(driver, version):
-    if version == BASE_VERSION:
-        driver.click(driver.button("新建 SSH 连接"))
-        driver.click(driver.button("管理已保存的 SSH 档案"))
-    else:
-        driver.click(driver.button("打开连接管理"))
+    # Both reviewed versions use the v0.1.2 connection manager. Baseline means
+    # the actual released UI, not the older v0.1.1 fixture layout.
+    driver.click(driver.button("打开连接管理"))
     wait_for(lambda: driver.find("//select[@aria-label='选择档案']"))
 
 
 def close_profiles(driver, version):
-    driver.click(driver.button("返回" if version == BASE_VERSION else "关闭"))
+    driver.click(driver.button("关闭"))
 
 
 def enable_history(driver, version):
     driver.click(driver.button("打开设置"))
-    if version == TARGET_VERSION:
-        driver.click(driver.button("历史记录"))
+    driver.click(driver.button("历史记录"))
     button = wait_for(lambda: driver.find(driver.button("启用明文聊天历史")))
     assert driver.command("GET", f"/element/{button}/enabled") is False
     checkbox = driver.find("//label[contains(.,'我理解聊天将以明文保存到本机')]/input")
@@ -359,7 +356,12 @@ def configure_candidate_model(driver, server):
     time.sleep(1)
     assert not server.requests and not server.test_requests
     driver.screenshot("model-settings-saved-test-awaits-consent")
-    driver.click("//label[contains(.,'同意向这个已保存目标发送上述最小测试数据')]/input")
+    # v0.1.3 names the selected test scope in this label. The same exact
+    # recipient-confirmation group still owns the explicit consent checkbox.
+    consent = "//*[@role='group' and @aria-label='确认测试接收方']//input[@type='checkbox']"
+    assert len(driver.command("POST", "/elements", {"using": "xpath", "value": consent})) == 1
+    assert driver.command("GET", f"/element/{driver.find(consent)}/selected") is False
+    driver.click(consent)
     driver.click(driver.button("确认并测试"))
     wait_for(lambda: driver.js("return document.querySelector('.settings-test-result')?.textContent.includes('流式聊天测试通过')"))
     assert len(server.test_requests) == 1 and not server.requests and not server.invalid_requests
@@ -376,21 +378,15 @@ def assert_literal_reply(driver):
 
 
 def seed(driver, server, version):
-    if version == TARGET_VERSION:
-        configure_candidate_model(driver, server)
-        driver.click(driver.button("新建 SSH 连接"))
-        for label, text in [("连接名称", PROFILE), ("主机地址", "127.0.0.1"), ("用户名", "synthetic-user")]:
-            driver.fill(label, text)
-        driver.click("//label[span[normalize-space(.)='保存连接']]/input")
-        driver.click(driver.button("仅保存连接"))
-        wait_for(lambda: driver.js("return ![...document.querySelectorAll('[role=dialog] h2')].some(e=>e.textContent==='连接 SSH 服务器')"))
-        open_profiles(driver, version)
-        driver.click(f"//select[@aria-label='选择档案']/option[starts-with(normalize-space(.),'{PROFILE}')]")
-    else:
-        open_profiles(driver, version)
-        for label, text in [("档案名称", PROFILE), ("档案主机", "127.0.0.1"), ("档案用户名", "synthetic-user")]:
-            driver.fill(label, text)
-        driver.click(driver.button("保存档案"))
+    configure_candidate_model(driver, server)
+    driver.click(driver.button("新建 SSH 连接"))
+    for label, text in [("连接名称", PROFILE), ("主机地址", "127.0.0.1"), ("用户名", "synthetic-user")]:
+        driver.fill(label, text)
+    driver.click("//label[span[normalize-space(.)='保存连接']]/input")
+    driver.click(driver.button("仅保存连接"))
+    wait_for(lambda: driver.js("return ![...document.querySelectorAll('[role=dialog] h2')].some(e=>e.textContent==='连接 SSH 服务器')"))
+    open_profiles(driver, version)
+    driver.click(f"//select[@aria-label='选择档案']/option[starts-with(normalize-space(.),'{PROFILE}')]")
     profile_id = wait_for(lambda: driver.js("return document.querySelector('select[aria-label=\"选择档案\"]').value"))
     driver.screenshot("saved-profile")
     close_profiles(driver, version)
@@ -418,14 +414,11 @@ def verify_preserved(driver, server, version, expected_profile_id):
     open_profiles(driver, version)
     driver.click(f"//select[@aria-label='选择档案']/option[starts-with(normalize-space(.),'{PROFILE}')]")
     assert driver.js("return document.querySelector('select[aria-label=\"选择档案\"]').value") == expected_profile_id
-    if version == BASE_VERSION:
-        wait_for(lambda: driver.js("return [...document.querySelectorAll('label')].find(e=>e.textContent.startsWith('档案用户名'))?.querySelector('input')?.value === 'synthetic-user'"))
-    else:
-        driver.click(driver.button("编辑 / 重命名"))
-        wait_for(lambda: driver.js("return [...document.querySelectorAll('label')].find(e=>e.textContent.startsWith('用户名'))?.querySelector('input')?.value === 'synthetic-user'"))
-        assert driver.js("return document.querySelector('input[aria-label=\"主机地址\"]').value === '127.0.0.1'")
-        assert driver.js("return document.querySelector('input[aria-label=\"连接名称\"]').value") == PROFILE
-        driver.click(driver.button("取消"))
+    driver.click(driver.button("编辑 / 重命名"))
+    wait_for(lambda: driver.js("return [...document.querySelectorAll('label')].find(e=>e.textContent.startsWith('用户名'))?.querySelector('input')?.value === 'synthetic-user'"))
+    assert driver.js("return document.querySelector('input[aria-label=\"主机地址\"]').value === '127.0.0.1'")
+    assert driver.js("return document.querySelector('input[aria-label=\"连接名称\"]').value") == PROFILE
+    driver.click(driver.button("取消"))
     assert driver.js("return [...document.querySelectorAll('input[type=password]')].every(e=>e.value==='')")
     close_profiles(driver, version)
     enable_history(driver, version)
@@ -463,20 +456,19 @@ def history_rows(history):
 
 def verify_history_upgrade(history, expected_rows):
     version, rows = history_rows(history)
-    assert version == 2, "Candidate did not migrate the history format marker"
+    assert version == 2, "Candidate did not retain the supported history format marker"
     indexed = {row[0]: row for row in rows}
     assert expected_rows, "Upgrade must start with real baseline history rows"
     for row in expected_rows:
         assert indexed.get(row[0]) == row, "Upgrade changed a preexisting history row"
 
 
-def verify_profile_backup(config, expected_digest):
-    path = config / "connections.v1.backup.toml"
-    assert path.is_file() and not path.is_symlink(), "Missing protected legacy profile backup"
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == expected_digest, "Legacy profile backup differs from baseline bytes"
+def verify_private_file(path, expected_digest, label):
+    assert path.is_file() and not path.is_symlink(), f"Missing protected regular {label}"
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == expected_digest, f"{label} differs from baseline bytes"
     if os.name != "nt":
         info = path.stat()
-        assert info.st_uid == os.getuid() and info.st_mode & 0o777 == 0o600, "Legacy profile backup is not owner-only"
+        assert info.st_uid == os.getuid() and info.st_mode & 0o7777 == 0o600, f"{label} is not owner-only"
     else:
         quoted = str(path).replace("'", "''")
         script = ("$ErrorActionPreference='Stop'; "
@@ -486,19 +478,40 @@ def verify_profile_backup(config, expected_digest):
                   "$allowed=@($sid,'S-1-5-18','S-1-5-32-544'); "
                   "$unexpected=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | "
                   "Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -notin $allowed }); "
-                  "if ($owner -ne $sid -or -not $acl.AreAccessRulesProtected -or $unexpected.Count -ne 0) { throw 'Unsafe legacy profile backup ACL' }")
+                  "if ($owner -ne $sid -or -not $acl.AreAccessRulesProtected -or $unexpected.Count -ne 0) { throw 'Unsafe private acceptance file ACL' }")
         # Match the pwsh host used by the Windows fixture. Windows PowerShell
         # cannot reliably load its Security module with inherited pwsh module paths.
         subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", script], check=True, timeout=15)
 
 
+def verify_profile_backup(config, expected_digest):
+    # Retain the strict legacy migration helper and regression coverage. The
+    # reviewed v0.1.2 baseline already writes v2, so this is not its upgrade gate.
+    verify_private_file(config / "connections.v1.backup.toml", expected_digest, "Legacy profile backup")
+
+
+def profile_schema_version(config):
+    path = config / "connections.toml"
+    assert path.is_file() and not path.is_symlink(), "Missing regular profile file"
+    markers = re.findall(r"^schema_version\s*=\s*([0-9]+)\s*$", path.read_text(encoding="utf-8"), re.MULTILINE)
+    assert len(markers) == 1, "Expected one profile schema marker"
+    return int(markers[0])
+
+
+def verify_current_profile_upgrade(config, expected):
+    assert expected["profile_schema_version"] == 2, "Upgrade must start with real v0.1.2 profiles"
+    verify_private_file(config / "connections.toml", expected["profile_file_sha256"], "Profile file")
+    assert profile_schema_version(config) == 2, "Upgrade changed the profile schema marker"
+    backup = config / "connections.v1.backup.toml"
+    assert not backup.exists() and not backup.is_symlink(), "Fresh v2 baseline unexpectedly created a legacy backup"
+
+
 def open_shell_logs(driver, version):
     driver.click(driver.button("打开终端日志"))
-    if version == TARGET_VERSION:
-        wait_for(lambda: driver.find("//select[@aria-label='日志查看范围']"))
-        # A disconnected current-session view deliberately does not widen its
-        # scope. Explicitly choose the all-records view before querying/export.
-        driver.click("//select[@aria-label='日志查看范围']/option[@value='all']")
+    wait_for(lambda: driver.find("//select[@aria-label='日志查看范围']"))
+    # A disconnected current-session view deliberately does not widen its
+    # scope. Explicitly choose the all-records view before querying/export.
+    driver.click("//select[@aria-label='日志查看范围']/option[@value='all']")
 
 
 def verify_empty_shell_log(driver, history, server, version):
@@ -507,13 +520,12 @@ def verify_empty_shell_log(driver, history, server, version):
     assert not list(history.glob("shell-log*")), "Unexpected shell-log data before consent"
     requests_before = len(server.requests)
     open_shell_logs(driver, version)
-    if version == TARGET_VERSION:
-        assert driver.js("return document.querySelector('.shell-log-dialog')?.getAttribute('aria-modal') === 'false'")
+    assert driver.js("return document.querySelector('.shell-log-dialog')?.getAttribute('aria-modal') === 'false'")
     wait_for(lambda: driver.js("return document.querySelector('.shell-log-dialog')?.textContent.includes('当前筛选下暂无日志。')"))
     wait_for(lambda: driver.js("return document.querySelector('.shell-log-dialog')?.textContent.includes('记录状态：未启用')"))
     assert driver.js("return document.querySelector('.shell-log-dialog').textContent.includes('不保存终端输出，不自动发送给模型')")
     checks = driver.command("POST", "/elements", {"using": "xpath", "value": "//div[contains(@class,'shell-log-consent')]//input[@type='checkbox']"})
-    assert len(checks) == (2 if version == BASE_VERSION else 1)
+    assert len(checks) == 1
     for checkbox in checks:
         assert driver.command("GET", f"/element/{checkbox[ELEMENT]}/selected") is False
         assert driver.command("GET", f"/element/{checkbox[ELEMENT]}/enabled") is False
@@ -592,7 +604,7 @@ def main():
 [model]
 protocol = "openai_chat_completions"
 base_url = "http://127.0.0.1:{server.server_port}/v1"
-api_key = "{TOKEN if args.application_version == BASE_VERSION else ''}"
+api_key = ""
 name = "native-fixture-model"
 [capabilities]
 streaming = "required"
@@ -637,7 +649,7 @@ allow_loopback_http = true
                 driver.close()
             assert not any((history / ("history.sqlite3" + suffix)).exists() for suffix in ("-wal", "-shm", "-journal")), "History database sidecars survived clean application exit"
             assert len(server.requests) == (1 if phase == "seed" else 0), "Unexpected model request before process exit"
-            assert len(server.test_requests) == (1 if phase == "seed" and args.application_version == TARGET_VERSION else 0), "Unexpected model configuration test"
+            assert len(server.test_requests) == (1 if phase == "seed" else 0), "Unexpected model configuration test"
             assert server.invalid_requests == 0
             actual = list(stored_identity(history))
             assert visible_task_identity == f"任务 ID: {actual[1]}", "Visible native task identity differs from persisted history"
@@ -652,14 +664,19 @@ allow_loopback_http = true
             server.requests.clear()
             server.test_requests.clear()
         history_version, preserved_rows = history_rows(history)
+        assert history_version == 2, "Reviewed native fixture must use history schema v2"
+        profile_version = profile_schema_version(config)
+        assert profile_version == 2, "Reviewed native fixture must use profile schema v2"
         if args.phase == "upgrade":
+            assert expected["history_version"] == 2, "Upgrade must start with real v0.1.2 history"
             verify_history_upgrade(history, expected["history_rows"])
-            verify_profile_backup(config, expected["profile_file_sha256"])
-            assert hashlib.sha256((config / "model.toml").read_bytes()).hexdigest() == expected["model_file_sha256"], "Upgrade changed unrelated model settings"
+            verify_current_profile_upgrade(config, expected)
+            verify_private_file(config / "model.toml", expected["model_file_sha256"], "Model settings")
         if expected is None or args.phase == "upgrade":
             state_file.write_text(json.dumps({"port": server.server_port, "identity": identity, "profile_id": profile_id,
                 "application_version": args.application_version, "application_sha256": application_hash,
                 "history_version": history_version, "history_rows": preserved_rows,
+                "profile_schema_version": profile_version,
                 "profile_file_sha256": hashlib.sha256((config / "connections.toml").read_bytes()).hexdigest(),
                 "model_file_sha256": hashlib.sha256((config / "model.toml").read_bytes()).hexdigest()}), encoding="utf-8")
         (args.evidence / "result.json").write_text(json.dumps({
@@ -671,8 +688,9 @@ allow_loopback_http = true
             "history_requires_new_process_consent": True, "restore_model_requests": 0,
             "shell_log_empty_export_fail_closed": True,
             "profile_id_preserved": True,
-            "legacy_history_rows_and_protected_profile_backup_verified": args.phase == "upgrade",
-            "model_settings_saved_and_tested_via_ui": args.phase == "seed" and args.application_version == TARGET_VERSION,
+            "history_rows_and_private_v2_profiles_preserved": args.phase == "upgrade",
+            "legacy_profile_migration_tested": False,
+            "model_settings_saved_and_tested_via_ui": args.phase == "seed",
             "not_tested": ["real provider", "SSH via UI", "desktop input methods", "Windows 10/11"]
                 + ([] if args.phase == "upgrade" else ["version upgrade in this phase"]),
         }, indent=2), encoding="utf-8")

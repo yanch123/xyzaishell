@@ -13,6 +13,7 @@ pub mod decision;
 mod execution;
 pub mod observation;
 mod risk;
+pub mod task_context;
 
 pub mod host_storage;
 pub mod storage;

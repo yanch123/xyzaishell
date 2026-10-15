@@ -180,6 +180,7 @@ async fn test_requires_exact_saved_version_and_confirmation_without_network() {
         file_revision: status.file_revision.unwrap(),
         destination: status.destination.unwrap(),
         model: status.model.unwrap(),
+        kind: ModelTestKind::ChatConnectivity,
         consent: false,
     };
     assert_eq!(
@@ -197,4 +198,28 @@ async fn test_requires_exact_saved_version_and_confirmation_without_network() {
         manager.test_saved(changed).await.unwrap_err().code,
         "CONFIG_CONFLICT"
     );
+}
+
+#[test]
+fn diagnostic_kind_defaults_to_chat_and_unknown_kinds_are_rejected() {
+    let base = serde_json::json!({
+        "test_id":uuid::Uuid::new_v4().to_string(),
+        "file_revision":"revision",
+        "destination":"https://example.invalid/v1",
+        "model":"model",
+        "consent":true
+    });
+    let legacy: ModelTestRequest = serde_json::from_value(base.clone()).unwrap();
+    assert_eq!(legacy.kind, ModelTestKind::ChatConnectivity);
+    let mut task = base.clone();
+    task["kind"] = serde_json::json!("task_capability");
+    assert_eq!(
+        serde_json::from_value::<ModelTestRequest>(task)
+            .unwrap()
+            .kind,
+        ModelTestKind::TaskCapability
+    );
+    let mut invalid = base;
+    invalid["kind"] = serde_json::json!("execute_terminal");
+    assert!(serde_json::from_value::<ModelTestRequest>(invalid).is_err());
 }

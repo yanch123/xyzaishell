@@ -22,16 +22,17 @@ beforeEach(() => {
     saved = { ...saved, revision: String(++revision), file_revision: `saved-${revision}`, base_url: request.base_url.replace(/\/+$/, ''), destination: request.base_url.replace(/\/+$/, ''), model: request.model, consented: false, key_present: request.key_update.kind !== 'clear', ready: request.key_update.kind !== 'clear' };
     return saved;
   });
-  mocks.testSaved.mockImplementation(async request => ({ ...request, success: true, error: null }));
+  mocks.testSaved.mockImplementation(async request => ({ ...request, outcome: 'supported', success: true, error: null }));
 });
 async function ready() { render(<Harness />); await waitFor(() => expect((screen.getByLabelText(/^Base URL/) as HTMLInputElement).value).toBe(modelConfig.base_url)); return userEvent.setup(); }
 const button = (name: string) => screen.getByRole('button', { name });
-describe('v0.1.2 saved model settings', () => {
+describe('v0.1.3 saved model settings and capability tests', () => {
   it('is nonmodal, keeps navigation and never reads an old key into the form', async () => {
     const user = await ready();
     expect(screen.getByRole('dialog').getAttribute('aria-modal')).toBe('false');
     expect((screen.getByLabelText(/^API Key/) as HTMLInputElement).value).toBe('');
     expect((screen.getByLabelText(/^API Key/) as HTMLInputElement).type).toBe('password');
+    await user.click(button('终端')); expect(screen.getByRole('region', { name: '终端显示设置' })).toBeDefined();
     await user.click(button('通用')); expect(screen.getByText('能力与边界')).toBeDefined();
     await user.click(button('历史记录')); expect(screen.getByText('Existing history controls')).toBeDefined();
     await user.click(button('终端背景仍可操作')); expect(document.activeElement).toBe(button('终端背景仍可操作'));
@@ -63,14 +64,14 @@ describe('v0.1.2 saved model settings', () => {
     const decision = screen.getByRole('group', { name: '确认测试接收方' });
     expect(decision.textContent).toContain('Reply with OK.'); expect(decision.textContent).toContain('不包含聊天历史');
     await user.click(within(decision).getByRole('checkbox')); await user.click(button('确认并测试'));
-    expect(mocks.testSaved).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ file_revision: 'saved-2', destination: saved.destination, model: saved.model, consent: true }));
+    expect(mocks.testSaved).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ file_revision: 'saved-2', destination: saved.destination, model: saved.model, kind: 'chat_connectivity', consent: true }));
     expect(mocks.confirm).not.toHaveBeenCalled(); expect(mocks.probe).not.toHaveBeenCalled(); expect(mocks.send).not.toHaveBeenCalled();
     expect(screen.getByText('流式聊天测试通过')).toBeDefined();
   });
   it('separates saved state from a failed test, and never automatically retries', async () => {
-    mocks.testSaved.mockImplementation(async request => ({ ...request, success: false, error: { code: 'MODEL_AUTH_FAILED', safe_message: 'Credentials rejected.', retry: 'after_user_action' } }));
+    mocks.testSaved.mockImplementation(async request => ({ ...request, outcome: 'inconclusive', success: false, error: { code: 'MODEL_AUTH_FAILED', safe_message: 'Credentials rejected.', retry: 'after_user_action' } }));
     const user = await ready(); await user.click(button('保存并测试')); await user.click(screen.getByRole('checkbox', { name: /同意向这个已保存目标/ })); await user.click(button('确认并测试'));
-    expect(screen.getByText('设置已保存，测试失败。')).toBeDefined(); expect(screen.getByText('Credentials rejected.')).toBeDefined();
+    expect(screen.getByText('设置已保存，测试结果不确定，不能据此判定模型不支持。不会自动重试。')).toBeDefined(); expect(screen.getByText('Credentials rejected.')).toBeDefined();
     expect(mocks.save).toHaveBeenCalledOnce(); expect(mocks.testSaved).toHaveBeenCalledOnce();
   });
   it('never tests after an uncertain save and hides raw errors', async () => {
@@ -96,11 +97,74 @@ describe('v0.1.2 saved model settings', () => {
     let finish!: (result: ModelTestResult) => void; mocks.testSaved.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
     await user.click(button('保存并测试')); await user.click(screen.getByRole('checkbox', { name: /同意向这个已保存目标/ })); await user.click(button('确认并测试')); await user.click(button('取消测试'));
     expect(mocks.cancelTest).toHaveBeenCalledExactlyOnceWith(mocks.testSaved.mock.calls[1][0].test_id);
-    await act(async () => finish({ ...mocks.testSaved.mock.calls[1][0], success: false, error: { code: 'MODEL_CANCELLED', safe_message: 'Cancelled.', retry: 'never' } }));
+    await act(async () => finish({ ...mocks.testSaved.mock.calls[1][0], outcome: 'inconclusive', success: false, error: { code: 'MODEL_CANCELLED', safe_message: 'Cancelled.', retry: 'never' } }));
     expect(screen.getByText('设置已保存，测试已取消。')).toBeDefined();
   });
   it('validates endpoint paths and model limits before IPC', async () => {
     const user = await ready(); fireEvent.change(screen.getByLabelText(/^Base URL/), { target: { value: 'https://example.com/v1/chat/completions' } }); await user.click(button('保存'));
     expect(mocks.save).not.toHaveBeenCalled(); expect(screen.getByText(/请填写有效 HTTPS API 根地址/)).toBeDefined();
+  });
+  it('sends only a separately consented synthetic tool test and explains its limits', async () => {
+    const user = await ready();
+    await user.click(screen.getByRole('radio', { name: /任务工具调用/ }));
+    await user.click(button('测试已保存配置'));
+    const decision = screen.getByRole('group', { name: '确认测试接收方' });
+    expect(decision.textContent).toContain('xyz_capability_probe');
+    expect(decision.textContent).toContain('xyz-task-capability');
+    expect(decision.textContent).toContain('不连接 SSH，不执行任何工具或命令');
+    expect(decision.textContent).not.toContain('Reply with OK.');
+    expect((button('确认并测试') as HTMLButtonElement).disabled).toBe(true);
+    expect(mocks.testSaved).not.toHaveBeenCalled();
+    await user.click(within(decision).getByRole('checkbox')); await user.click(button('确认并测试'));
+    expect(mocks.testSaved).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ kind: 'task_capability', file_revision: modelConfig.file_revision, destination: modelConfig.destination, model: modelConfig.model, consent: true }));
+    expect(screen.getByText('合成工具调用格式已验证')).toBeDefined();
+    expect(screen.getAllByText(/通过不代表真实任务一定可执行、安全或可靠/).length).toBeGreaterThan(0);
+    expect(mocks.confirm).not.toHaveBeenCalled(); expect(mocks.probe).not.toHaveBeenCalled(); expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('invalidates consent on test-kind changes and never sends when declined', async () => {
+    const user = await ready(); await user.click(button('测试已保存配置'));
+    await user.click(screen.getByRole('checkbox', { name: /同意向这个已保存目标/ }));
+    await user.click(screen.getByRole('radio', { name: /任务工具调用/ }));
+    expect(screen.queryByRole('group', { name: '确认测试接收方' })).toBeNull();
+    await user.click(button('测试已保存配置'));
+    expect((screen.getByRole('checkbox', { name: /同意向这个已保存目标/ }) as HTMLInputElement).checked).toBe(false);
+    expect((button('确认并测试') as HTMLButtonElement).disabled).toBe(true);
+    await user.click(button('暂不测试')); expect(mocks.testSaved).not.toHaveBeenCalled(); expect(mocks.save).not.toHaveBeenCalled();
+    expect(screen.getByText('设置已保存，测试已取消，未发送请求。')).toBeDefined();
+  });
+  it('blocks an already checked consent after a saved revision changes', async () => {
+    const user = await ready(); await user.click(screen.getByRole('radio', { name: /任务工具调用/ })); await user.click(button('测试已保存配置'));
+    await user.click(screen.getByRole('checkbox', { name: /同意向这个已保存目标/ }));
+    act(() => emit({ kind: 'config_updated', config: { ...modelConfig, revision: '9', file_revision: 'external-9', model: 'external-model' } }));
+    expect((button('确认并测试') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText('已保存版本已变化，请重新选择测试并核对接收方。')).toBeDefined();
+    await user.click(button('确认并测试')); expect(mocks.testSaved).not.toHaveBeenCalled();
+    await user.click(button('测试已保存配置'));
+    expect((screen.getByRole('checkbox', { name: /同意向这个已保存目标/ }) as HTMLInputElement).checked).toBe(false);
+    expect(screen.getByRole('group', { name: '确认测试接收方' }).textContent).toContain('external-model');
+  });
+  it('keeps unsupported distinct from transport uncertainty and does not grant chat consent', async () => {
+    mocks.testSaved.mockImplementation(async request => ({ ...request, outcome: 'unsupported', success: false, error: { code: 'MODEL_TOOL_UNSUPPORTED', safe_message: 'Expected tool call was not returned.', retry: 'after_user_action' } }));
+    const user = await ready(); await user.click(screen.getByRole('radio', { name: /任务工具调用/ })); await user.click(button('保存并测试'));
+    await user.click(screen.getByRole('checkbox', { name: /同意向这个已保存目标/ })); await user.click(button('确认并测试'));
+    expect(screen.getByText('本次未通过工具调用格式检查')).toBeDefined();
+    expect(screen.getByText('设置已保存，本次未通过所选测试的格式检查。不会自动重试。')).toBeDefined();
+    expect(mocks.testSaved).toHaveBeenCalledOnce(); expect(mocks.confirm).not.toHaveBeenCalled();
+  });
+  it('does not treat a missing or inconclusive outcome as supported even if success is true', async () => {
+    mocks.testSaved.mockImplementation(async request => ({ ...request, success: true, error: null }));
+    const user = await ready(); await user.click(button('测试已保存配置'));
+    await user.click(screen.getByRole('checkbox', { name: /同意向这个已保存目标/ })); await user.click(button('确认并测试'));
+    expect(screen.getByText('测试结果不确定')).toBeDefined(); expect(screen.queryByText('流式聊天测试通过')).toBeNull();
+  });
+  it('labels a late task-capability result with its original revision after config changes', async () => {
+    let finish!: (result: ModelTestResult) => void; mocks.testSaved.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const user = await ready(); await user.click(screen.getByRole('radio', { name: /任务工具调用/ })); await user.click(button('测试已保存配置'));
+    await user.click(screen.getByRole('checkbox', { name: /同意向这个已保存目标/ })); await user.click(button('确认并测试'));
+    act(() => emit({ kind: 'config_updated', config: { ...modelConfig, revision: '9', file_revision: 'external-9', model: 'external-model' } }));
+    await act(async () => finish({ ...mocks.testSaved.mock.calls[0][0], outcome: 'supported', success: true, error: null }));
+    expect(screen.getByText('此前保存版本的测试已结束，结果不代表当前草稿或新配置。')).toBeDefined();
+    expect(screen.getByText(/结果仅对应此前已保存的版本，不代表当前草稿或新配置已通过/)).toBeDefined();
+    expect(mocks.testSaved).toHaveBeenCalledOnce();
   });
 });

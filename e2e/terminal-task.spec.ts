@@ -12,7 +12,7 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
     const session = { session_id: 'synthetic-ssh', generation: '1' };
     const chat = { chat_id: 'synthetic-chat', task_id: 'synthetic-chat', title: '新任务', revision: '1', active_run_id: null, messages: [] };
     type Action = { action_id: string; display_revision: string; command_text: string; append_enter: boolean; digest: string; policy: string; reason: string; approval_id: string | null; expires_at_unix_ms: number; displayed: boolean; delivery: string };
-    type Task = { chat_id: string; task_id: string; run_id: string; session: typeof session; target: { host: string; username: string; port: number }; revision: string; phase: string; instruction: string; assistant_text: string; action: Action; actions: Action[]; error: null; owner: boolean; remote_outcome: string; terminal_ready: boolean; round: number };
+    type Task = { task_context?: Record<string, unknown>; chat_id: string; task_id: string; run_id: string; session: typeof session; target: { host: string; username: string; port: number }; revision: string; phase: string; instruction: string; assistant_text: string; action: Action; actions: Action[]; error: null; owner: boolean; remote_outcome: string; terminal_ready: boolean; round: number };
     let task: Task | null = null;
     const emit = (event: string, payload: unknown) => listeners.get(event)?.forEach(id => callbacks.get(id)?.({ event, id, payload: structuredClone(payload) }));
     const unlisten = (event: string, id: number) => { listeners.get(event)?.delete(id); callbacks.delete(id); };
@@ -43,6 +43,7 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
           const consent = request?.context_consent as Record<string, unknown>;
           if (request?.readiness_confirmed !== true || consent?.revision !== config.revision || consent?.destination !== config.destination) throw new Error('Missing per-run consent/readiness');
           task = { chat_id: chat.chat_id, task_id: chat.task_id, run_id: 'synthetic-run', session, target: { host: 'synthetic-server.invalid', username: 'synthetic-user', port: 22 }, revision: '1', phase: 'awaiting_display', instruction: String(request.instruction), assistant_text: '<script>window.unsafe = true</script> 合成模型分析，仅验证界面。', action: { action_id: 'synthetic-action-1', display_revision: '1', command_text: 'uname -a', append_enter: true, digest: 'synthetic-binding-1', policy: 'auto_read_only', reason: '合成测试：基础策略允许。', approval_id: null, expires_at_unix_ms: Date.now() + 120000, displayed: false, delivery: 'not_sent' }, actions: [], error: null, owner: true, remote_outcome: 'not_sent', terminal_ready: true, round: 1 };
+          task.task_context = { task_id: task.task_id, run_id: task.run_id, session, summary: '合成任务摘要，仅测试界面', confirmed_facts: [], findings: [], hypotheses: [{ id: 'guess-1', text: '尚未核实系统版本', evidence_command_ids: [] }], remaining_steps: [{ id: 'step-1', text: '核查系统版本', status: 'pending', evidence_command_ids: [] }], evidence: [], truncated: false };
           return update();
         }
         if (cmd === 'ack_terminal_action' && task) {
@@ -115,5 +116,9 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
   expect(beforeInterrupt).not.toContain('send_user_input'); expect(beforeInterrupt).not.toContain('send_chat_message');
   await page.getByRole('button', { name: '发送 Ctrl+C' }).click();
   await expect.poll(async () => page.evaluate(() => (window as unknown as { __SYNTHETIC_TASK_CALLS__: Array<{ cmd: string }> }).__SYNTHETIC_TASK_CALLS__.filter(call => call.cmd === 'send_user_input').length)).toBe(1);
+  await page.locator('.task-context-panel > summary').click();
+  await expect(page.getByText('核查系统版本', { exact: true })).toBeVisible();
+  await expect(page.getByText('尚未核实系统版本', { exact: true })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('synthetic-task-context.png'), fullPage: true });
   expect(errors).toEqual([]);
 });

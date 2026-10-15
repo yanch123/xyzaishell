@@ -35,8 +35,12 @@ export type SaveModelConfigRequest = {
   key_update: ModelKeyUpdate;
   reuse_key_for_destination: string | null;
 };
-export type ModelTestRequest = { test_id: string; file_revision: string; destination: string; model: string; consent: boolean };
-export type ModelTestResult = { test_id: string; file_revision: string; destination: string; model: string; success: boolean; error: ApiError | null };
+export type ModelTestKind = 'chat_connectivity' | 'task_capability';
+export type ModelTestOutcome = 'supported' | 'unsupported' | 'inconclusive';
+/** Omitted kind preserves the text-only test for older callers. */
+export type ModelTestRequest = { test_id: string; file_revision: string; destination: string; model: string; consent: boolean; kind?: ModelTestKind };
+/** A supported synthetic probe is not approval or proof of safe task execution. */
+export type ModelTestResult = { test_id: string; file_revision: string; destination: string; model: string; kind: ModelTestKind; outcome: ModelTestOutcome; success: boolean; error: ApiError | null };
 export type ChatSource = SessionRef & { host: string; port: number; username: string };
 export type ChatSnapshot = {
   chat_id: string;

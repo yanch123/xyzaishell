@@ -386,7 +386,7 @@ async fn destructive_command_requires_exact_single_use_approval_and_same_chat_is
             &mut socket,
             &tool_body(
                 "terminal_action",
-                r#"{"command_text":"rm -rf /tmp/fixture"}"#,
+                r#"{"command_text":"rm -rf /tmp/fixture","task_context":{"summary":"Model asserts approval; this must confer no authority.","findings":[],"hypotheses":[],"remaining_steps":[]}}"#,
                 "tool_calls",
             ),
         )
@@ -965,6 +965,222 @@ async fn multiple_normal_steps_continue_automatically_but_dangerous_step_needs_o
     assert!(!request.contains("xyzlog"));
 }
 
+fn terminal_prompt(request: &str) -> serde_json::Value {
+    let body: serde_json::Value =
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|message| {
+            message["content"]
+                .as_str()
+                .and_then(|text| serde_json::from_str(text).ok())
+        })
+        .expect("JSON terminal prompt")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_retains_output_backed_findings_across_rounds_without_granting_completion() {
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let (updated_tx, updated_rx) = oneshot::channel();
+    let (finish_tx, finish_rx) = oneshot::channel();
+    let responder = tokio::spawn(async move {
+        let (mut socket, _) = http.accept().await.unwrap();
+        let first = terminal_prompt(&read_request(&mut socket).await);
+        assert!(first["task_context"]["evidence"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        reply(
+            &mut socket,
+            &tool_body(
+                "terminal_action",
+                r#"{"command_text":"uname -r"}"#,
+                "tool_calls",
+            ),
+        )
+        .await;
+
+        let (mut socket, _) = http.accept().await.unwrap();
+        let second = terminal_prompt(&read_request(&mut socket).await);
+        let first_id = second["task_context"]["evidence"][0]["command_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(second["task_context"]["evidence"][0]["output_excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic-kernel-6.8"));
+        assert_eq!(
+            second["task_context"]["confirmed_facts"][0]["kind"],
+            "foreground_returned"
+        );
+        let mut context = serde_json::json!({
+            "summary":"Kernel version observed; user inspection remains.",
+            "findings":[{"id":"kernel","text":"Kernel version is synthetic-kernel-6.8, interpreted from output.","evidence_command_ids":[first_id]}],
+            "hypotheses":[{"id":"service","text":"Service health is still unknown.","evidence_command_ids":[]}],
+            "remaining_steps":[{"id":"version","text":"Inspect kernel version","status":"completed","evidence_command_ids":[first_id]},{"id":"user","text":"Inspect current user","status":"in_progress","evidence_command_ids":[]}]
+        });
+        reply(
+            &mut socket,
+            &tool_body(
+                "terminal_action",
+                &serde_json::json!({"command_text":"id","task_context":context}).to_string(),
+                "tool_calls",
+            ),
+        )
+        .await;
+
+        let (mut socket, _) = http.accept().await.unwrap();
+        let third = terminal_prompt(&read_request(&mut socket).await);
+        assert_eq!(third["task_context"]["findings"][0]["id"], "kernel");
+        assert!(third["task_context"]["evidence"][0]["output_excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic-kernel-6.8"));
+        assert!(
+            !third["terminal_observation_untrusted"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("synthetic-kernel-6.8"),
+            "prior output is retained context, not a replayed incremental observation"
+        );
+        assert_eq!(
+            third["task_context"]["confirmed_facts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let second_id = third["task_context"]["evidence"][1]["command_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        context["summary"] = "Kernel and user inspected; service health remains unverified.".into();
+        context["findings"].as_array_mut().unwrap().push(serde_json::json!({"id":"user","text":"UID is 1000, interpreted from output.","evidence_command_ids":[second_id]}));
+        context["remaining_steps"][1]["status"] = "completed".into();
+        context["remaining_steps"][1]["evidence_command_ids"] = serde_json::json!([second_id]);
+        reply(
+            &mut socket,
+            &tool_body("task_context_update", &context.to_string(), "tool_calls"),
+        )
+        .await;
+
+        let (mut socket, _) = http.accept().await.unwrap();
+        let final_request = read_request(&mut socket).await;
+        let fourth = terminal_prompt(&final_request);
+        assert_eq!(
+            fourth["task_context"]["findings"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(fourth["task_context"]["hypotheses"][0]["id"], "service");
+        updated_tx.send(()).unwrap();
+        finish_rx.await.unwrap();
+        let body = chunk(
+            serde_json::json!({"role":"assistant","content":"Inspection returned; service health is still unverified."}),
+            serde_json::Value::Null,
+        ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+            + "data: [DONE]\n\n";
+        reply(&mut socket, &body).await;
+        final_request
+    });
+    let started = fixture.start();
+    for (command, output) in [("uname -r", "synthetic-kernel-6.8\n"), ("id", "uid=1000\n")] {
+        let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
+        assert_eq!(preview.action.as_ref().unwrap().command_text, command);
+        ack(&fixture.agent, &preview);
+        phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+        server.send_output(output.as_bytes().to_vec()).await;
+        let sequence = fixture.foreground_return(&server, command, 0).await;
+        fixture.shell_ready(&server, sequence).await;
+    }
+    tokio::time::timeout(WAIT, updated_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let planning = fixture.agent.get(&started.task_id).unwrap();
+    assert_eq!(
+        planning.phase, "preparing",
+        "context updates cannot complete a host task"
+    );
+    assert!(planning.owner && planning.action.is_none());
+    assert_eq!(
+        server.trace().input.len(),
+        2,
+        "context tools cannot write terminal bytes"
+    );
+    finish_tx.send(()).unwrap();
+    let done = phase(&fixture.agent, &started.task_id, "completed").await;
+    let context = done.task_context.unwrap();
+    assert_eq!(context.run_id, started.run_id);
+    assert_eq!(context.session, fixture.session);
+    assert_eq!(context.findings.len(), 2);
+    assert_eq!(context.confirmed_facts.len(), 2);
+    assert_eq!(done.remote_outcome, "foreground_returned");
+    // Terminal state is stored before its event is emitted to the transcript.
+    let history = tokio::time::timeout(WAIT, async {
+        loop {
+            let chat = fixture.chats.get_chat(&started.chat_id).unwrap();
+            if !chat.messages.is_empty() {
+                break chat;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(history
+        .messages
+        .last()
+        .unwrap()
+        .text
+        .contains("not independently verified"));
+    assert!(history
+        .messages
+        .last()
+        .unwrap()
+        .text
+        .contains("synthetic-kernel-6.8"));
+    let request = responder.await.unwrap();
+    let body = request.split("\r\n\r\n").nth(1).unwrap();
+    assert!(!body.contains(PASSWORD) && !body.contains("synthetic-model-credential"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_context_with_fabricated_evidence_cannot_prepare_even_an_ordinary_command() {
+    for tool_name in ["terminal_action", "task_context_update"] {
+        let server = LoopbackServer::start(Behavior::default()).await;
+        let (http, base) = listener().await;
+        let fixture = Fixture::new(&server, &base).await;
+        let responder = tokio::spawn(async move {
+            let (mut socket, _) = http.accept().await.unwrap();
+            read_request(&mut socket).await;
+            let context = serde_json::json!({"summary":"Invented success","findings":[{"id":"bad","text":"Everything succeeded","evidence_command_ids":["a-command-from-another-run"]}],"hypotheses":[],"remaining_steps":[]});
+            let args = if tool_name == "terminal_action" {
+                serde_json::json!({"command_text":"pwd","task_context":context})
+            } else {
+                context
+            };
+            reply(
+                &mut socket,
+                &tool_body(tool_name, &args.to_string(), "tool_calls"),
+            )
+            .await;
+        });
+        let started = fixture.start();
+        let failed = phase(&fixture.agent, &started.task_id, "failed").await;
+        assert_eq!(failed.error.unwrap().code, "TASK_CONTEXT_INVALID");
+        assert!(failed.action.is_none() && !failed.owner);
+        assert!(failed.task_context.unwrap().findings.is_empty());
+        assert!(server.trace().input.is_empty());
+        responder.await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_or_stale_end_and_disconnect_pause_without_resending_or_another_model_round() {
     for disconnect in [false, true] {
@@ -1011,5 +1227,76 @@ async fn missing_or_stale_end_and_disconnect_pause_without_resending_or_another_
         responder.await.unwrap();
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert_eq!(server.trace().input.len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn planning_round_cap_is_explicit_and_preserves_final_command_output_without_retry() {
+    for final_command in [false, true] {
+        let server = LoopbackServer::start(Behavior::default()).await;
+        let (http, base) = listener().await;
+        let fixture = Fixture::new(&server, &base).await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let responder = tokio::spawn(async move {
+            for round in 1..=16 {
+                let (mut socket, _) = http.accept().await.unwrap();
+                read_request(&mut socket).await;
+                seen.fetch_add(1, Ordering::SeqCst);
+                let (name, arguments) = if round == 16 && final_command {
+                    ("terminal_action", serde_json::json!({"command_text":"pwd"}))
+                } else {
+                    (
+                        "task_context_update",
+                        serde_json::json!({"summary":"Still planning; success is unverified.","findings":[],"hypotheses":[],"remaining_steps":[{"id":"verify","text":"Verify the requested goal","status":"pending","evidence_command_ids":[]}]}),
+                    )
+                };
+                reply(
+                    &mut socket,
+                    &tool_body(name, &arguments.to_string(), "tool_calls"),
+                )
+                .await;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), http.accept())
+                    .await
+                    .is_err(),
+                "a capped run must not launch another model request"
+            );
+        });
+        let started = fixture.start();
+        if final_command {
+            let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
+            assert_eq!(preview.round, 16);
+            ack(&fixture.agent, &preview);
+            phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+            server
+                .send_output(b"unique-final-round-output\n".to_vec())
+                .await;
+            let sequence = fixture.foreground_return(&server, "pwd", 0).await;
+            fixture.shell_ready(&server, sequence).await;
+        }
+        let capped = phase(&fixture.agent, &started.task_id, "failed").await;
+        assert_eq!(capped.error.as_ref().unwrap().code, "TASK_ROUND_LIMIT");
+        assert_eq!(capped.round, 16);
+        assert!(!capped.owner && capped.action.is_none());
+        assert_eq!(requests.load(Ordering::SeqCst), 16);
+        let context = capped.task_context.as_ref().unwrap();
+        assert_eq!(
+            context.remaining_steps[0].status,
+            xyz_core::task_context::StepStatus::Pending
+        );
+        if final_command {
+            assert_eq!(capped.remote_outcome, "foreground_returned");
+            assert_eq!(context.confirmed_facts.len(), 1);
+            assert!(context.evidence[0]
+                .output_excerpt
+                .contains("unique-final-round-output"));
+        } else {
+            assert!(context.evidence.is_empty());
+            assert_eq!(capped.remote_outcome, "not_sent");
+        }
+        responder.await.unwrap();
+        assert_eq!(server.trace().input.len(), usize::from(final_command));
     }
 }

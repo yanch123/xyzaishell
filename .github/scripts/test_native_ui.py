@@ -18,23 +18,24 @@ SPEC.loader.exec_module(native)
 
 class NativeVersionPhaseTests(unittest.TestCase):
     def test_seed_and_same_version_preservation(self):
-        native.verify_phase_version("seed", "0.1.1", "new-hash", None)
-        expected = {"application_version": "0.1.1", "application_sha256": "new-hash"}
-        native.verify_phase_version("preserved", "0.1.1", "new-hash", expected)
-        with self.assertRaises(ValueError):
-            native.verify_phase_version("preserved", "0.1.1", "other-hash", expected)
+        for version in ("0.1.2", "0.1.3"):
+            native.verify_phase_version("seed", version, "new-hash", None)
+            expected = {"application_version": version, "application_sha256": "new-hash"}
+            native.verify_phase_version("preserved", version, "new-hash", expected)
+            with self.assertRaises(ValueError):
+                native.verify_phase_version("preserved", version, "other-hash", expected)
 
     def test_upgrade_requires_exact_old_version_and_replaced_executable(self):
-        expected = {"application_version": "0.1.1", "application_sha256": "old-hash"}
-        native.verify_phase_version("upgrade", "0.1.2", "new-hash", expected)
-        for version, digest, record in [("0.1.1", "new-hash", expected), ("0.1.2", "old-hash", expected),
-                ("0.1.3", "new-hash", expected), ("0.1.2", "new-hash", None),
-                ("0.1.2", "new-hash", {"application_version": "0.1.0", "application_sha256": "old-hash"})]:
+        expected = {"application_version": "0.1.2", "application_sha256": "old-hash"}
+        native.verify_phase_version("upgrade", "0.1.3", "new-hash", expected)
+        for version, digest, record in [("0.1.2", "new-hash", expected), ("0.1.3", "old-hash", expected),
+                ("0.1.4", "new-hash", expected), ("0.1.3", "new-hash", None),
+                ("0.1.3", "new-hash", {"application_version": "0.1.0", "application_sha256": "old-hash"})]:
             with self.assertRaises(ValueError):
                 native.verify_phase_version("upgrade", version, digest, record)
 
     def test_invalid_version_or_phase_rejected(self):
-        for phase, version in [("seed", "latest"), ("seed", "0.1.1\\nextra"), ("seed", "0.1.3"), ("other", "0.1.1")]:
+        for phase, version in [("seed", "latest"), ("seed", "0.1.2\\nextra"), ("seed", "0.1.1"), ("seed", "0.1.4"), ("other", "0.1.2")]:
             with self.assertRaises(ValueError):
                 native.verify_phase_version(phase, version, "hash", None)
 
@@ -59,6 +60,17 @@ class ProcessQueryTests(unittest.TestCase):
 
 
 class NativeDriverHelperTests(unittest.TestCase):
+    def test_both_reviewed_versions_use_current_connection_and_log_controls(self):
+        for version in ("0.1.2", "0.1.3"):
+            with self.subTest(version=version):
+                driver = mock.Mock()
+                driver.button.side_effect = lambda text: text
+                native.open_profiles(driver, version)
+                native.close_profiles(driver, version)
+                native.open_shell_logs(driver, version)
+                self.assertEqual(driver.click.call_args_list, [mock.call("打开连接管理"), mock.call("关闭"),
+                    mock.call("打开终端日志"), mock.call("//select[@aria-label='日志查看范围']/option[@value='all']")])
+
     def transport_driver(self, directory):
         driver = native.Driver.__new__(native.Driver)
         driver.application = pathlib.Path("xyzaishell")
@@ -330,6 +342,75 @@ class NativeHelperTests(unittest.TestCase):
                 connection.execute("UPDATE chats SET payload='changed' WHERE chat_id='old-chat'")
             with self.assertRaisesRegex(AssertionError, "preexisting history row"):
                 native.verify_history_upgrade(root, rows)
+
+    def test_v012_history_upgrade_rejects_schema_change_missing_or_empty_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with sqlite3.connect(root / "history.sqlite3") as connection:
+                connection.execute("CREATE TABLE chats (chat_id TEXT,task_id TEXT,revision INTEGER,listed INTEGER,updated_ms INTEGER,payload TEXT)")
+                connection.execute("INSERT INTO chats VALUES ('old-chat','old-task',3,1,12,'synthetic')")
+                connection.execute("PRAGMA user_version=2")
+            version, rows = native.history_rows(root)
+            self.assertEqual(version, 2)
+            native.verify_history_upgrade(root, rows)
+            with self.assertRaisesRegex(AssertionError, "real baseline history"):
+                native.verify_history_upgrade(root, [])
+            with sqlite3.connect(root / "history.sqlite3") as connection:
+                connection.execute("PRAGMA user_version=3")
+            with self.assertRaisesRegex(AssertionError, "history format marker"):
+                native.verify_history_upgrade(root, rows)
+            with sqlite3.connect(root / "history.sqlite3") as connection:
+                connection.execute("PRAGMA user_version=2")
+                connection.execute("DELETE FROM chats")
+            with self.assertRaisesRegex(AssertionError, "preexisting history row"):
+                native.verify_history_upgrade(root, rows)
+
+    @unittest.skipIf(native.os.name == "nt", "Unix permission fixture")
+    def test_current_profile_upgrade_requires_v2_exact_bytes_and_private_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = root / "connections.toml"
+            original = b'schema_version = 2\n# real synthetic baseline profile\n'
+            profile.write_bytes(original)
+            profile.chmod(0o600)
+            expected = {"profile_schema_version": 2, "profile_file_sha256": native.hashlib.sha256(original).hexdigest()}
+            native.verify_current_profile_upgrade(root, expected)
+            with self.assertRaisesRegex(AssertionError, "real v0.1.2 profiles"):
+                native.verify_current_profile_upgrade(root, dict(expected, profile_schema_version=1))
+            profile.chmod(0o644)
+            with self.assertRaisesRegex(AssertionError, "owner-only"):
+                native.verify_current_profile_upgrade(root, expected)
+            profile.chmod(0o600)
+            profile.write_bytes(original + b"# altered\n")
+            with self.assertRaisesRegex(AssertionError, "baseline bytes"):
+                native.verify_current_profile_upgrade(root, expected)
+            profile.write_bytes(original)
+            backup = root / "connections.v1.backup.toml"
+            backup.write_bytes(original)
+            with self.assertRaisesRegex(AssertionError, "legacy backup"):
+                native.verify_current_profile_upgrade(root, expected)
+            backup.unlink()
+            profile.rename(backup)
+            profile.symlink_to(backup)
+            with self.assertRaisesRegex(AssertionError, "protected regular"):
+                native.verify_current_profile_upgrade(root, expected)
+
+    def test_windows_current_profile_checks_actual_file_acl_and_propagates_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            profile = root / "connections.toml"
+            profile.write_bytes(b"schema_version = 2\n")
+            expected = {"profile_schema_version": 2, "profile_file_sha256": native.hashlib.sha256(profile.read_bytes()).hexdigest()}
+            with mock.patch.object(native.os, "name", "nt"), mock.patch.object(native.subprocess, "run") as run:
+                native.verify_current_profile_upgrade(root, expected)
+                args, kwargs = run.call_args
+                self.assertIn(str(profile), args[0][-1])
+                self.assertIn("$owner -ne $sid", args[0][-1])
+                self.assertIn("AreAccessRulesProtected", args[0][-1])
+                self.assertTrue(kwargs["check"])
+                run.side_effect = native.subprocess.CalledProcessError(1, "pwsh")
+                with self.assertRaises(native.subprocess.CalledProcessError):
+                    native.verify_current_profile_upgrade(root, expected)
 
     @unittest.skipIf(native.os.name == "nt", "Unix permission fixture")
     def test_profile_backup_requires_exact_bytes_and_owner_only_mode(self):

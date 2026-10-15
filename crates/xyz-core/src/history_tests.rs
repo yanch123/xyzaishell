@@ -89,6 +89,7 @@ fn terminal(chat: &ChatSnapshot, phase: &str) -> TerminalTaskSnapshot {
         terminal_ready: false,
         round: 1,
         secret_request: None,
+        task_context: None,
     }
 }
 

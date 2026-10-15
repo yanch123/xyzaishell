@@ -4,11 +4,12 @@ use super::*;
 use crate::storage::{private_files::PrivateDirectory, StorageError};
 use futures::StreamExt;
 use rig_core::{
-    completion::{CompletionRequest, FinishReason},
+    completion::{CompletionRequest, FinishReason, ToolDefinition},
+    message::{AssistantContent, ToolName},
     providers::openai::OpenAIConfig,
     streaming::{Item, PartKind, StreamEvent},
 };
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 use zeroize::Zeroize;
 
 #[derive(Deserialize)]
@@ -36,6 +37,20 @@ pub struct SaveModelConfigRequest {
     /// Explicit reuse decision bound to the exact normalized new destination.
     pub reuse_key_for_destination: Option<String>,
 }
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTestKind {
+    #[default]
+    ChatConnectivity,
+    TaskCapability,
+}
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTestOutcome {
+    Supported,
+    Unsupported,
+    Inconclusive,
+}
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelTestRequest {
@@ -43,7 +58,11 @@ pub struct ModelTestRequest {
     pub file_revision: String,
     pub destination: String,
     pub model: String,
-    /// Authorizes only authentication and the fixed minimal test prompt.
+    /// Older clients remain limited to the existing text-only test. Consent is
+    /// for this exact kind, saved destination, model and configuration revision.
+    #[serde(default)]
+    pub kind: ModelTestKind,
+    /// Authorizes only authentication and this kind's fixed synthetic test data.
     pub consent: bool,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -52,6 +71,10 @@ pub struct ModelTestResult {
     pub file_revision: String,
     pub destination: String,
     pub model: String,
+    pub kind: ModelTestKind,
+    /// Evidence from this test attempt, not a guarantee about future requests.
+    /// Transport errors and a model declining the probe are inconclusive.
+    pub outcome: ModelTestOutcome,
     pub success: bool,
     pub error: Option<ApiError>,
 }
@@ -235,7 +258,7 @@ impl ModelConfigManager {
                 || state.status.model.as_deref() != Some(request.model.as_str())
                 || uuid::Uuid::parse_str(&request.test_id).is_err()
             {
-                return Err(ApiError::new("MODEL_TEST_CONFIRMATION_REQUIRED", "Review and confirm the exact saved destination, model, and minimal test data before testing."));
+                return Err(ApiError::new("MODEL_TEST_CONFIRMATION_REQUIRED", "Review and confirm the exact saved destination, model, test kind, and synthetic test data before testing."));
             }
             if let Some(index) = state
                 .cancelled_tests
@@ -248,6 +271,8 @@ impl ModelConfigManager {
                     file_revision: request.file_revision,
                     destination: request.destination,
                     model: request.model,
+                    kind: request.kind,
+                    outcome: ModelTestOutcome::Inconclusive,
                     success: false,
                     error: Some(ApiError::new(
                         "MODEL_CANCELLED",
@@ -280,7 +305,7 @@ impl ModelConfigManager {
         let outcome = tokio::select! {
             biased;
             _ = receiver.changed() => Err(ApiError::new("MODEL_CANCELLED", "The model settings test was cancelled without retry.")),
-            result = tokio::time::timeout(Duration::from_secs(snapshot.request.request_timeout_seconds), stream_test(snapshot)) => result.unwrap_or_else(|_| Err(ApiError::new("MODEL_TIMEOUT", "The model settings test timed out without retry."))),
+            result = tokio::time::timeout(Duration::from_secs(snapshot.request.request_timeout_seconds), stream_test(snapshot, request.kind)) => result.unwrap_or_else(|_| Err(ApiError::new("MODEL_TIMEOUT", "The model settings test timed out without retry."))),
         };
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state
@@ -295,12 +320,26 @@ impl ModelConfigManager {
             file_revision: request.file_revision,
             destination: request.destination,
             model: request.model,
+            kind: request.kind,
+            outcome: match &outcome {
+                Ok(()) => ModelTestOutcome::Supported,
+                Err(error) if error.code == "MODEL_TASK_CAPABILITY_UNSUPPORTED" => {
+                    ModelTestOutcome::Unsupported
+                }
+                Err(_) => ModelTestOutcome::Inconclusive,
+            },
             success: outcome.is_ok(),
             error: outcome.err(),
         })
     }
 }
-async fn stream_test(config: Arc<ModelSnapshot>) -> Result<(), ApiError> {
+const MOCK_TOOL_NAME: &str = "xyz_capability_probe";
+const MOCK_PROBE_VALUE: &str = "xyz-task-capability";
+const MOCK_TOOL_PROMPT: &str = "This is a synthetic compatibility test. Call xyz_capability_probe exactly once with the JSON argument {\"probe\":\"xyz-task-capability\"}. Do not call any other tool. The tool is inert and will not be executed.";
+fn incompatible_tool_response() -> ApiError {
+    ApiError::new("MODEL_TASK_CAPABILITY_UNSUPPORTED", "This completed test response is incompatible with the task adapter: it requires exactly one streamed mock-tool call with the requested name, exact JSON arguments, and a complete normalized tool-call finish reason. No tool was executed. Review the provider's streaming tool-call support or choose a compatible model, then explicitly test again.")
+}
+async fn stream_test(config: Arc<ModelSnapshot>, kind: ModelTestKind) -> Result<(), ApiError> {
     let transport = crate::model_transport::build_transport(
         &config.destination,
         Duration::from_secs(config.request.connect_timeout_seconds),
@@ -309,28 +348,111 @@ async fn stream_test(config: Arc<ModelSnapshot>) -> Result<(), ApiError> {
     )?;
     let failures = transport.clone();
     let safe_failure = || {
-        failures.safe_error().unwrap_or_else(|| ApiError::new("MODEL_TEST_FAILED", "The provider did not complete the streaming chat test. Check this saved configuration and service availability. No automatic retry occurs."))
+        failures.safe_error().unwrap_or_else(|| ApiError::new("MODEL_TEST_FAILED", "The provider did not complete a valid test stream, so compatibility is inconclusive. Check this saved configuration and service availability. No automatic retry occurs."))
     };
     let model = OpenAIConfig::new(config.api_key.as_str())
         .with_base_url(&config.destination)
         .connect(transport)
         .chat(&config.model);
-    // No history, terminal context, preamble, tool declarations, or user draft.
-    let mut stream = model
-        .stream(CompletionRequest::new("Reply with OK.").max_tokens(16))
-        .map_err(|_| safe_failure())?;
+    // No history, terminal context, user draft, execution adapter or SSH handle.
+    // This inert declaration is serialized only; no Tool implementation exists.
+    let request = match kind {
+        ModelTestKind::ChatConnectivity => CompletionRequest::new("Reply with OK.").max_tokens(16),
+        ModelTestKind::TaskCapability => {
+            let tool = ToolDefinition::new(
+                ToolName::new(MOCK_TOOL_NAME).map_err(|_| safe_failure())?,
+                "Inert compatibility probe. The application validates the synthetic arguments only; it never executes this tool.",
+                serde_json::json!({"type":"object","additionalProperties":false,"properties":{"probe":{"type":"string","enum":[MOCK_PROBE_VALUE]}},"required":["probe"]}),
+            );
+            CompletionRequest::new(MOCK_TOOL_PROMPT)
+                .tools(vec![tool])
+                .max_tokens(128)
+        }
+    };
+    let mut stream = model.stream(request).map_err(|_| safe_failure())?;
     let mut output_bytes = 0usize;
+    let mut raw_arguments: BTreeMap<usize, String> = BTreeMap::new();
     while let Some(item) = stream.next().await {
         match item.map_err(|_| safe_failure())? {
             Item::Event(StreamEvent::Text { text, .. }) => {
                 output_bytes += text.len();
-                if output_bytes > 4096 { return Err(ApiError::new("MODEL_OUTPUT_LIMIT", "The minimal model test exceeded its response limit.")); }
             }
-            Item::Event(StreamEvent::Start { kind: PartKind::ToolCall, .. }) | Item::Event(StreamEvent::Arguments { .. }) => return Err(ApiError::new("MODEL_TOOLS_UNAVAILABLE", "The test returned a tool call. Only streaming text is tested; no tool was executed.")),
+            Item::Event(StreamEvent::Start { kind: PartKind::ToolCall, .. })
+                if kind == ModelTestKind::ChatConnectivity => return Err(ApiError::new("MODEL_TOOLS_UNAVAILABLE", "The chat connectivity test returned a tool call. Only streaming text was requested; no tool was executed.")),
+            Item::Event(StreamEvent::Arguments { part, json }) => {
+                if kind == ModelTestKind::ChatConnectivity {
+                    return Err(ApiError::new("MODEL_TOOLS_UNAVAILABLE", "The chat connectivity test returned a tool call. Only streaming text was requested; no tool was executed."));
+                }
+                output_bytes += json.len();
+                if output_bytes <= 4096 && raw_arguments.len() < 16 {
+                    raw_arguments.entry(part.index()).or_default().push_str(&json);
+                } else {
+                    return Err(ApiError::new("MODEL_OUTPUT_LIMIT", "The synthetic model test exceeded its response limit; compatibility is inconclusive."));
+                }
+            }
             _ => {},
+        }
+        if output_bytes > 4096 {
+            return Err(ApiError::new("MODEL_OUTPUT_LIMIT", "The synthetic model test exceeded its response limit; compatibility is inconclusive."));
         }
     }
     let response = stream.finish().await.map_err(|_| safe_failure())?;
+    if kind == ModelTestKind::TaskCapability {
+        if !matches!(
+            response.finish_reason(),
+            Some(FinishReason::Stop | FinishReason::ToolCalls)
+        ) {
+            return Err(ApiError::new("MODEL_TASK_CAPABILITY_INCONCLUSIVE", "The synthetic response did not reach a complete stop or tool-call boundary. Task compatibility is inconclusive; no tool was executed and no automatic retry occurs."));
+        }
+        let calls: Vec<_> = response
+            .choice
+            .iter()
+            .filter_map(|part| match part {
+                AssistantContent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        if calls.is_empty() && raw_arguments.is_empty() {
+            return Err(ApiError::new("MODEL_TASK_CAPABILITY_INCONCLUSIVE", "The model did not return the requested mock tool call. A text reply does not establish task compatibility or prove that tool calling is unsupported. Check the provider's streaming tool-call support, then explicitly test again."));
+        }
+        if calls.len() != 1
+            || raw_arguments.len() != 1
+            // Match the real task adapter: Rig reconciles stop + a completed
+            // tool call to ToolCalls. This is not raw-wire certification.
+            || !matches!(response.finish_reason(), Some(FinishReason::ToolCalls))
+            || response.choice.iter().any(|part| {
+                !matches!(
+                    part,
+                    AssistantContent::Text(_) | AssistantContent::ToolCall(_)
+                )
+            })
+        {
+            return Err(incompatible_tool_response());
+        }
+        let call = calls[0];
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ProbeArguments {
+            probe: String,
+        }
+        let arguments: ProbeArguments = serde_json::from_str(
+            raw_arguments
+                .values()
+                .next()
+                .ok_or_else(incompatible_tool_response)?,
+        )
+        .map_err(|_| incompatible_tool_response())?;
+        if call.function.name.as_str() != MOCK_TOOL_NAME
+            || call.function.invalid_arguments.is_some()
+            || arguments.probe != MOCK_PROBE_VALUE
+            || serde_json::to_value(&call.function.arguments)
+                .map_err(|_| incompatible_tool_response())?
+                != serde_json::json!({"probe":MOCK_PROBE_VALUE})
+        {
+            return Err(incompatible_tool_response());
+        }
+        return Ok(());
+    }
     if response
         .choice
         .iter()

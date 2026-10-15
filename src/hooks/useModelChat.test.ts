@@ -228,3 +228,78 @@ describe('saved settings and immutable chat provenance', () => {
     expect(mocks.probe).not.toHaveBeenCalled(); expect(mocks.create).not.toHaveBeenCalled(); expect(mocks.send).not.toHaveBeenCalled();
   });
 });
+
+describe('explicit terminal attachment lifecycle', () => {
+  const target = { state: 'connected' as const, host: 'first.example', port: 22, username: 'user', session: { session_id: 'first-session', generation: '1' } };
+  const source = { ...target.session, host: target.host, port: 22, username: target.username };
+  const selection = { id: 'selection-one', source, text: 'disk output', truncated: false };
+  async function attachedReady() {
+    mocks.list.mockResolvedValue([{ ...chat(), source }, { ...chat('chat-b'), source }]);
+    mocks.get.mockImplementation(async (id: string) => ({ ...chat(id), source }));
+    const hook = renderHook((props: { target: typeof target }) => useModelChat(props.target), { initialProps: { target } });
+    await waitFor(() => expect(hook.result.current.ready).toBe(true));
+    act(() => expect(hook.result.current.attachSelection('chat-a', selection)).toBe(true));
+    return hook;
+  }
+  it('stores only a bounded draft until separate review and send; edits preserve source and revoke consent', async () => {
+    const { result } = await attachedReady();
+    expect(mocks.send).not.toHaveBeenCalled(); expect(mocks.create).not.toHaveBeenCalled();
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false));
+    act(() => result.current.consentAttachment('chat-a', true));
+    expect(result.current.attachments['chat-a'].consent?.destination).toBe(modelConfig.destination);
+    act(() => result.current.editAttachment('chat-a', 'reviewed output'));
+    expect(result.current.attachments['chat-a'].consent).toBeNull();
+    expect(result.current.attachments['chat-a'].source).toEqual(source);
+    expect(Object.isFrozen(result.current.attachments['chat-a'].source)).toBe(true);
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false));
+    act(() => { result.current.updateDraft('chat-a', 'explain'); result.current.consentAttachment('chat-a', true); });
+    await act(async () => expect(await result.current.send('chat-a')).toBe(true));
+    expect(mocks.send).toHaveBeenCalledExactlyOnceWith('chat-a', expect.stringContaining('reviewed output'));
+    expect(mocks.send.mock.calls[0][1]).toContain('用户已编辑'); expect(mocks.send.mock.calls[0][1]).toContain('"session_id":"first-session"');
+    expect(result.current.attachments['chat-a']).toBeUndefined(); expect(result.current.drafts['chat-a']).toBe('');
+  });
+  it('refuses replacement and other chats/sessions/history instead of transferring raw output', async () => {
+    const { result } = await attachedReady();
+    act(() => {
+      expect(result.current.attachSelection('chat-a', { ...selection, text: 'replacement' })).toBe(false);
+      expect(result.current.attachSelection('chat-b', { ...selection, source: { ...source, host: 'other.example' } })).toBe(false);
+      expect(result.current.attachSelection('chat-b', { ...selection, source: { ...source, generation: '2' } })).toBe(false);
+      result.current.restoreChat({ ...chat('history'), source, restored_read_only: true });
+      expect(result.current.attachSelection('history', selection)).toBe(false);
+    });
+    expect(result.current.attachments['chat-a'].text).toBe('disk output'); expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('revokes review after switching chats, even on return, and after config changes', async () => {
+    const { result } = await attachedReady();
+    act(() => result.current.consentAttachment('chat-a', true));
+    await act(async () => result.current.selectChat('chat-b'));
+    await act(async () => result.current.selectChat('chat-a'));
+    expect(result.current.attachments['chat-a'].consent).toBeNull();
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false));
+    act(() => result.current.consentAttachment('chat-a', true));
+    act(() => emit({ kind: 'config_updated', config: { ...modelConfig, revision: '4', model: 'changed-model' } }));
+    expect(result.current.attachments['chat-a'].consent).toBeNull();
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false)); expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('fences reconnect and disconnect at send time and never restores old approval on return', async () => {
+    const { result, rerender } = await attachedReady();
+    act(() => result.current.consentAttachment('chat-a', true));
+    rerender({ target: { ...target, session: { ...target.session, generation: '2' } } });
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false));
+    act(() => result.current.consentAttachment('chat-a', true)); expect(result.current.attachments['chat-a'].consent).toBeNull();
+    rerender({ target });
+    expect(result.current.attachments['chat-a'].consent).toBeNull();
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false)); expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('preserves newly edited attachment while a prior explicit send completes', async () => {
+    const { result } = await attachedReady();
+    let done!: (chat: ChatSnapshot) => void;
+    mocks.send.mockImplementationOnce(() => new Promise(resolve => { done = resolve; }));
+    act(() => result.current.consentAttachment('chat-a', true));
+    let pending!: Promise<boolean>;
+    act(() => { pending = result.current.send('chat-a'); });
+    act(() => result.current.editAttachment('chat-a', 'new draft after send'));
+    await act(async () => { done({ ...stream(), source }); expect(await pending).toBe(true); });
+    expect(result.current.attachments['chat-a'].text).toBe('new draft after send'); expect(result.current.attachments['chat-a'].consent).toBeNull();
+  });
+});

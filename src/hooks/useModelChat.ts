@@ -3,9 +3,11 @@ import { desktopAvailable } from '../lib/bridge';
 import { modelBridge } from '../lib/modelBridge';
 import { MAX_CHATS, MAX_DRAFT_LENGTH, MAX_MESSAGE_BYTES, MAX_MESSAGES, utf8Length } from '../lib/chats';
 import { INITIAL_MODEL_CONFIG, MAX_CONCURRENT_CHATS, newerRevision } from '../lib/model';
-import type { ChatSnapshot, ModelConfigStatus, SaveModelConfigRequest, ModelTestResult } from '../lib/model';
+import type { ChatSnapshot, ModelConfigStatus, SaveModelConfigRequest, ModelTestResult, ModelTestKind } from '../lib/model';
 import type { SessionSnapshot } from '../lib/types';
 import { safeError } from '../lib/types';
+import type { TerminalAttachmentDraft, TerminalSelection } from '../lib/terminalSelection';
+import { attachmentConsented, boundSelection, composeAttachedMessage, selectionMatchesChat, selectionMatchesTarget } from '../lib/terminalSelection';
 
 function previewChat(): ChatSnapshot {
   const id = crypto.randomUUID();
@@ -27,6 +29,8 @@ export function useModelChat(target?: SessionSnapshot) {
   const [ready, setReady] = useState(!native);
   const [selected, setSelected] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [attachments, setAttachments] = useState<Record<string, TerminalAttachmentDraft>>({});
+  const attachmentsRef = useRef(attachments);
   const [errors, setErrors] = useState<Record<string, string | null>>({});
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<Record<string, 'sending' | 'cancelling'>>({});
@@ -126,6 +130,37 @@ export function useModelChat(target?: SessionSnapshot) {
     draftsRef.current = next;
     setDrafts(next);
   };
+  const commitAttachments = (next: Record<string, TerminalAttachmentDraft>) => { attachmentsRef.current = next; setAttachments(next); };
+  const revokeAttachmentConsents = () => {
+    if (!Object.values(attachmentsRef.current).some(item => item.consent)) return;
+    commitAttachments(Object.fromEntries(Object.entries(attachmentsRef.current).map(([id, item]) => [id, Object.freeze({ ...item, consent: null })])));
+  };
+  const attachmentContext = JSON.stringify([current?.chat_id, target?.state, target?.session?.session_id, target?.session?.generation, target?.host, target?.port, target?.username, config.revision, config.destination]);
+  useEffect(() => { revokeAttachmentConsents(); }, [attachmentContext]);
+  const attachSelection = (chatId: string, selection: TerminalSelection): boolean => {
+    const chat = chatsRef.current.find(item => item.chat_id === chatId);
+    if (!chat || !selectionMatchesTarget(selection, targetRef.current) || !selectionMatchesChat(selection, chat) || attachmentsRef.current[chatId]) return false;
+    const bounded = boundSelection(selection.text);
+    if (!bounded.text.trim()) return false;
+    const attachment: TerminalAttachmentDraft = Object.freeze({ ...selection, source: Object.freeze({ ...selection.source }), ...bounded, truncated: selection.truncated || bounded.truncated, edited: false, consent: null });
+    commitAttachments({ ...attachmentsRef.current, [chatId]: attachment });
+    return true;
+  };
+  const editAttachment = (chatId: string, text: string) => {
+    const attachment = attachmentsRef.current[chatId];
+    if (!attachment || attachment.text === text) return;
+    const bounded = boundSelection(text);
+    commitAttachments({ ...attachmentsRef.current, [chatId]: Object.freeze({ ...attachment, text: bounded.text, truncated: attachment.truncated || bounded.truncated, edited: true, consent: null }) });
+  };
+  const removeAttachment = (chatId: string) => { const next = { ...attachmentsRef.current }; delete next[chatId]; commitAttachments(next); };
+  const consentAttachment = (chatId: string, allowed: boolean) => {
+    const attachment = attachmentsRef.current[chatId]; const config = configRef.current;
+    const chat = chatsRef.current.find(item => item.chat_id === chatId);
+    if (!attachment) return;
+    const consent = allowed && config.ready && config.revision && config.destination && chat && selectionMatchesTarget(attachment, targetRef.current) && selectionMatchesChat(attachment, chat)
+      ? Object.freeze({ revision: config.revision, destination: config.destination }) : null;
+    commitAttachments({ ...attachmentsRef.current, [chatId]: Object.freeze({ ...attachment, consent }) });
+  };
   const createChat = async () => {
     if (!ready || creatingRef.current || chatsRef.current.length >= MAX_CHATS) return;
     creatingRef.current = true;
@@ -155,6 +190,7 @@ export function useModelChat(target?: SessionSnapshot) {
     }).finally(() => { creatingRef.current = false; if (alive.current) setCreating(false); });
   }, [native, ready, connectedTarget, creating, acceptChat]);
   const selectChat = (chatId: string) => {
+    if (chatId !== current?.chat_id) revokeAttachmentConsents();
     setSelected(chatId);
     // Read-only reconciliation: never cancels, resends or transfers a run.
     if (native && ready) void modelBridge.get(chatId).then(next => {
@@ -163,7 +199,12 @@ export function useModelChat(target?: SessionSnapshot) {
   };
   const send = async (chatId: string): Promise<boolean> => {
     const chat = chatsRef.current.find(item => item.chat_id === chatId);
-    const text = draftsRef.current[chatId]?.trim() ?? '';
+    const attachment = attachmentsRef.current[chatId];
+    if (attachment && (!chat || !selectionMatchesTarget(attachment, targetRef.current) || !selectionMatchesChat(attachment, chat) || !attachmentConsented(attachment, configRef.current) || !attachment.text.trim())) {
+      setErrors(items => ({ ...items, [chatId]: '终端选区的来源、会话或接收方已变化，或尚未审阅确认。请移除旧附件后从当前终端重新选择并核对。' }));
+      return false;
+    }
+    const text = composeAttachedMessage(draftsRef.current[chatId] ?? '', attachment);
     if (!native || !ready || configWriteBlocked || !chat || !chatMatchesTarget(chat, targetRef.current) || !text || utf8Length(text) > MAX_MESSAGE_BYTES || chat.messages.length > MAX_MESSAGES - 2 || chat.active_run_id || pendingRef.current.has(chatId) || !configRef.current.ready || !configRef.current.consented) return false;
     if (chatsRef.current.filter(item => item.active_run_id || pendingRef.current.get(item.chat_id) === 'sending').length >= MAX_CONCURRENT_CHATS) return false;
     markPending(chatId, 'sending');
@@ -175,6 +216,7 @@ export function useModelChat(target?: SessionSnapshot) {
         acceptChat(next);
         // A user may already have begun their next message while IPC completes.
         if (draftsRef.current[chatId] === submittedDraft) updateDraft(chatId, '');
+        if (attachment && attachmentsRef.current[chatId] === attachment) removeAttachment(chatId);
       }
       return true;
     } catch (failure) {
@@ -216,11 +258,11 @@ export function useModelChat(target?: SessionSnapshot) {
     }
     finally { configBusyRef.current = false; if (alive.current) setConfigBusy(false); }
   };
-  const testSaved = async (expected: ModelConfigStatus): Promise<ModelTestResult | null> => {
+  const testSaved = async (expected: ModelConfigStatus, kind: ModelTestKind = 'chat_connectivity'): Promise<ModelTestResult | null> => {
     if (!native || configWriteBlocked || testIdRef.current || !expected.ready || !expected.file_revision || !expected.destination || !expected.model) return null;
     const testId = crypto.randomUUID(); testIdRef.current = testId; setConfigTestBusy(true); setError(null); setConfigTest(null);
     try {
-      const result = await modelBridge.testSaved({ test_id: testId, file_revision: expected.file_revision, destination: expected.destination, model: expected.model, consent: true });
+      const result = await modelBridge.testSaved({ test_id: testId, file_revision: expected.file_revision, destination: expected.destination, model: expected.model, consent: true, kind });
       if (alive.current) setConfigTest(result);
       return result;
     } catch (failure) { if (alive.current) setError(safeError(failure)); return null; }
@@ -257,6 +299,6 @@ export function useModelChat(target?: SessionSnapshot) {
     acceptChat(chat); setSelected(chat.chat_id);
   };
   const runningCount = chats.filter(chat => chat.active_run_id || pending[chat.chat_id] === 'sending').length;
-  return { native, ready, config, chats, current, drafts, errors, error, pending, creating, configBusy, runningCount, configWriteBlocked, configTest, configTestBusy, saveConfig, testSaved, cancelConfigTest, updateDraft, createChat, selectChat, send, cancel, reloadConfig, confirmDestination, probe, retryLoad, restoreChat };
+  return { native, ready, config, chats, current, drafts, attachments, attachSelection, editAttachment, removeAttachment, consentAttachment, errors, error, pending, creating, configBusy, runningCount, configWriteBlocked, configTest, configTestBusy, saveConfig, testSaved, cancelConfigTest, updateDraft, createChat, selectChat, send, cancel, reloadConfig, confirmDestination, probe, retryLoad, restoreChat };
 }
 export type ModelChatController = ReturnType<typeof useModelChat>;

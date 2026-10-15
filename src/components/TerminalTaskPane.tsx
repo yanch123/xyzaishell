@@ -1,3 +1,4 @@
+import { TaskContextPanel } from './TaskContextPanel';
 import { TaskSecretPanel } from './TaskSecretPanel';
 import { useEffect, useId, useRef, useState } from 'react';
 import type { ChatSnapshot, ModelConfigStatus } from '../lib/model';
@@ -51,6 +52,7 @@ export function TerminalTaskPane({ agent, current, config, session, onStart, onS
         <div className="task-heading"><span className="task-phase" role="status">{task.phase === 'cancelled' && task.owner ? '停止请求已发出 · 等待发送边界' : TASK_PHASE_LABELS[task.phase]}</span><span>第 {task.round} 轮</span></div>
         <p className="task-instruction">{task.instruction}</p>
         <div className="task-identity" title={`任务 ${task.task_id}\n运行 ${task.run_id}`}>当前任务与运行固定绑定 · {task.target.username}@{task.target.host}:{task.target.port}</div>
+        <TaskContextPanel task={task} />
         {task.assistant_text && <article className="local-message assistant-message" aria-label="任务模型分析"><div className="message-meta"><span className="assistant-avatar"><Icon name="spark" size={13} /></span><span>模型分析 · 当前轮</span></div><p>{task.assistant_text}</p></article>}
         {!task.assistant_text && task.phase === 'preparing' && <p className="task-waiting">正在等待模型分析，不代表已执行命令。</p>}
         {task.actions.length > 0 && <details className="previous-actions"><summary>查看之前 {task.actions.length} 条命令的发送记录</summary>{task.actions.map(action => <TerminalActionCard key={action.action_id} task={{ ...task, action, phase: 'completed', owner: false }} agent={agent} connected={connected} displayEnabled={false} />)}</details>}
