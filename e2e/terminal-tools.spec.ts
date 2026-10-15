@@ -59,13 +59,34 @@ test('synthetic IPC: real terminal search, reviewed attachment and persistent di
   const attachment = page.getByRole('region', { name: '终端选区附件草稿' });
   await expect(attachment).toContainText('tester@synthetic.example:22');
   await expect(attachment.getByRole('textbox')).toHaveValue('alpha');
-  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
+  const send = page.getByRole('button', { name: '发送', exact: true });
+  const composer = page.getByRole('textbox', { name: '聊天消息' });
+  // These observation-only checks run before fill/check/click can scroll the UI.
+  await expect(send).toBeDisabled();
+  await expect(send).toBeInViewport({ ratio: 1 });
+  await expect(composer).toBeInViewport({ ratio: 1 });
+  await expect(attachment.locator('.attachment-heading')).toBeInViewport({ ratio: 1 });
+  await expect(attachment.locator('.attachment-source')).toBeInViewport({ ratio: 1 });
+  expect(await attachment.evaluate(element => element.scrollTop)).toBe(0);
+  expect(await page.locator('.terminal-review > .composer-area').evaluate(element => ({ scrollTop: element.scrollTop, overflowY: getComputedStyle(element).overflowY }))).toEqual({ scrollTop: 0, overflowY: 'visible' });
+  await page.screenshot({ path: testInfo.outputPath('synthetic-terminal-selection-source.png'), fullPage: true });
   await attachment.getByRole('textbox').fill('alpha (reviewed)');
   await expect(attachment).toContainText('已由你编辑');
+  // Move only the preview to its consent section; the composer never scrolls.
+  await attachment.evaluate(element => { element.scrollTop = element.scrollHeight; });
+  await expect(attachment.getByRole('checkbox')).toBeInViewport({ ratio: 1 });
+  await expect(send).toBeInViewport({ ratio: 1 });
   await attachment.getByRole('checkbox').check();
-  await page.getByRole('textbox', { name: '聊天消息' }).fill('解释这个输出');
+  await composer.fill('解释这个输出');
+  await expect(send).toBeInViewport({ ratio: 1 });
+  await expect(composer).toBeInViewport({ ratio: 1 });
   await page.screenshot({ path: testInfo.outputPath('synthetic-terminal-selection-review.png'), fullPage: true });
-  await page.getByRole('button', { name: '发送', exact: true }).click();
+  // Source remains recoverable by local preview scroll after editing/consenting.
+  await attachment.evaluate(element => { element.scrollTop = 0; });
+  await expect(attachment.locator('.attachment-heading')).toBeInViewport({ ratio: 1 });
+  await expect(attachment.locator('.attachment-source')).toBeInViewport({ ratio: 1 });
+  await expect(send).toBeInViewport({ ratio: 1 });
+  await send.click();
   await expect(attachment).toHaveCount(0);
   const calls = await page.evaluate(() => (window as unknown as { __TERMINAL_TOOLS_CALLS__: Array<{ cmd: string; args: Record<string, unknown> }> }).__TERMINAL_TOOLS_CALLS__);
   const sends = calls.filter(call => call.cmd === 'send_chat_message');

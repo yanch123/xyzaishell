@@ -112,3 +112,31 @@ describe('v0.1.2 immutable chat provenance', () => {
     expect((screen.getByRole('textbox',{name:'聊天消息'}) as HTMLTextAreaElement).disabled).toBe(true);
   });
 });
+
+describe('terminal attachment review layout', () => {
+  it('keeps the preview as its own sibling of the composer and restores normal chat layout on removal', async () => {
+    const target = { state: 'connected' as const, host: 'review.example', port: 22, username: 'tester', session: { session_id: 'review-session', generation: '1' } };
+    const source = { ...target.session, host: target.host, port: target.port, username: target.username };
+    mocks.list.mockResolvedValue([{ ...chat(), source }]);
+    function ReviewHarness() {
+      const model = useModelChat(target);
+      return <><button onClick={() => model.attachSelection('chat-a', { id: 'review-one', source, text: 'selected output', truncated: false })}>Add selection fixture</button><ChatPane model={model} session={target} showHistory={false} onToggleHistory={vi.fn()} onSettings={vi.fn()} onConsent={consent} /></>;
+    }
+    render(<ReviewHarness />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '新建聊天' }).hasAttribute('disabled')).toBe(false));
+    const pane = screen.getByRole('complementary', { name: 'AI 聊天工作区' });
+    expect(pane.classList.contains('terminal-review')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Add selection fixture' }));
+    const preview = screen.getByRole('region', { name: '终端选区附件草稿' });
+    expect(pane.classList.contains('terminal-review')).toBe(true);
+    expect(preview.parentElement).toBe(pane);
+    const composerArea = screen.getByRole('textbox', { name: '聊天消息' }).closest('.composer-area');
+    expect(composerArea?.parentElement).toBe(pane);
+    expect(composerArea?.contains(preview)).toBe(false);
+    expect(screen.getByRole('button', { name: '发送' }).hasAttribute('disabled')).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: '移除附件' }));
+    expect(pane.classList.contains('terminal-review')).toBe(false);
+    expect(screen.queryByRole('region', { name: '终端选区附件草稿' })).toBeNull();
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+});

@@ -97,6 +97,12 @@ test(`synthetic settings (${colorScheme} OS): save, kind-bound consent, terminal
   await page.screenshot({ path: testInfo.outputPath('settings-minimal-test-complete.png'), fullPage: true });
   await settings.getByRole('button', { name: '测试已保存配置', exact: true }).click();
   await consent.getByRole('checkbox').check();
+  for (const radio of await settings.getByRole('radio').all()) {
+    const box = await radio.boundingBox();
+    expect(box?.width).toBeGreaterThanOrEqual(12);
+    expect(box?.width).toBeLessThanOrEqual(20);
+    expect(box?.height).toBeLessThanOrEqual(20);
+  }
   await settings.getByRole('radio', { name: /任务工具调用/ }).check();
   await expect(consent).toBeHidden();
   await settings.getByRole('button', { name: '测试已保存配置', exact: true }).click();
