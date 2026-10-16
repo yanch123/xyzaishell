@@ -1607,6 +1607,69 @@ impl RuntimeContext {
 }
 
 #[cfg(test)]
+impl RuntimeContext {
+    pub(super) fn retention_test_install_ledger(&mut self, ledger: ContextLedger) {
+        self.ledger = ledger;
+    }
+}
+
+fn redact_request_template(
+    context: &RuntimeContext,
+    mut body: Value,
+    redactor: &crate::observation::ObservationBuffer,
+) -> Result<Value, ApiError> {
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            let planning = context.kind == RequestKind::Planning && message["role"] == "user";
+            if let Some(content) = message.get_mut("content") {
+                if planning {
+                    if let Some(text) = content.as_str() {
+                        let mut prompt: Value = serde_json::from_str(text).map_err(|_| {
+                            ApiError::new(
+                                "CONTEXT_SERIALIZATION",
+                                "Planning prompt must remain structured JSON.",
+                            )
+                        })?;
+                        redact_json_values(&mut prompt, redactor)?;
+                        for filter in &context.redactors {
+                            redact_json_values(&mut prompt, filter)?;
+                        }
+                        *content = serde_json::to_string(&prompt)
+                            .map_err(|_| provider_error())?
+                            .into();
+                        continue;
+                    }
+                }
+                redact_json_values(content, redactor)?;
+                for filter in &context.redactors {
+                    redact_json_values(content, filter)?;
+                }
+            }
+        }
+    }
+    Ok(body)
+}
+
+fn strip_transcript_copy(mut body: Value, kind: RequestKind) -> Result<Value, ApiError> {
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        if kind == RequestKind::Conversation {
+            messages.retain(|m| matches!(m["role"].as_str(), Some("system" | "developer")));
+            messages.push(json!({"role":"user","content":""}));
+        } else if kind == RequestKind::Planning {
+            for message in messages.iter_mut().filter(|m| m["role"] == "user") {
+                if let Some(text) = message["content"].as_str() {
+                    let mut prompt: Value =
+                        serde_json::from_str(text).map_err(|_| provider_error())?;
+                    prompt["conversation_history_untrusted"] = json!([]);
+                    message["content"] = prompt.to_string().into();
+                }
+            }
+        }
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -1731,68 +1794,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-impl RuntimeContext {
-    pub(super) fn retention_test_install_ledger(&mut self, ledger: ContextLedger) {
-        self.ledger = ledger;
-    }
-}
-
-fn redact_request_template(
-    context: &RuntimeContext,
-    mut body: Value,
-    redactor: &crate::observation::ObservationBuffer,
-) -> Result<Value, ApiError> {
-    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-        for message in messages {
-            let planning = context.kind == RequestKind::Planning && message["role"] == "user";
-            if let Some(content) = message.get_mut("content") {
-                if planning {
-                    if let Some(text) = content.as_str() {
-                        let mut prompt: Value = serde_json::from_str(text).map_err(|_| {
-                            ApiError::new(
-                                "CONTEXT_SERIALIZATION",
-                                "Planning prompt must remain structured JSON.",
-                            )
-                        })?;
-                        redact_json_values(&mut prompt, redactor)?;
-                        for filter in &context.redactors {
-                            redact_json_values(&mut prompt, filter)?;
-                        }
-                        *content = serde_json::to_string(&prompt)
-                            .map_err(|_| provider_error())?
-                            .into();
-                        continue;
-                    }
-                }
-                redact_json_values(content, redactor)?;
-                for filter in &context.redactors {
-                    redact_json_values(content, filter)?;
-                }
-            }
-        }
-    }
-    Ok(body)
-}
 #[cfg(all(test, target_os = "linux"))]
 #[path = "tasks_context_privacy_tests.rs"]
 mod privacy_tests;
-
-fn strip_transcript_copy(mut body: Value, kind: RequestKind) -> Result<Value, ApiError> {
-    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-        if kind == RequestKind::Conversation {
-            messages.retain(|m| matches!(m["role"].as_str(), Some("system" | "developer")));
-            messages.push(json!({"role":"user","content":""}));
-        } else if kind == RequestKind::Planning {
-            for message in messages.iter_mut().filter(|m| m["role"] == "user") {
-                if let Some(text) = message["content"].as_str() {
-                    let mut prompt: Value =
-                        serde_json::from_str(text).map_err(|_| provider_error())?;
-                    prompt["conversation_history_untrusted"] = json!([]);
-                    message["content"] = prompt.to_string().into();
-                }
-            }
-        }
-    }
-    Ok(body)
-}
