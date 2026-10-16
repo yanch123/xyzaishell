@@ -30,3 +30,5 @@ pub mod shell_log_store;
 pub mod shell_log_types;
 
 pub mod shell_integration;
+
+pub mod context;

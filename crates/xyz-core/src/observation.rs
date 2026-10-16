@@ -11,11 +11,19 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_OBSERVATION_BYTES: usize = 16 * 1024;
 const MAX_REDACT_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_REDACT_CONTEXT_BYTES: usize = 1024 * 1024;
 const MAX_SECRET_BYTES: usize = MAX_OBSERVATION_BYTES;
 const MAX_TOTAL_SECRET_BYTES: usize = 64 * 1024;
 const MAX_SECRETS: usize = 128;
 const SANITIZE_CHUNK_BYTES: usize = 4096;
 const REDACTED: &str = "[REDACTED]";
+
+fn context_redaction_limit() -> ApiError {
+    ApiError::new(
+        "CONTEXT_REDACTION_LIMIT",
+        "Context exceeds the bounded redaction size. No partial context was prepared.",
+    )
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Observation {
@@ -158,10 +166,36 @@ impl ObservationBuffer {
         self.redact_inner(text, true)
     }
 
+    /// Redact bounded raw context prose before JSON escaping. One sanitizer
+    /// and secret matcher span every chunk; neither prefixes nor escape state
+    /// are finalized at chunk boundaries. Oversize input/output fails closed
+    /// instead of silently discarding the beginning of a context projection.
+    /// The final serialized API body needs its own transport-size check.
+    pub fn redact_prose_chunked(&self, text: &str) -> Result<String, ApiError> {
+        self.redact_bounded(text, true, MAX_REDACT_CONTEXT_BYTES, true)
+    }
+
     fn redact_inner(&self, text: &str, prose: bool) -> String {
+        self.redact_bounded(text, prose, MAX_REDACT_TEXT_BYTES, false)
+            .unwrap_or_else(|_| REDACTED.to_owned())
+    }
+
+    fn redact_bounded(
+        &self,
+        text: &str,
+        prose: bool,
+        limit: usize,
+        reject_truncation: bool,
+    ) -> Result<String, ApiError> {
         let state = self.lock();
-        if state.blocked || text.len() > MAX_REDACT_TEXT_BYTES {
-            return REDACTED.to_owned();
+        if state.blocked {
+            return Err(ApiError::new(
+                "OBSERVATION_SECRET_LIMIT",
+                "The known-secret filter is unavailable. No context was prepared.",
+            ));
+        }
+        if text.len() > limit {
+            return Err(context_redaction_limit());
         }
         let mut redactor = Redactor {
             patterns: state
@@ -196,7 +230,7 @@ impl ObservationBuffer {
             ..Sanitizer::default()
         };
         let mut tail = Tail::default();
-        tail.limit = MAX_REDACT_TEXT_BYTES;
+        tail.limit = limit;
         let mut chunk = Zeroizing::new(String::with_capacity(SANITIZE_CHUNK_BYTES + 4));
         for &byte in text.as_bytes() {
             if let Some(ch) = sanitizer.push(byte) {
@@ -204,6 +238,9 @@ impl ObservationBuffer {
                 if chunk.len() >= SANITIZE_CHUNK_BYTES {
                     redactor.push(&chunk, &mut tail);
                     chunk.zeroize();
+                    if reject_truncation && tail.truncated {
+                        return Err(context_redaction_limit());
+                    }
                 }
             }
         }
@@ -211,7 +248,10 @@ impl ObservationBuffer {
         if !redactor.pending.is_empty() {
             tail.push(REDACTED);
         }
-        std::mem::take(&mut tail.text)
+        if reject_truncation && tail.truncated {
+            return Err(context_redaction_limit());
+        }
+        Ok(std::mem::take(&mut tail.text))
     }
 
     /// Immutable-in-practice per-run redaction rules, detached from later SSH
@@ -1180,6 +1220,96 @@ mod tests {
         assert_eq!(
             observer.redact_prose("prefix fixture-"),
             "prefix [REDACTED]"
+        );
+    }
+    #[test]
+    fn context_prose_preserves_large_prefix_and_suffix_across_secret_boundaries() {
+        let observer = ObservationBuffer::new();
+        observer.add_known_secret("fixture-secret-value").unwrap();
+        for prefix_len in [4092, 65532, 131068] {
+            let prefix = "a".repeat(prefix_len);
+            let suffix = "\n\tretained context".repeat(5000);
+            let input = format!("{prefix}fixture-secret-value{suffix}");
+            let safe = observer.redact_prose_chunked(&input).unwrap();
+            assert_eq!(safe, format!("{prefix}[REDACTED]{suffix}"));
+            assert!(!safe.contains("fixture-secret-value"));
+        }
+    }
+    #[test]
+    fn context_prose_redacts_utf8_and_json_sensitive_values_before_encoding() {
+        let observer = ObservationBuffer::new();
+        let secret = "密钥🔑\n\"值\\end";
+        observer.add_known_secret(secret).unwrap();
+        let input = format!(
+            "{}{}\n{}",
+            "a".repeat(4094),
+            secret,
+            "后续内容".repeat(10000)
+        );
+        let safe = observer.redact_prose_chunked(&input).unwrap();
+        assert!(safe.contains("[REDACTED]\n后续内容"));
+        assert!(!safe.contains(secret));
+        let encoded = serde_json::to_string(&serde_json::json!({"text": safe})).unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded["text"].as_str().unwrap(), safe);
+        assert!(!decoded["text"].as_str().unwrap().contains(secret));
+    }
+    #[test]
+    fn context_prose_keeps_escape_state_through_large_control_payloads() {
+        let observer = ObservationBuffer::new();
+        let prefix = "x".repeat(4095);
+        let input = format!("{prefix}\x1b]52;c;{}\x07visible\n", "hidden".repeat(15000));
+        assert_eq!(
+            observer.redact_prose_chunked(&input).unwrap(),
+            format!("{prefix}visible\n")
+        );
+    }
+    #[test]
+    fn context_prose_masks_unresolved_secret_prefix_at_end_only() {
+        let observer = ObservationBuffer::new();
+        observer.add_known_secret("secret-prefix-value").unwrap();
+        let prefix = "x".repeat(65536);
+        assert_eq!(
+            observer
+                .redact_prose_chunked(&format!("{prefix}secret-pref"))
+                .unwrap(),
+            format!("{prefix}[REDACTED]")
+        );
+    }
+    #[test]
+    fn context_prose_enforces_input_bound_and_keeps_legacy_bound() {
+        let observer = ObservationBuffer::new();
+        let exact = "x".repeat(MAX_REDACT_CONTEXT_BYTES);
+        assert_eq!(observer.redact_prose_chunked(&exact).unwrap(), exact);
+        assert_eq!(observer.redact_prose(&exact), REDACTED);
+        assert_eq!(
+            observer
+                .redact_prose_chunked(&(exact + "x"))
+                .unwrap_err()
+                .code,
+            "CONTEXT_REDACTION_LIMIT"
+        );
+    }
+    #[test]
+    fn context_prose_output_expansion_fails_without_returning_a_truncated_tail() {
+        let observer = ObservationBuffer::new();
+        observer.add_known_secret("k").unwrap();
+        let input = "k ".repeat(105000);
+        assert!(input.len() < MAX_REDACT_CONTEXT_BYTES);
+        assert_eq!(
+            observer.redact_prose_chunked(&input).unwrap_err().code,
+            "CONTEXT_REDACTION_LIMIT"
+        );
+    }
+    #[test]
+    fn context_prose_refuses_unavailable_secret_rules() {
+        let observer = ObservationBuffer::new();
+        assert!(observer
+            .add_known_secret(&"s".repeat(MAX_SECRET_BYTES + 1))
+            .is_err());
+        assert_eq!(
+            observer.redact_prose_chunked("ordinary").unwrap_err().code,
+            "OBSERVATION_SECRET_LIMIT"
         );
     }
     #[test]
