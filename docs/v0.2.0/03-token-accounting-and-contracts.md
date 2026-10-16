@@ -32,7 +32,7 @@
 
 没有 usage、流式末包丢失、供应商不支持或字段意义不明时返回 null/unknown，不补造“实际 token”。供应商通常不给类别分解，因此类别始终标估算，不把实报总量按比例分摊后叫实报。压缩摘要请求的实报归属 `compaction`，普通问答/终端规划归属 `conversation`/`planning`；摘要调用不能覆盖“上一次主请求”的展示。详情可另列最近压缩请求用量。v0.2.0 不承诺费用、价格或精确账单。
 
-协议依据：OpenAI Chat Completions 的流式 usage 需要请求 `stream_options.include_usage`，最后的 usage 块统计该请求；流中断或取消时可能收不到它。该协议事实不能推广成所有 OpenAI 兼容服务都支持，适配器需按能力处理并保留缺失状态。见 [OpenAI 官方流式事件参考](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)（核对日期：2026-10-16）。80% 触发阈值、默认容量及类别方案是本项目设计决策，不是供应商或 Cursor 的既定行为。
+协议依据：OpenAI Chat Completions 的流式 usage 需要请求 `stream_options.include_usage`，最后的 usage 块统计该请求；流中断或取消时可能收不到它。该协议事实不能推广成所有 OpenAI 兼容服务都支持，适配器需按能力处理并保留缺失状态。见 [OpenAI 官方流式事件参考](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)（核对日期：2026-10-16）。分阶段 80%/95% 触发阈值、默认容量及类别方案是本项目设计决策，不是供应商或 Cursor 的既定行为。
 
 ### 2.3 字节护栏
 
@@ -52,21 +52,34 @@
 - `input_budget_tokens`（B）：W − R − S；只有 W 为有效配置且 B > 0 时有效。
 - `estimated_input_tokens`（I）：当前请求估算；使用粗略估算时保护判断可取其明确记录的保守上界。
 - `input_occupancy_ratio`：I/B；主界面百分比与默认自动触发都使用该分母。
-- `auto_trigger_ratio = 0.80`：仅控制自动触发；不设置压缩后目标比例或以降到触发阈值以下作为成功条件。
+- `after_turn_trigger_ratio = 0.80`、`in_turn_trigger_ratio = 0.95`：仅控制各阶段的自动触发；不设置压缩后目标比例或以降到触发阈值以下作为成功条件。
+- `turn_phase = end_of_turn | active_turn`；`effective_trigger_ratio` 分别取 0.80 或 0.95，由后端权威运行状态确定。
 
 为了避免“看起来未达阈值却自动压缩”，如保护采用上界，主占用也使用同一上界并注明“保守估算”，不得主指示显示点估计而阈值暗用另一量。类别可显示主估算，若与保护估算不同，详情明确标记，不伪装二者精确相加。
 
-W 有效时（包括产品默认），若审计后的传输字节保护先于 token 阈值达到，可以另行触发自动压缩；原因记录为 `byte_pressure`（与 token 同时触发则为 `both`；完整枚举见 02 的 6.5），主占用百分比仍按原公式。所有自动原因均使用已配置方式，默认 LLM，明确选择自动 quick 时不得调用模型。W 配置无效/不可用时不按字节触发自动压缩；缺少模型元数据但已解析到产品默认值不属于不可用。
+常规自动触发仅看 token I/B 与当前阶段阈值，不设字节占用 80%/95% 软阈值。仅当某个待发送请求的 `serialized_request_bytes > transport_limit_bytes` 时，进入 `hard_byte_limit` 保护：安全点按已配置方式尝试压缩，或停止并提示请求过大；不得强行发送。它不是闲置历史检查，不会因仅字节占比高但尚未超限而发起压缩。主指示仍按 token I/B，硬限制错误独立解释。
+
+触发原因统一为 `token_pressure | hard_byte_limit | both | manual`；`both` 表示当前 token 阶段阈值与实际待发请求字节硬超限同时满足。默认方式 LLM；用户明确选择自动 quick 时不得调用模型。预算配置无效或计量不可用时不能用字节例外绕过验证，须停止并保留输入。
 
 输入构成占比 = 某类别估算 / 同一方法下全部类别估算。输出预留和安全余量不进入类别份额分母。构成条只代表输入，预算占用则代表当前输入与 B 的关系，两个标题必须区分。舍入后的份额可使用最大余数法使显示总和为 100%；输入为零时不做除法。
 
-默认配置示例：W=256000，R=4096，S=12800，则 B=239104。达到 80% 触发边界即评估压缩，但无需达到某个固定压缩后比例；90% → 85% 的严格缩减在保护项完整、最终输入不超过 B 且字节硬预算满足时允许成功。分类份额与占用分母保持独立。
+默认配置示例：W=256000，R=4096，S=12800，则 B=239104。本轮最终回复结束后达到 80% 才评估压缩；本轮进行中达到 95% 才在安全检查点评估，但无需达到某个固定压缩后比例；回复结束后或手动压缩的 90% → 85% 严格缩减在保护项完整、最终输入不超过 B 且字节硬预算满足时允许成功。分类份额与占用分母保持独立。
 
-压缩结果记录 `benefit_tokens` 与 `benefit_bytes`（同一估算器、同一编码规则下的缩减量）：提交时两者均不得为负，至少一项严格为正，并按 02 的触发原因检查对应指标。字节压力下允许 tokens 不变而 bytes 减少，不能把 benefit_tokens >0 误设为所有模式的必要条件。结合 `budget_fits`（待发请求通过全部 token/字节硬预算）与保护集/引用验证共同判定；不能用“未降到 80% 以下”否定一个合法结果，也不能用严格缩减掩盖仍超出硬预算。前后对比不能跨模型或估算器版本。
+压缩结果记录 `benefit_tokens` 与 `benefit_bytes`（同一估算器、同一编码规则下的缩减量）：提交时两者均不得为负，至少一项严格为正，并按 02 的触发原因检查对应指标。硬字节限制原因下允许 tokens 不变而 bytes 减少，不能把 benefit_tokens >0 误设为所有模式的必要条件。结合 `budget_fits`（待发请求通过全部 token/字节硬预算）与保护集/引用验证共同判定；不能用“未降到当前触发阈值以下”否定一个合法结果，也不能用严格缩减掩盖仍超出硬预算。前后对比不能跨模型或估算器版本。
 
 普通模型无可靠窗口元数据时使用 `product_default`，UI 标记“按默认容量估算”，仍可按配置预算正常自动压缩。不能将该默认改称已验证模型窗口。容量解析随模型/接收方变化重新执行；持久化的可选用户覆盖与解析后的有效值分开，用户未编辑时不得把产品默认值记成 user_override；无效的显式覆盖应报错而不是静默回退默认值。R+S >= W、非法值或配置不可取得时为预算配置错误，B 与占用比返回 null，不做负数、零除或自动减输出；保留草稿并指引修改配置。
 
 供应商实际窗口可能小于默认配置。遇到 provider context overflow 时安全失败，提示调整窗口配置，不自动把失败请求重发、不重放命令、不以一次成功或报错反推精确真实容量。缺少 usage 仍独立显示未知，不影响容量来源标签。
+
+### 3.1 阶段与本地预览的边界
+
+`active_turn` 从用户新消息提交开始，覆盖分析、模型生成、工具循环及其暂停；只有主机确认该轮最终回复完整结束，才进入 `end_of_turn`。工具结果返回、等待审批、等待密码、预算暂停、执行结果未知，均不等于本轮结束。取消或异常不能伪造最终回复完成；它们的停止/核对状态优先，不借自动压缩恢复任务。
+
+自动计量采用 `measurement_scope=committed_context`，只含已提交消息、已授权工具结果与工作记忆；当前输入草稿仅供 `draft_preview` 本地估算。前端如显示草稿预览，注明“含未发送草稿”，不能拿该百分比当作自动任务已采用的输入；弹层可显示后台自动检查的已提交占用。自动摘要请求绝不携带未提交草稿，草稿输入事件不触发模型网络调用。
+
+新用户消息使旧 end_of_turn job 的 turn_id/phase/revision fence 失效，取消或丢弃结果并转 active_turn 的 95% 检查。正在发出的模型请求或命令不得打断，达阈值后等下一个安全点；若下一次发送已经违反 token/byte 硬上限则必须阻止，不能强行发出。回复后的压缩成功不自动发新消息、不恢复命令或暂停的任务。
+
+字节不得成为任何阶段的隐藏软阈值。只有待发送请求实际超过硬上限才可触发显式 hard_byte_limit 保护，安全点处理或停止。压缩提交前重新验证 turn_id、phase 和所有原有修订 fence；回复后没有待发请求时不得借硬字节例外主动调用。
 
 ## 4. 互斥类别契约
 
@@ -97,6 +110,9 @@ type ContextUsageSnapshot = {
   config_revision: string;
   projection_id: string; // 不含原文的关联 ID；不得公开秘密派生指纹
   request_kind: 'conversation' | 'planning' | 'compaction';
+  turn_id: string;
+  turn_phase: 'end_of_turn' | 'active_turn';
+  measurement_scope: 'committed_context' | 'draft_preview';
   prepared_at: string;
   status: 'ready' | 'estimating' | 'unavailable' | 'stale';
   estimate: {
@@ -115,7 +131,9 @@ type ContextUsageSnapshot = {
     input_budget_tokens: number | null;
     decision_input_tokens: number | null;
     input_occupancy_ratio: number | null;
-    auto_trigger_ratio: number;
+    after_turn_trigger_ratio: number; // 默认 0.80
+    in_turn_trigger_ratio: number;    // 默认 0.95
+    effective_trigger_ratio: number;
   };
   byte_guards: Array<{
     scope: 'planning_prompt' | 'serialized_request';
@@ -151,7 +169,7 @@ type ProviderUsage = {
 - `get_context_usage(chat_id, expected_context_revision)`：只读当前准备结果；草稿预览如需传入，由本机桥传递，不调用外部模型。
 - `compact_context(chat_id, expected_context_revision, mode, client_request_id)`：`mode = llm | quick`，具体执行/排队、状态机和幂等见核心设计。必须带修订号，防止对旧上下文提交摘要。
 - 自动压缩及手动压缩共用预算、投影与提交路径；并发事件通过 chat/config/session/run 修订重新校验。
-- 自动尝试记录内部 `eligible_source_fingerprint` 与覆盖清单，基于可压缩来源范围而非单纯投影 revision 去重。没有新增可压缩内容时，即使占用仍超过 80%，也不重复压缩同一批来源；候选摘要本身不能成为无限自我再压缩的新内容。细节与显式重试见 02。该指纹不泄露原文或秘密，不作为前端公开计量字段。
+- 自动尝试记录内部 `eligible_source_fingerprint` 与覆盖清单，基于可压缩来源范围而非单纯投影 revision 去重。没有新增可压缩内容时，即使占用仍超过当前阶段阈值，也不重复压缩同一批来源；候选摘要本身不能成为无限自我再压缩的新内容。细节与显式重试见 02。该指纹不泄露原文或秘密，不作为前端公开计量字段。
 - 快照变化事件携带完整修订号，前端丢弃旧 revision；订阅断线后读取权威快照，不猜测操作成功。
 - `client_request_id` 只去重同一操作，不允许压缩重试隐式重放原模型消息或终端命令。
 
@@ -163,10 +181,13 @@ type ProviderUsage = {
 2. 草稿变长、工具结果变大、模型切换、秘密重脱敏或引用失效后，快照刷新且过期投影不能发送。
 3. 新响应的实报不能替换下一次请求估算；压缩请求用量不会混入主请求实报。
 4. 无元数据模型回落 W=256000、capacity_source=product_default，显示“按默认容量估算”且允许自动压缩；实际无效/不可用配置显示 — 并暂停。缺 usage 显示未知；超预算可显示 >100%，不能钳成 100% 后丢失超限状态。
-5. 主指示与 80% 触发共用 B 和 decision_input_tokens；边界用原值判断。预留、类别占比和字节上限的分母不混用。
+5. 主指示与分阶段 80%/95% 触发共用 B 和 decision_input_tokens；边界用原值判断，并区分 committed_context 与 draft_preview。预留、类别占比和字节上限的分母不混用。
 6. 重复文本按真实发送份数计费式计数，不按 UI 对象数量；移除未发送终端记录不改变输入量。
 7. 大历史/小投影与小历史/大工具 schema 两个反例，证明不是按 UI 历史字数估算。
-8. 旧 60 KiB prompt/128 条/256 KiB 发送门槛按 02/04 迁移，不残留隐藏的旧拒绝分支；单消息、独立历史内存及审计后的 transport 限制分别校验。有效 W 的字节保护触发必须独立标因，不能改写 token 占用。
+8. 旧 60 KiB prompt/128 条/256 KiB 发送门槛按 02/04 迁移，不残留隐藏的旧拒绝分支；单消息、独立历史内存及审计后的 transport 限制分别校验。实际待发请求超过字节硬限的例外必须独立标因，不能改写 token 占用，不能把未超硬限的字节占比当作软触发。
 
-9. 验证 90% → 85% 可合法成功，没有固定压缩后比例门槛；同一可压缩来源无新增时不循环自动触发，新增可压缩内容后才重新评估。
+9. 验证回复结束后或手动压缩 90% → 85% 可合法成功，没有固定压缩后比例门槛；同一可压缩来源无新增时不循环自动触发，新增可压缩内容后才重新评估。
 10. 手动覆盖、可靠元数据、256000 默认的优先级正确；无效覆盖不静默回退；供应商实际容量低于默认时保留上下文并提示调整，不自动重试或重放。
+
+11. active_turn 的 token 占用在 80% 至不足 95% 时不常规自动压缩；到 95% 后仅在安全点执行。end_of_turn 的 token 占用在 80% 触发，工具返回/审批/密码/预算暂停/未知结果均不能误判为结束。token 40%、bytes 95% 且未超硬限必须零自动调用；待发请求 bytes > hard limit 才允许明确标因的安全点压缩或停止。
+12. 回复后任务不发送未提交草稿；新用户消息使旧任务 fence 失效并切到 95%；任何阶段达到硬上限都不强行发送，回复后压缩也不恢复终端执行。
