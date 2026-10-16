@@ -122,6 +122,32 @@ impl Terminal {
         }
     }
 
+    async fn shell_ready(&mut self) {
+        timeout(WAIT, async {
+            while self.manager.shell_integration().status().phase
+                != xyz_core::shell_integration::IntegrationPhase::Ready
+            {
+                if let SshEvent::State { snapshot } = self.event().await {
+                    assert_ne!(
+                        snapshot.state,
+                        SessionState::Disconnected,
+                        "disconnected during startup; exit={:?}; PTY output={:?}",
+                        self.exit_status,
+                        String::from_utf8_lossy(&self.output)
+                    );
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "no verified initial prompt: {:?}; PTY output={:?}",
+                self.manager.shell_integration().status(),
+                String::from_utf8_lossy(&self.output)
+            )
+        });
+    }
+
     async fn output_contains(&mut self, expected: &str) {
         // Bound the whole wait, not just individual reads: continuous unrelated
         // output must not turn a broken marker assertion into an infinite test.
@@ -135,7 +161,9 @@ impl Terminal {
                     assert_ne!(
                         snapshot.state,
                         SessionState::Disconnected,
-                        "disconnected before expected shell output: {expected:?}"
+                        "disconnected before expected shell output: {expected:?}; exit={:?}; PTY output={:?}",
+                        self.exit_status,
+                        String::from_utf8_lossy(&self.output)
                     );
                 }
             }
@@ -200,6 +228,7 @@ async fn exercise_real_pty() {
         }
     }
     terminal.state(SessionState::Connected).await;
+    terminal.shell_ready().await;
 
     let nonce = Uuid::new_v4().simple().to_string();
     // Split the marker across printf arguments so terminal input echo cannot
@@ -278,6 +307,7 @@ async fn exercise_real_pty() {
         first.generation.parse::<u64>().unwrap() + 1
     );
     terminal.state(SessionState::Connected).await;
+    terminal.shell_ready().await;
     terminal
         .write(
             &second,

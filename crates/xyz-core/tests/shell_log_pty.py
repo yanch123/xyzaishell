@@ -65,9 +65,18 @@ class Shell:
         return self.p.before
 
     def install(self):
-        self.p.send(BOOTSTRAP.encode())
-        self.p.expect_exact(PROMPT)
-        return self.p.before
+        # This unit fixture installs into an existing synthetic shell. Feeding
+        # the entire script through readline hits a Bash5.1 allocator bug and
+        # is not the production --rcfile startup path tested separately below.
+        # Evaluate the exact generated script at top level, without changing its PID,
+        # options, aliases or hooks. Never use this file path on remote hosts.
+        with tempfile.TemporaryDirectory(prefix='xyz-local-bootstrap-') as directory:
+            path = pathlib.Path(directory) / 'bootstrap.bash'
+            path.write_text(BOOTSTRAP)
+            path.chmod(0o600)
+            self.p.sendline(('builtin eval "$(< ' + shlex.quote(str(path)) + ')"').encode())
+            self.p.expect_exact(PROMPT)
+            return self.p.before
 
     def close(self):
         self.p.close(force=True)

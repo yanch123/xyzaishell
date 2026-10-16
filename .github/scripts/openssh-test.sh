@@ -30,7 +30,7 @@ done
 as_root=()
 if [[ "$mode" == --disposable-user ]]; then
   [[ ${CI:-} == true ]] || { echo '--disposable-user requires CI=true on a disposable runner.' >&2; exit 1; }
-  for command in useradd userdel install getent pkill pgrep; do
+  for command in useradd userdel install getent pkill pgrep runuser cmp; do
     command -v "$command" >/dev/null || { echo "Missing prerequisite: $command" >&2; exit 1; }
   done
   if [[ $EUID -ne 0 ]]; then
@@ -124,6 +124,16 @@ printf 'OpenSSH fixture selected real Bash %s (%s)\n' "$fixture_bash_version" "$
 authorized_keys="$fixture/client/authorized_keys"
 cp "$fixture/client/key.pub" "$authorized_keys"
 if [[ "$mode" == --disposable-user ]]; then
+  # A custom runtime may live beneath runner-private ancestors. Copy only the
+  # selected executable into this disposable fixture, never widen runner-home
+  # permissions. The exact bytes and runtime version remain independently checked.
+  "${as_root[@]}" install -d -m 755 "$fixture/runtime"
+  "${as_root[@]}" install -m 755 "$fixture_bash" "$fixture/runtime/bash"
+  cmp -- "$fixture_bash" "$fixture/runtime/bash" || {
+    echo 'Disposable runtime copy differs from selected Bash.' >&2
+    exit 1
+  }
+  fixture_bash="$fixture/runtime/bash"
   username="xyzssh_$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
   # '*' has no usable password but is not OpenSSH's '!' locked-account prefix.
   # Password auth is also disabled in this daemon's isolated configuration.
@@ -152,6 +162,17 @@ BASHRC
   authorized_keys="$fixture/home/.ssh/authorized_keys"
   "${as_root[@]}" install -m 600 -o "$fixture_uid" "$fixture/client/key.pub" "$authorized_keys"
   chmod 711 "$fixture"
+  # The daemon executes as this account, not the CI runner. Verify all parent
+  # directories and runtime dependencies are usable before starting SSH.
+  account_version=$("${as_root[@]}" runuser -u "$username" -- "$fixture_bash" \
+    --noprofile --norc -c 'printf "%s" "$BASH_VERSION"') || {
+    echo 'Disposable account cannot execute selected Bash runtime.' >&2
+    exit 1
+  }
+  [[ "$account_version" == "$fixture_bash_version" ]] || {
+    echo "Disposable account runtime mismatch: $account_version" >&2
+    exit 1
+  }
   # Some minimal images omit this package-owned privilege-separation directory.
   # Only the disposable-account mode may create it, and removes it if created.
   if [[ ! -d /run/sshd ]]; then
