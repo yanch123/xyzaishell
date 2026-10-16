@@ -1,3 +1,4 @@
+import type { TerminalTaskSnapshot } from '../lib/agent';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { desktopAvailable } from '../lib/bridge';
 import { modelBridge } from '../lib/modelBridge';
@@ -5,9 +6,14 @@ import { MAX_CHATS, MAX_DRAFT_LENGTH, MAX_MESSAGE_BYTES, MAX_MESSAGES, utf8Lengt
 import { INITIAL_MODEL_CONFIG, MAX_CONCURRENT_CHATS, newerRevision } from '../lib/model';
 import type { ChatSnapshot, ModelConfigStatus, SaveModelConfigRequest, ModelTestResult, ModelTestKind } from '../lib/model';
 import type { SessionSnapshot } from '../lib/types';
-import { safeError } from '../lib/types';
+import { safeError, sameSession } from '../lib/types';
 import type { TerminalAttachmentDraft, TerminalSelection } from '../lib/terminalSelection';
 import { attachmentConsented, boundSelection, composeAttachedMessage, selectionMatchesChat, selectionMatchesTarget } from '../lib/terminalSelection';
+
+// These errors are returned before a unified turn is accepted. Unknown failures
+// may follow real execution and must never unlock a replay of the same draft.
+const SEND_PREFLIGHT_ERRORS = new Set(['MODEL_CONFIG_CHANGED', 'MODEL_CONFIG_UNAVAILABLE', 'CONVERSATION_SCOPE_REQUIRED', 'SESSION_STALE', 'CHAT_BUSY', 'CHAT_NOT_FOUND', 'AI_OWNER_BUSY', 'CHAT_RESTORED_READ_ONLY', 'CHAT_TARGET_MISMATCH', 'TASK_INPUT_INVALID']);
+type UncertainSubmission = { revision: string; text: string; draft: string | undefined; messageIds: string[]; attachment?: TerminalAttachmentDraft };
 
 function previewChat(): ChatSnapshot {
   const id = crypto.randomUUID();
@@ -20,10 +26,14 @@ function targetIdentity(target?: SessionSnapshot): string | null {
 }
 function chatMatchesTarget(chat: ChatSnapshot, target?: SessionSnapshot): boolean {
   if (chat.restored_read_only) return false;
-  return !chat.source || !!targetIdentity(target) && chat.source.host === target?.host && chat.source.port === target?.port && chat.source.username === target?.username;
+  return !chat.source || !targetIdentity(target) || chat.source.host === target?.host && chat.source.port === target?.port && chat.source.username === target?.username;
 }
 export function useModelChat(target?: SessionSnapshot) {
   const native = desktopAvailable();
+  const [terminalTask, setTerminalTask] = useState<TerminalTaskSnapshot | null>(null);
+  const [scopeGrant, setScopeGrant] = useState<string | null>(null);
+  const scopeGrantRef = useRef<string | null>(null);
+  const scopeKey = (configuration: ModelConfigStatus, session?: SessionSnapshot) => JSON.stringify([configuration.revision, configuration.destination, targetIdentity(session)]);
   const [chats, setChats] = useState<ChatSnapshot[]>(() => native ? [] : [previewChat()]);
   const [config, setConfig] = useState<ModelConfigStatus>(INITIAL_MODEL_CONFIG);
   const [ready, setReady] = useState(!native);
@@ -33,6 +43,8 @@ export function useModelChat(target?: SessionSnapshot) {
   const attachmentsRef = useRef(attachments);
   const [errors, setErrors] = useState<Record<string, string | null>>({});
   const [error, setError] = useState<string | null>(null);
+  const [uncertainSubmissions, setUncertainSubmissions] = useState<Record<string, boolean>>({});
+  const uncertainSubmissionsRef = useRef(new Map<string, UncertainSubmission>());
   const [pending, setPending] = useState<Record<string, 'sending' | 'cancelling'>>({});
   const [creating, setCreating] = useState(false);
   const [configBusy, setConfigBusy] = useState(false);
@@ -54,6 +66,20 @@ export function useModelChat(target?: SessionSnapshot) {
   const initialChat = useRef<Promise<ChatSnapshot> | null>(null);
 
   const acceptChat = useCallback((next: ChatSnapshot) => {
+    const uncertain = uncertainSubmissionsRef.current.get(next.chat_id);
+    if (uncertain && newerRevision(next.revision, uncertain.revision) && next.messages.some(message => message.role === 'user' && !uncertain.messageIds.includes(message.id) && message.text === uncertain.text)) {
+      // A newer authoritative transcript proves acceptance, even if execution
+      // already finished. Consume the original draft before lifting the fence.
+      if (draftsRef.current[next.chat_id] === uncertain.draft) {
+        draftsRef.current = { ...draftsRef.current, [next.chat_id]: '' }; setDrafts(draftsRef.current);
+      }
+      if (uncertain.attachment && attachmentsRef.current[next.chat_id] === uncertain.attachment) {
+        const remaining = { ...attachmentsRef.current }; delete remaining[next.chat_id];
+        attachmentsRef.current = remaining; setAttachments(remaining);
+      }
+      uncertainSubmissionsRef.current.delete(next.chat_id);
+      setUncertainSubmissions(Object.fromEntries([...uncertainSubmissionsRef.current.keys()].map(id => [id, true])));
+    }
     const old = chatsRef.current.find(chat => chat.chat_id === next.chat_id);
     if (old && !newerRevision(next.revision, old.revision)) return;
     const updated = old ? chatsRef.current.map(chat => chat.chat_id === next.chat_id ? next : chat) : [...chatsRef.current, next];
@@ -106,7 +132,7 @@ export function useModelChat(target?: SessionSnapshot) {
     let reading = false;
     const reconcile = async () => {
       if (reading || disposed) return;
-      const active = chatsRef.current.filter(chat => chat.active_run_id || pendingRef.current.has(chat.chat_id));
+      const active = chatsRef.current.filter(chat => chat.active_run_id || pendingRef.current.has(chat.chat_id) || uncertainSubmissionsRef.current.has(chat.chat_id));
       if (!active.length) return;
       reading = true;
       await Promise.all(active.map(async chat => {
@@ -205,15 +231,18 @@ export function useModelChat(target?: SessionSnapshot) {
       return false;
     }
     const text = composeAttachedMessage(draftsRef.current[chatId] ?? '', attachment);
-    if (!native || !ready || configWriteBlocked || !chat || !chatMatchesTarget(chat, targetRef.current) || !text || utf8Length(text) > MAX_MESSAGE_BYTES || chat.messages.length > MAX_MESSAGES - 2 || chat.active_run_id || pendingRef.current.has(chatId) || !configRef.current.ready || !configRef.current.consented) return false;
+    if (!native || !ready || configWriteBlocked || !chat || !chatMatchesTarget(chat, targetRef.current) || !text || utf8Length(text) > MAX_MESSAGE_BYTES || chat.messages.length > MAX_MESSAGES - 2 || chat.active_run_id || pendingRef.current.has(chatId) || uncertainSubmissionsRef.current.has(chatId) || !configRef.current.ready || !configRef.current.consented || (!attachment && targetIdentity(targetRef.current) && scopeGrantRef.current !== scopeKey(configRef.current, targetRef.current))) return false;
     if (chatsRef.current.filter(item => item.active_run_id || pendingRef.current.get(item.chat_id) === 'sending').length >= MAX_CONCURRENT_CHATS) return false;
     markPending(chatId, 'sending');
     setErrors(items => ({ ...items, [chatId]: null }));
     const submittedDraft = draftsRef.current[chatId];
     try {
-      const next = await modelBridge.send(chatId, text);
+      const next = attachment
+        ? { kind: 'chat' as const, chat: await modelBridge.sendText(chatId, text) }
+        : await modelBridge.send(chatId, text, configRef.current.revision!, configRef.current.destination!, targetRef.current?.state === 'connected' ? targetRef.current.session : null);
       if (alive.current) {
-        acceptChat(next);
+        if (next.kind === 'terminal') setTerminalTask(next.task);
+        else if (next.kind === 'chat') acceptChat(next.chat);
         // A user may already have begun their next message while IPC completes.
         if (draftsRef.current[chatId] === submittedDraft) updateDraft(chatId, '');
         if (attachment && attachmentsRef.current[chatId] === attachment) removeAttachment(chatId);
@@ -222,11 +251,24 @@ export function useModelChat(target?: SessionSnapshot) {
     } catch (failure) {
       if (alive.current) {
         setErrors(items => ({ ...items, [chatId]: safeError(failure) }));
-        // An IPC failure can be ambiguous; reconcile without reissuing the send.
+        const code = typeof failure === 'object' && failure !== null && 'code' in failure ? String(failure.code) : null;
+        if (!code || !SEND_PREFLIGHT_ERRORS.has(code)) {
+          uncertainSubmissionsRef.current.set(chatId, { revision: chat.revision, text, draft: submittedDraft, messageIds: chat.messages.map(message => message.id), attachment });
+          setUncertainSubmissions(items => ({ ...items, [chatId]: true }));
+          // An event may have arrived before the failed IPC response.
+          const known = chatsRef.current.find(item => item.chat_id === chatId);
+          if (known) acceptChat(known);
+        }
+        // Only authoritative reads can reconcile this fence; never resubmit.
         try { const next = await modelBridge.get(chatId); if (alive.current) acceptChat(next); } catch { /* Keep safe original error. */ }
       }
       return false;
     } finally { if (alive.current) markPending(chatId, null); else pendingRef.current.delete(chatId); }
+  };
+  const reconcileSubmission = async (chatId: string) => {
+    if (!native || !uncertainSubmissionsRef.current.has(chatId)) return;
+    try { const next = await modelBridge.get(chatId); if (alive.current) acceptChat(next); }
+    catch (failure) { if (alive.current) setErrors(items => ({ ...items, [chatId]: safeError(failure) })); }
   };
   const cancel = async (chatId: string) => {
     const runId = chatsRef.current.find(chat => chat.chat_id === chatId)?.active_run_id;
@@ -273,12 +315,16 @@ export function useModelChat(target?: SessionSnapshot) {
     try { await modelBridge.cancelTest(testIdRef.current); }
     catch (failure) { if (alive.current) setError(safeError(failure)); }
   };
-  const confirmDestination = async (expected: ModelConfigStatus): Promise<boolean> => {
+  const confirmDestination = async (expected: ModelConfigStatus, expectedTarget: SessionSnapshot | undefined = targetRef.current): Promise<boolean> => {
     if (!native || configWriteBlocked || configBusyRef.current || !expected.ready || !expected.revision || !expected.destination) return false;
     configBusyRef.current = true; setConfigBusy(true); setError(null);
     try {
-      const next = await modelBridge.confirm(expected.revision, expected.destination);
-      if (alive.current) acceptConfig(next);
+      if (scopeKey(expected, expectedTarget) !== scopeKey(configRef.current, targetRef.current) || expectedTarget?.state !== targetRef.current?.state || expectedTarget?.state === 'connected' && !sameSession(expectedTarget.session, targetRef.current?.session)) return false;
+      const next = await modelBridge.confirmScope(expected.revision, expected.destination, expectedTarget?.state === 'connected' ? expectedTarget.session : null);
+      if (alive.current) {
+        acceptConfig(next);
+        const grant = scopeKey(next, expectedTarget); scopeGrantRef.current = grant; setScopeGrant(grant);
+      }
       return next.consented;
     } catch (failure) { if (alive.current) setError(safeError(failure)); return false; }
     finally { configBusyRef.current = false; if (alive.current) setConfigBusy(false); }
@@ -299,6 +345,7 @@ export function useModelChat(target?: SessionSnapshot) {
     acceptChat(chat); setSelected(chat.chat_id);
   };
   const runningCount = chats.filter(chat => chat.active_run_id || pending[chat.chat_id] === 'sending').length;
-  return { native, ready, config, chats, current, drafts, attachments, attachSelection, editAttachment, removeAttachment, consentAttachment, errors, error, pending, creating, configBusy, runningCount, configWriteBlocked, configTest, configTestBusy, saveConfig, testSaved, cancelConfigTest, updateDraft, createChat, selectChat, send, cancel, reloadConfig, confirmDestination, probe, retryLoad, restoreChat };
+  const scopeConsented = config.consented && (!connectedTarget || scopeGrant === scopeKey(config, target));
+  return { uncertainSubmissions, reconcileSubmission, terminalTask, scopeConsented, native, ready, config, chats, current, drafts, attachments, attachSelection, editAttachment, removeAttachment, consentAttachment, errors, error, pending, creating, configBusy, runningCount, configWriteBlocked, configTest, configTestBusy, saveConfig, testSaved, cancelConfigTest, updateDraft, createChat, selectChat, send, cancel, reloadConfig, confirmDestination, probe, retryLoad, restoreChat };
 }
 export type ModelChatController = ReturnType<typeof useModelChat>;

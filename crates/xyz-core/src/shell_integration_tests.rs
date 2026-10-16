@@ -85,7 +85,7 @@ fn unsupported_reasons_have_specific_safe_diagnostics_and_never_restore_readines
         (
             "unsupported_bash",
             "SHELL_UNSUPPORTED_BASH",
-            "Bash 5.1 or 5.2",
+            "Bash 5.1 或 5.2",
         ),
         (
             "namespace_conflict",
@@ -105,11 +105,7 @@ fn unsupported_reasons_have_specific_safe_diagnostics_and_never_restore_readines
             "PROMPT_COMMAND",
         ),
         ("missing_tools", "SHELL_UNSUPPORTED_MISSING_TOOLS", "base64"),
-        (
-            "private_unrecognized_reason",
-            "SHELL_UNSUPPORTED",
-            "unrecognized",
-        ),
+        ("private_unrecognized_reason", "SHELL_UNSUPPORTED", "未识别"),
     ] {
         let f = Fixture::new();
         f.event(&format!("U;{reason}"));
@@ -122,7 +118,7 @@ fn unsupported_reasons_have_specific_safe_diagnostics_and_never_restore_readines
             "{}",
             diagnostic.safe_message
         );
-        assert!(diagnostic.safe_message.contains("manual terminal"));
+        assert!(diagnostic.safe_message.contains("手动终端"));
         assert!(!diagnostic
             .safe_message
             .contains("private_unrecognized_reason"));
@@ -438,4 +434,51 @@ fn paused_shared_logger_retains_prompt_gap_and_cannot_resume() {
         .entries
         .is_empty());
     log.disconnect(f.session());
+}
+
+#[test]
+fn controlled_startup_requires_hello_then_ready_and_never_replays() {
+    let service = ShellIntegrationService::new();
+    let snapshot = snapshot("1");
+    let session = snapshot.session.unwrap();
+    let command = service.prepare_startup(&session).unwrap();
+    assert!(command.starts_with("exec /bin/sh -c "));
+    assert_eq!(service.status().phase, IntegrationPhase::Installing);
+    assert!(service.ready_snapshot(&session).is_err());
+    assert!(service.prepare_startup(&session).is_err());
+    let nonce = service.status().shell_id.unwrap();
+    service.ingest(
+        &session,
+        format!("\x1b]777;xyzlog;2;{nonce};H;5.2.37(1)-release\x07").as_bytes(),
+    );
+    assert_eq!(service.status().phase, IntegrationPhase::AwaitingReady);
+    assert!(service.ready_snapshot(&session).is_err());
+    service.ingest(
+        &session,
+        format!("\x1b]777;xyzlog;2;{nonce};R;0;123;\x07").as_bytes(),
+    );
+    assert!(service.ready_snapshot(&session).is_ok());
+    service.disconnect(&session);
+    assert_eq!(service.status().phase, IntegrationPhase::Disconnected);
+    assert!(service.ready_snapshot(&session).is_err());
+}
+
+#[test]
+fn startup_timeout_and_explicit_refusal_never_accept_late_ready() {
+    for refused in [false, true] {
+        let service = ShellIntegrationService::new();
+        let session = snapshot("1").session.unwrap();
+        service.prepare_startup(&session).unwrap();
+        let nonce = service.status().shell_id.unwrap();
+        if refused {
+            service.startup_unavailable(&session, "SHELL_STARTUP_REFUSED", "手动终端");
+        } else {
+            service.inner.lock().unwrap().deadline = Some(Instant::now() - Duration::from_secs(1));
+        }
+        assert_eq!(service.status().phase, IntegrationPhase::Unknown);
+        service.ingest(&session, format!("\x1b]777;xyzlog;2;{nonce};H;5.2.37(1)-release\x07\x1b]777;xyzlog;2;{nonce};R;0;123;\x07").as_bytes());
+        assert_eq!(service.status().phase, IntegrationPhase::Unknown);
+        assert!(service.ready_snapshot(&session).is_err());
+        assert!(service.prepare_startup(&session).is_err());
+    }
 }

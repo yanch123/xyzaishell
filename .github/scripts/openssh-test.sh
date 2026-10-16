@@ -127,6 +127,20 @@ if [[ "$mode" == --disposable-user ]]; then
   fixture_user=$username
   fixture_uid=$(id -u "$username")
   "${as_root[@]}" install -d -m 700 -o "$fixture_uid" "$fixture/home" "$fixture/home/.ssh"
+  # Configure only the account created by this fixture, before SSH startup.
+  # Production preparation must preserve these settings and definitions.
+  cat > "$fixture/bashrc" <<'BASHRC'
+stty -echo
+HISTCONTROL=ignoreboth
+HISTIGNORE=
+HISTSIZE=1000
+shopt -s cmdhist promptvars lithist
+PS1='XYZ_OPENSSH> '
+alias xyz_fixture_alias='printf "%s\n" XYZ_ALIAS_PRESERVED'
+xyz_fixture_function() { return 23; }
+BASHRC
+  "${as_root[@]}" install -m 600 -o "$fixture_uid" "$fixture/bashrc" "$fixture/home/.bashrc"
+  export XYZ_OPENSSH_FIXTURE_BASHRC=1
   authorized_keys="$fixture/home/.ssh/authorized_keys"
   "${as_root[@]}" install -m 600 -o "$fixture_uid" "$fixture/client/key.pub" "$authorized_keys"
   chmod 711 "$fixture"
@@ -220,19 +234,19 @@ cargo test -p xyz-core --locked --test shell_log_openssh \
 
 # OpenSSH records protocol request types, independently of the client's events.
 # Two terminal-interoperability plus three shell-log connections must each
-# allocate exactly one PTY and start one shell. Bootstrap stays in visible PTY.
-# Any exec/subsystem request, including one refused by MaxSessions, is failure.
+# allocate exactly one PTY and start its controlled shell with one exec.
+# There is no hidden channel or stdin bootstrap; subsystem requests are forbidden.
 python3 - "$fixture/sshd.log" <<'PY'
 import pathlib
 import re
 import sys
 
 log = pathlib.Path(sys.argv[1]).read_text()
-for request, count in [('pty-req', 5), ('shell', 5), ('window-change', 1)]:
+for request, count in [('pty-req', 5), ('exec', 5), ('shell', 0), ('window-change', 1)]:
     actual = len(re.findall(r'server_input_channel_req: channel \d+ request ' + request + r' reply ', log))
     assert actual == count, f'Expected {count} {request} requests, got {actual}'
-assert not re.search(r'request (exec|subsystem) reply ', log), 'Hidden exec/subsystem request detected'
+assert not re.search(r'request subsystem reply ', log), 'Unexpected subsystem request detected'
 assert len(re.findall(r'server_input_channel_open: ctype session ', log)) == 5, 'Unexpected extra session channel'
-assert len(re.findall(r'Starting session: shell on ', log)) == 5, 'Expected five real OS PTY shells'
-print('PASS: OpenSSH observed five PTY shells, resize, and zero exec/subsystem requests.')
+assert len(re.findall(r'Starting session: command on ', log)) == 5, 'Expected five controlled real OS PTY shells'
+print('PASS: OpenSSH observed five controlled PTY exec shells, resize, and no extra channels or subsystem requests.')
 PY

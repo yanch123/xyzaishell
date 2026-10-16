@@ -30,6 +30,8 @@ from upgrade_baseline import BASE_VERSION, TARGET_VERSION
 ELEMENT = "element-6066-11e4-a52e-4f735466cecf"
 PROMPT = "Native fixture history message 中文"
 REPLY = "Native fixture streamed reply 中文 <script>window.unsafe=true</script>"
+FOLLOWUP = "Native fixture follow-up: retain the previous answer 中文"
+FOLLOWUP_REPLY = "Native fixture contextual follow-up reply 中文"
 PROFILE = "Native fixture profile 中文"
 TOKEN = "synthetic-native-fixture-token"
 
@@ -115,8 +117,13 @@ class ModelFixture(http.server.BaseHTTPRequestHandler):
             self.server.invalid_requests += 1
             self.send_error(400)
             return
+        followup = body.get("messages", [])[-1].get("content") == FOLLOWUP
+        if followup and not any(m.get("role") == "assistant" and m.get("content") == REPLY for m in body["messages"]):
+            self.server.invalid_requests += 1
+            self.send_error(400)
+            return
         chunks = [
-            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "OK" if probe else REPLY}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "OK" if probe else FOLLOWUP_REPLY if followup else REPLY}, "finish_reason": None}]},
             {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
         ]
         stream = "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
@@ -379,6 +386,8 @@ def assert_literal_reply(driver):
 
 def seed(driver, server, version):
     configure_candidate_model(driver, server)
+    if version == TARGET_VERSION:
+        assert driver.js("return ![...document.querySelectorAll('[role=tab]')].some(e=>['文字聊天','执行终端任务'].includes(e.textContent.trim())) && !document.querySelector('textarea[aria-label=\"终端任务指令\"]')")
     driver.click(driver.button("新建 SSH 连接"))
     for label, text in [("连接名称", PROFILE), ("主机地址", "127.0.0.1"), ("用户名", "synthetic-user")]:
         driver.fill(label, text)
@@ -401,16 +410,25 @@ def seed(driver, server, version):
     time.sleep(1)
     assert server.requests == []
     driver.screenshot("actual-ipc-recipient-consent")
-    driver.click("//label[contains(.,'我确认此地址和模型')]/input")
+    driver.click("//label[contains(.,'我确认此地址')]/input")
     driver.click(driver.button("同意并发送"))
     assert_literal_reply(driver)
     wait_for(lambda: driver.js("return document.body.textContent.includes('无生成中的聊天')"))
     assert len(server.requests) == 1 and server.invalid_requests == 0
     driver.screenshot("actual-ipc-streamed-chat")
+    if version == TARGET_VERSION:
+        driver.command("POST", f"/element/{element}/value", {"text": FOLLOWUP, "value": list(FOLLOWUP)})
+        driver.click(driver.button("发送"))
+        wait_for(lambda: driver.js("return [...document.querySelectorAll('article[aria-label=\"模型回复\"] p')].some(e=>e.textContent === " + json.dumps(FOLLOWUP_REPLY) + ")"))
+        assert not driver.command("POST", "/elements", {"using": "xpath", "value": "//*[@role='dialog' and @aria-label='确认模型接收方']"})
+        wait_for(lambda: driver.js("return document.body.textContent.includes('无生成中的聊天')"))
+        assert len(server.requests) == 2 and server.invalid_requests == 0
+        assert server.requests[1]["messages"][-1]["content"] == FOLLOWUP
+        driver.screenshot("unified-no-ssh-contextual-followup")
     return profile_id
 
 
-def verify_preserved(driver, server, version, expected_profile_id):
+def verify_preserved(driver, server, version, expected_profile_id, message_count=2):
     open_profiles(driver, version)
     driver.click(f"//select[@aria-label='选择档案']/option[starts-with(normalize-space(.),'{PROFILE}')]")
     assert driver.js("return document.querySelector('select[aria-label=\"选择档案\"]').value") == expected_profile_id
@@ -423,9 +441,10 @@ def verify_preserved(driver, server, version, expected_profile_id):
     close_profiles(driver, version)
     enable_history(driver, version)
     # The saved title remains '新任务'; it is not derived from message text.
-    # This isolated fixture has exactly one two-message conversation. Require
+    # This isolated fixture has exactly one conversation (baseline: two messages;
+    # candidate: four, including the contextual follow-up). Require
     # uniqueness, then verify exact reply and persisted task/chat identity below.
-    restore = "//div[@aria-label='本机保存的聊天']/div[span[contains(.,' · 2 条消息')]]/button[normalize-space(.)='仅恢复文字']"
+    restore = f"//div[@aria-label='本机保存的聊天']/div[span[contains(.,' · {message_count} 条消息')]]/button[normalize-space(.)='仅恢复文字']"
     wait_for(lambda: len(driver.command("POST", "/elements", {"using": "xpath", "value": restore})) == 1)
     driver.click(restore)
     assert_literal_reply(driver)
@@ -486,7 +505,7 @@ def verify_private_file(path, expected_digest, label):
 
 def verify_profile_backup(config, expected_digest):
     # Retain the strict legacy migration helper and regression coverage. The
-    # reviewed v0.1.2 baseline already writes v2, so this is not its upgrade gate.
+    # reviewed v0.1.3 baseline already writes v2, so this is not its upgrade gate.
     verify_private_file(config / "connections.v1.backup.toml", expected_digest, "Legacy profile backup")
 
 
@@ -499,7 +518,7 @@ def profile_schema_version(config):
 
 
 def verify_current_profile_upgrade(config, expected):
-    assert expected["profile_schema_version"] == 2, "Upgrade must start with real v0.1.2 profiles"
+    assert expected["profile_schema_version"] == 2, "Upgrade must start with real v0.1.3 profiles"
     verify_private_file(config / "connections.toml", expected["profile_file_sha256"], "Profile file")
     assert profile_schema_version(config) == 2, "Upgrade changed the profile schema marker"
     backup = config / "connections.v1.backup.toml"
@@ -629,6 +648,7 @@ allow_loopback_http = true
         phases = ["seed", "restart"] if expected is None else [args.phase]
         identity = expected["identity"] if expected else None
         profile_id = expected["profile_id"] if expected else None
+        message_count = expected.get("message_count", 2) if expected else (4 if args.application_version == TARGET_VERSION else 2)
         for phase in phases:
             directory = args.evidence / phase
             directory.mkdir(exist_ok=True)
@@ -637,7 +657,7 @@ allow_loopback_http = true
                 if phase == "seed":
                     profile_id = seed(driver, server, args.application_version)
                 else:
-                    verify_preserved(driver, server, args.application_version, profile_id)
+                    verify_preserved(driver, server, args.application_version, profile_id, message_count)
                 verify_empty_shell_log(driver, history, server, args.application_version)
                 visible_task_identity = driver.js("return document.querySelector('.chat-status span[title]')?.getAttribute('title')")
             except BaseException:
@@ -648,7 +668,7 @@ allow_loopback_http = true
             finally:
                 driver.close()
             assert not any((history / ("history.sqlite3" + suffix)).exists() for suffix in ("-wal", "-shm", "-journal")), "History database sidecars survived clean application exit"
-            assert len(server.requests) == (1 if phase == "seed" else 0), "Unexpected model request before process exit"
+            assert len(server.requests) == (message_count // 2 if phase == "seed" else 0), "Unexpected model request before process exit"
             assert len(server.test_requests) == (1 if phase == "seed" else 0), "Unexpected model configuration test"
             assert server.invalid_requests == 0
             actual = list(stored_identity(history))
@@ -668,13 +688,13 @@ allow_loopback_http = true
         profile_version = profile_schema_version(config)
         assert profile_version == 2, "Reviewed native fixture must use profile schema v2"
         if args.phase == "upgrade":
-            assert expected["history_version"] == 2, "Upgrade must start with real v0.1.2 history"
+            assert expected["history_version"] == 2, "Upgrade must start with real v0.1.3 history"
             verify_history_upgrade(history, expected["history_rows"])
             verify_current_profile_upgrade(config, expected)
             verify_private_file(config / "model.toml", expected["model_file_sha256"], "Model settings")
         if expected is None or args.phase == "upgrade":
             state_file.write_text(json.dumps({"port": server.server_port, "identity": identity, "profile_id": profile_id,
-                "application_version": args.application_version, "application_sha256": application_hash,
+                "application_version": args.application_version, "application_sha256": application_hash, "message_count": message_count,
                 "history_version": history_version, "history_rows": preserved_rows,
                 "profile_schema_version": profile_version,
                 "profile_file_sha256": hashlib.sha256((config / "connections.toml").read_bytes()).hexdigest(),
@@ -691,6 +711,7 @@ allow_loopback_http = true
             "history_rows_and_private_v2_profiles_preserved": args.phase == "upgrade",
             "legacy_profile_migration_tested": False,
             "model_settings_saved_and_tested_via_ui": args.phase == "seed",
+            "unified_no_ssh_followup_context_tested": args.phase == "seed" and args.application_version == TARGET_VERSION,
             "not_tested": ["real provider", "SSH via UI", "desktop input methods", "Windows 10/11"]
                 + ([] if args.phase == "upgrade" else ["version upgrade in this phase"]),
         }, indent=2), encoding="utf-8")

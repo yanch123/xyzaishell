@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { action, connectedSession, controller, task } from '../test/agentFixtures';
@@ -12,11 +12,11 @@ describe('terminal task visible workflow', () => {
     render(<TerminalTaskPane {...common} agent={controller({ tasks: { 'chat-a': current }, continueTask })} />);
     expect(screen.getByRole('article', { name: '任务模型分析' }).textContent).toContain(current.assistant_text);
     expect(document.querySelector('script')).toBeNull();
-    const button = screen.getByRole('button', { name: '确认就绪并继续分析' });
-    expect(button.hasAttribute('disabled')).toBe(true); expect(continueTask).not.toHaveBeenCalled();
-    await user.click(screen.getByRole('checkbox', { name: '我已检查终端，并确认当前可接收下一步命令。' })); await user.click(button);
+    const button = screen.getByRole('button', { name: '核对状态并继续' });
+    expect(button.hasAttribute('disabled')).toBe(false); expect(continueTask).not.toHaveBeenCalled();
+    await user.click(button);
     expect(continueTask).toHaveBeenCalledExactlyOnceWith('chat-a', 'run-a');
-    expect(button.hasAttribute('disabled')).toBe(true);
+    expect(screen.queryByRole('checkbox', {name: '我已检查终端，并确认当前可接收下一步命令。'})).toBeNull();
   });
   it('shows another chat owner without transferring it and pins cancellation to the owning run', async () => {
     const cancel = vi.fn(); const select = vi.fn(); const user = userEvent.setup();
@@ -33,16 +33,17 @@ describe('terminal task visible workflow', () => {
     const current = task({ phase: 'cancelled', owner: false, remote_outcome: 'unknown', terminal_ready: false });
     const continueTask = vi.fn(); const user = userEvent.setup();
     const view = render(<TerminalTaskPane {...common} agent={controller({ tasks: { 'chat-a': current }, continueTask })} />);
-    await user.click(screen.getByRole('checkbox', { name: '我已检查终端，并确认当前可接收下一步命令。' })); await user.click(screen.getByRole('button', { name: '确认终端就绪 · 不重启 AI' }));
+    await user.click(screen.getByRole('button', { name: '核对状态并继续' }));
     expect(continueTask).toHaveBeenCalledExactlyOnceWith('chat-a', 'run-a');
     view.rerender(<TerminalTaskPane {...common} agent={controller({ tasks: { 'chat-a': { ...current, revision: '2', terminal_ready: true } }, continueTask })} />);
     expect(screen.queryByRole('checkbox')).toBeNull(); expect(screen.getByText('AI 已停止')).toBeDefined();
   });
-  it('opens a confirmation request rather than executing a composer submission directly', () => {
-    const onStart = vi.fn(); const start = vi.fn();
-    render(<TerminalTaskPane {...common} onStart={onStart} agent={controller({ drafts: { 'chat-a': '检查状态' }, start })} />);
-    fireEvent.click(screen.getByRole('button', { name: '核对并开始执行' }));
-    expect(onStart).toHaveBeenCalledExactlyOnceWith(chat(), '检查状态'); expect(start).not.toHaveBeenCalled();
+  it('has no second composer or per-task start gate', () => {
+    const start = vi.fn();
+    render(<TerminalTaskPane {...common} agent={controller({ start })} />);
+    expect(screen.queryByRole('textbox')).toBeNull();
+    expect(screen.queryByRole('button', { name: '核对并开始执行' })).toBeNull();
+    expect(start).not.toHaveBeenCalled();
   });
   it('waits for cancelled in-flight writes to settle before offering readiness confirmation', () => {
     const current = task({ phase: 'cancelled', owner: true, terminal_ready: false, remote_outcome: 'unknown' });
@@ -92,23 +93,18 @@ describe('integrated automatic execution states', () => {
   });
 });
 
-describe('compact active-task review layout', () => {
-  it('collapses the unavailable new-task editor while keeping its draft accessible and restoring it after stop', () => {
-    const owner = task({ phase: 'waiting_approval', action: action({ policy: 'require_approval', displayed: true }) });
-    const onStart = vi.fn();
-    const view = render(<TerminalTaskPane {...common} onStart={onStart} agent={controller({ owner, blocked: true, tasks: { 'chat-a': owner }, drafts: { 'chat-a': '保留下一次任务草稿' } })} />);
-    expect(screen.queryByRole('textbox', { name: '终端任务指令' })).toBeNull();
-    expect(screen.getByRole('group', { name: '精确终端命令' })).toBeDefined();
-    const expand = screen.getByRole('button', { name: /展开新任务草稿/ });
-    expect(expand.getAttribute('aria-expanded')).toBe('false');
-    fireEvent.click(expand);
-    expect((screen.getByRole('textbox', { name: '终端任务指令' }) as HTMLTextAreaElement).value).toBe('保留下一次任务草稿');
-    expect((screen.getByRole('button', { name: '核对并开始执行' }) as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(screen.getByRole('button', { name: /收起新任务草稿/ }));
-    expect(screen.queryByRole('textbox', { name: '终端任务指令' })).toBeNull();
-    view.rerender(<TerminalTaskPane {...common} onStart={onStart} agent={controller({ owner: null, blocked: false, tasks: { 'chat-a': { ...owner, phase: 'cancelled', owner: false, terminal_ready: true } }, drafts: { 'chat-a': '保留下一次任务草稿' } })} />);
-    expect((screen.getByRole('textbox', { name: '终端任务指令' }) as HTMLTextAreaElement).value).toBe('保留下一次任务草稿');
-    expect(screen.queryByRole('button', { name: /展开新任务草稿/ })).toBeNull();
-    expect(onStart).not.toHaveBeenCalled();
+
+describe('conversational replies', () => {
+  it('does not repeat a greeting already rendered in the shared transcript', () => {
+    const completed = task({ phase: 'completed', owner: false, instruction: '你好', assistant_text: '你好，有什么可以帮你？' });
+    const current = { ...chat(), messages: [
+      { id: 'user', role: 'user' as const, text: '你好', run_id: completed.run_id, state: 'complete' as const, error: null },
+      { id: 'assistant', role: 'assistant' as const, text: completed.assistant_text, run_id: completed.run_id, state: 'complete' as const, error: null },
+    ] };
+    render(<TerminalTaskPane {...common} current={current} agent={controller({ tasks: { 'chat-a': completed } })} />);
+    expect(screen.queryByText('你好')).toBeNull();
+    expect(screen.queryByText(completed.assistant_text)).toBeNull();
+    expect(screen.queryByText('AI 流程已结束')).toBeNull();
+    expect(screen.queryByLabelText('当前终端任务')).toBeNull();
   });
 });

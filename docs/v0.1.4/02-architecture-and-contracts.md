@@ -4,7 +4,7 @@
 
 ## 统一入口
 
-新增宿主入口 `submit_conversation_turn(chatId, text)`，结果为带标签的 `chat`（ChatSnapshot）或 `terminal`（TerminalTaskSnapshot）。不接受渲染层伪造“已空闲”作为执行证据。宿主读取当前配置、许可范围、连接身份和命令识别状态。
+新增宿主入口 `submit_conversation_turn(chatId, text, revision, destination, session)`，结果为带标签的 `chat`（ChatSnapshot）或 `terminal`（TerminalTaskSnapshot）。配置和 session 参数仅为期望值，用于拒绝迟到的旧请求，不能赋予权限；不接受渲染层伪造“已空闲”作为执行证据。宿主读取当前配置、许可范围、连接身份和命令识别状态。
 
 - 当前服务器已就绪且具备对应能力许可：进入支持文字回复／工具提议的 Agent 流程。
 - 无连接、准备中或环境不支持：文字流仍可响应，附带准确可用性说明，不提供执行工具、不宣称已执行。

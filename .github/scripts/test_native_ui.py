@@ -18,7 +18,7 @@ SPEC.loader.exec_module(native)
 
 class NativeVersionPhaseTests(unittest.TestCase):
     def test_seed_and_same_version_preservation(self):
-        for version in ("0.1.2", "0.1.3"):
+        for version in ("0.1.3", "0.1.4"):
             native.verify_phase_version("seed", version, "new-hash", None)
             expected = {"application_version": version, "application_sha256": "new-hash"}
             native.verify_phase_version("preserved", version, "new-hash", expected)
@@ -26,16 +26,16 @@ class NativeVersionPhaseTests(unittest.TestCase):
                 native.verify_phase_version("preserved", version, "other-hash", expected)
 
     def test_upgrade_requires_exact_old_version_and_replaced_executable(self):
-        expected = {"application_version": "0.1.2", "application_sha256": "old-hash"}
-        native.verify_phase_version("upgrade", "0.1.3", "new-hash", expected)
-        for version, digest, record in [("0.1.2", "new-hash", expected), ("0.1.3", "old-hash", expected),
-                ("0.1.4", "new-hash", expected), ("0.1.3", "new-hash", None),
-                ("0.1.3", "new-hash", {"application_version": "0.1.0", "application_sha256": "old-hash"})]:
+        expected = {"application_version": "0.1.3", "application_sha256": "old-hash"}
+        native.verify_phase_version("upgrade", "0.1.4", "new-hash", expected)
+        for version, digest, record in [("0.1.3", "new-hash", expected), ("0.1.4", "old-hash", expected),
+                ("0.1.5", "new-hash", expected), ("0.1.4", "new-hash", None),
+                ("0.1.4", "new-hash", {"application_version": "0.1.0", "application_sha256": "old-hash"})]:
             with self.assertRaises(ValueError):
                 native.verify_phase_version("upgrade", version, digest, record)
 
     def test_invalid_version_or_phase_rejected(self):
-        for phase, version in [("seed", "latest"), ("seed", "0.1.2\\nextra"), ("seed", "0.1.1"), ("seed", "0.1.4"), ("other", "0.1.2")]:
+        for phase, version in [("seed", "latest"), ("seed", "0.1.3\\nextra"), ("seed", "0.1.1"), ("seed", "0.1.5"), ("other", "0.1.3")]:
             with self.assertRaises(ValueError):
                 native.verify_phase_version(phase, version, "hash", None)
 
@@ -61,7 +61,7 @@ class ProcessQueryTests(unittest.TestCase):
 
 class NativeDriverHelperTests(unittest.TestCase):
     def test_both_reviewed_versions_use_current_connection_and_log_controls(self):
-        for version in ("0.1.2", "0.1.3"):
+        for version in ("0.1.3", "0.1.4"):
             with self.subTest(version=version):
                 driver = mock.Mock()
                 driver.button.side_effect = lambda text: text
@@ -290,6 +290,18 @@ class NativeHelperTests(unittest.TestCase):
         self.assertEqual(len(self.server.requests), 1)
         self.assertEqual(self.server.invalid_requests, 0)
 
+    def test_followup_requires_previous_assistant_context(self):
+        body = {"model": "native-fixture-model", "stream": True, "messages": [
+            {"role": "user", "content": native.PROMPT},
+            {"role": "assistant", "content": native.REPLY},
+            {"role": "user", "content": native.FOLLOWUP}]}
+        stream = self.post(body)
+        self.assertEqual(json.loads(stream.split("\n\n")[0][6:])["choices"][0]["delta"]["content"], native.FOLLOWUP_REPLY)
+        body["messages"].pop(1)
+        with self.assertRaises(urllib.error.HTTPError):
+            self.post(body)
+        self.assertEqual(self.server.invalid_requests, 1)
+
     def test_minimal_settings_probe_is_separate_and_has_no_history(self):
         body = {"model": "native-fixture-model", "stream": True,
                 "messages": [{"role": "user", "content": "Reply with OK."}]}
@@ -343,7 +355,7 @@ class NativeHelperTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "preexisting history row"):
                 native.verify_history_upgrade(root, rows)
 
-    def test_v012_history_upgrade_rejects_schema_change_missing_or_empty_rows(self):
+    def test_v013_history_upgrade_rejects_schema_change_missing_or_empty_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             with sqlite3.connect(root / "history.sqlite3") as connection:
@@ -375,7 +387,7 @@ class NativeHelperTests(unittest.TestCase):
             profile.chmod(0o600)
             expected = {"profile_schema_version": 2, "profile_file_sha256": native.hashlib.sha256(original).hexdigest()}
             native.verify_current_profile_upgrade(root, expected)
-            with self.assertRaisesRegex(AssertionError, "real v0.1.2 profiles"):
+            with self.assertRaisesRegex(AssertionError, "real v0.1.3 profiles"):
                 native.verify_current_profile_upgrade(root, dict(expected, profile_schema_version=1))
             profile.chmod(0o644)
             with self.assertRaisesRegex(AssertionError, "owner-only"):

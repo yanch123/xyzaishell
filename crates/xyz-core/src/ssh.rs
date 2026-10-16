@@ -366,30 +366,17 @@ impl SessionManager {
     pub fn shell_integration(&self) -> crate::shell_integration::ShellIntegrationService {
         self.inner.shell_integration.clone()
     }
+    /// Compatibility endpoint: preparation belongs to connection startup now.
+    /// Never inject setup into an existing foreground, even if a stale client
+    /// submits its old readiness checkbox.
     pub async fn install_shell_integration(
         &self,
         session: &SessionRef,
-        readiness_confirmed: bool,
+        _readiness_confirmed: bool,
     ) -> Result<crate::shell_integration::IntegrationStatus, ApiError> {
-        let snapshot = {
+        {
             let state = self.lock();
             require_connected(&state, session)?;
-            state.snapshot.clone()
-        };
-        if let Some(bootstrap) = self
-            .inner
-            .shell_integration
-            .confirm_install(snapshot, readiness_confirmed)?
-        {
-            if let Err(error) = self
-                .write(session, &STANDARD.encode(bootstrap.as_bytes()))
-                .await
-            {
-                self.inner
-                    .shell_integration
-                    .fail_install(session, error.clone());
-                return Err(error);
-            }
         }
         Ok(self.inner.shell_integration.status())
     }
@@ -892,18 +879,45 @@ impl SessionManager {
             .map_err(|_| ApiError::new("SSH_PTY_FAILED", "Unable to request a terminal."))?;
         self.wait_request_success(session_ref, &mut channel, output_seq, "SSH_PTY_FAILED")
             .await?;
-        channel.request_shell(true).await.map_err(|_| {
-            ApiError::new(
-                "SSH_SHELL_FAILED",
-                "Unable to request an interactive shell.",
-            )
-        })?;
-        self.wait_request_success(session_ref, &mut channel, output_seq, "SSH_SHELL_FAILED")
-            .await?;
+        // Register the protocol BEFORE any startup output can arrive. The code
+        // is the command of this visible PTY, never data written to its stdin.
+        let startup = self.inner.shell_integration.prepare_startup(session_ref)?;
+        channel
+            .exec(true, startup.as_bytes())
+            .await
+            .map_err(|_| ApiError::new("SSH_SHELL_FAILED", "无法启动当前终端的交互 Shell。"))?;
+        if !self
+            .wait_exec_success(session_ref, &mut channel, output_seq)
+            .await?
+        {
+            // An explicit refusal proves that this exec request did not start.
+            // Only then may we request the ordinary manual shell on SAME channel.
+            self.inner.shell_integration.startup_unavailable(
+                session_ref,
+                "SHELL_STARTUP_REFUSED",
+                "服务器不支持自动准备 Shell，已切换为手动终端。不会向终端输入启动脚本。",
+            );
+            channel
+                .request_shell(true)
+                .await
+                .map_err(|_| ApiError::new("SSH_SHELL_FAILED", "服务器拒绝打开手动终端。"))?;
+            self.wait_request_success(session_ref, &mut channel, output_seq, "SSH_SHELL_FAILED")
+                .await?;
+        }
         self.change_state(session_ref, SessionState::Connected, None)?;
         let mut transport_seq = 0u64;
+        // A silent startup/password prompt must still publish a terminal
+        // preparation timeout to watchers without sending any terminal input.
+        let preparation_deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(preparation_deadline);
+        let mut preparation_pending = true;
         loop {
             tokio::select! {
+                _ = &mut preparation_deadline, if preparation_pending => {
+                    preparation_pending = false;
+                    self.inner.shell_integration.status();
+                }
+
                 command = receiver.recv() => match command {
                     Some(Command::Write { data, reply }) => {
                         // The sole writer serializes frames; it does not arbitrate human/AI intent.
@@ -949,6 +963,42 @@ impl SessionManager {
         )
         .await;
         Ok(())
+    }
+    async fn wait_exec_success(
+        &self,
+        session: &SessionRef,
+        channel: &mut russh::Channel<client::Msg>,
+        seq: &mut u64,
+    ) -> Result<bool, ApiError> {
+        tokio::time::timeout(NETWORK_TIMEOUT, async {
+            loop {
+                match channel.wait().await {
+                    Some(ChannelMsg::Success) => return Ok(true),
+                    Some(ChannelMsg::Failure) => return Ok(false),
+                    None | Some(ChannelMsg::Close) => {
+                        return Err(ApiError::new(
+                            "SSH_SHELL_FAILED",
+                            "Shell 启动时连接已关闭；不会重试或注入输入。",
+                        ))
+                    }
+                    message => {
+                        if !self.handle_channel_message(session, message, seq).await? {
+                            return Err(ApiError::new(
+                                "SSH_SHELL_FAILED",
+                                "Shell 启动时连接已关闭。",
+                            ));
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                "SSH_SHELL_FAILED",
+                "服务器未确认 Shell 启动；结果未知，不会自动重试。",
+            )
+        })?
     }
     async fn wait_request_success(
         &self,

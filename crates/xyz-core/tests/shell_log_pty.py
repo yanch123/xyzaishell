@@ -11,6 +11,8 @@ import unittest
 import subprocess
 import shlex
 import sys
+import os
+import tempfile
 import pexpect
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -18,6 +20,9 @@ NONCE = '0123456789abcdef0123456789abcdef'
 SOURCE = (ROOT / 'crates/xyz-core/src/shell_log_bootstrap.bash').read_text().replace('@NONCE@', NONCE)
 BOOTSTRAP = subprocess.check_output(
     ['cargo', 'run', '-p', 'xyz-core', '--locked', '--quiet', '--example', 'shell_log_bootstrap'], cwd=ROOT,
+).decode('utf-8')
+STARTUP = subprocess.check_output(
+    ['cargo', 'run', '-p', 'xyz-core', '--locked', '--quiet', '--example', 'shell_log_bootstrap', '--', '--startup'], cwd=ROOT,
 ).decode('utf-8')
 FRAME = re.compile(rb'\x1b\]777;xyzlog;2;' + NONCE.encode() + rb';([^\x07]*)\x07')
 PROMPT = b'XYZ_PTY> '
@@ -213,6 +218,120 @@ class CurrentShellContract(unittest.TestCase):
                 if command.startswith('exit'):
                     self.assertIn(b'PRESERVED_EXIT_TRAP', s.p.before)
 
+
+
+class ControlledStartupContract(unittest.TestCase):
+    def launch(self, rc='', account_shell='/bin/bash'):
+        home = tempfile.TemporaryDirectory(prefix='xyz-startup-')
+        self.addCleanup(home.cleanup)
+        path = pathlib.Path(home.name)
+        setup = "HISTFILE=; HISTCONTROL=ignoreboth; HISTIGNORE=; HISTSIZE=1000; shopt -s cmdhist promptvars interactive_comments; PS1='XYZ_PTY> '; PS2='CONT> '\n"
+        (path / '.bashrc').write_text(setup + rc + '\n')
+        (path / '.bash_profile').write_text('printf LOGIN_PROFILE_SHOULD_NOT_RUN\n')
+        before = (path / '.bashrc').read_bytes()
+        process = pexpect.spawn('/bin/sh', ['-c', STARTUP],
+            env=dict(os.environ, HOME=home.name, SHELL=account_shell),
+            encoding=None, timeout=5, echo=False)
+        self.addCleanup(process.close, force=True)
+        return process, path, before
+
+    def test_ephemeral_rc_survives_exec_preserves_startup_aliases_and_hooks(self):
+        p, path, before = self.launch("alias zz='printf STARTUP_ALIAS'; ff(){ return 23; }; PROMPT_COMMAND='printf STARTUP_HOOK'; printf RC_FINISHED")
+        p.expect_exact(PROMPT)
+        initial = p.before
+        self.assertEqual([f[0] for f in frames(initial)], [b'H', b'R'])
+        self.assertLess(initial.index(b'RC_FINISHED'), initial.index(b';H;'))
+        self.assertLess(initial.index(b'STARTUP_HOOK'), initial.index(b';R;'))
+        self.assertNotIn(b'LOGIN_PROFILE_SHOULD_NOT_RUN', initial)
+        p.sendline(b'zz; ff # xyz-action:first')
+        p.expect_exact(PROMPT)
+        result = p.before
+        self.assertIn(b'STARTUP_ALIAS', result)
+        self.assertEqual([f[0] for f in frames(result)], [b'B', b'E', b'R'])
+        self.assertEqual(frames(result)[1][3], b'23')
+        self.assertEqual((path / '.bashrc').read_bytes(), before)
+        self.assertEqual(sorted(f.name for f in path.iterdir()), ['.bash_profile', '.bashrc'])
+
+    def test_bash_history_default_after_rc_is_observed_not_assigned(self):
+        for setting in ['', 'unset HISTSIZE']:
+            with self.subTest(setting=setting):
+                p, path, _ = self.launch()
+                # This separate launch exercises truly minimal startup settings.
+                p.close(force=True)
+                (path / '.bashrc').write_text("HISTFILE=; PS1='XYZ_PTY> '; " + setting + "\n")
+                p = pexpect.spawn('/bin/sh', ['-c', STARTUP],
+                    env=dict(os.environ, HOME=str(path), SHELL='/bin/bash'),
+                    encoding=None, timeout=5, echo=False)
+                self.addCleanup(p.close, force=True)
+                p.expect_exact(PROMPT)
+                self.assertEqual([f[0] for f in frames(p.before)], [b'H', b'R'])
+                p.sendline(b"printf 'HISTORY_LIMIT:%s\\n' \"$HISTSIZE\"")
+                p.expect_exact(PROMPT)
+                self.assertIn(b'HISTORY_LIMIT:500', p.before)
+                self.assertEqual([f[0] for f in frames(p.before)], [b'B', b'E', b'R'])
+
+    def test_absent_rc_uses_normal_bash_defaults(self):
+        p, path, _ = self.launch()
+        p.close(force=True)
+        (path / '.bashrc').unlink()
+        p = pexpect.spawn('/bin/sh', ['-c', STARTUP],
+            env=dict(os.environ, HOME=str(path), SHELL='/bin/bash', HISTFILE=''),
+            encoding=None, timeout=5, echo=False)
+        self.addCleanup(p.close, force=True)
+        p.expect(FRAME)
+        self.assertTrue(p.match.group(1).startswith(b'H;'))
+        self.assertNotIn(b'LOGIN_PROFILE_SHOULD_NOT_RUN', p.before)
+        p.expect(FRAME)
+        self.assertTrue(p.match.group(1).startswith(b'R;0;'))
+
+    def test_explicit_history_limits_are_never_overridden(self):
+        for value in ['0', '', 'invalid']:
+            with self.subTest(value=value):
+                p, _, _ = self.launch('HISTSIZE=' + shlex.quote(value))
+                p.expect_exact(PROMPT)
+                self.assertEqual(frames(p.before), [[b'U', b'unsupported_options']])
+                p.sendline(b"printf 'HISTORY_LIMIT:<%s>\\n' \"$HISTSIZE\"")
+                p.expect_exact(PROMPT)
+                self.assertIn(('HISTORY_LIMIT:<' + value + '>').encode(), p.before)
+                self.assertEqual(frames(p.before), [])
+
+    def test_startup_password_read_gets_no_automatic_input(self):
+        p, _, _ = self.launch('read -r -s -p STARTUP_PASSWORD answer; [[ $answer == SYNTHETIC_SECRET ]] && printf STARTUP_ACCEPTED')
+        p.expect_exact(b'STARTUP_PASSWORD')
+        self.assertEqual(frames(p.before), [])
+        self.assertEqual(p.expect([pexpect.TIMEOUT, pexpect.EOF], timeout=0.25), 0)
+        self.assertEqual(frames(p.before), [])
+        p.sendline(b'SYNTHETIC_SECRET')  # Explicit human fixture input only.
+        p.expect_exact(PROMPT)
+        self.assertIn(b'STARTUP_ACCEPTED', p.before)
+        self.assertNotIn(b'SYNTHETIC_SECRET', p.before)
+        self.assertEqual([f[0] for f in frames(p.before)], [b'H', b'R'])
+
+    def test_startup_foreground_program_is_not_injected_and_disconnect_is_safe(self):
+        helper = 'import sys; print("STARTUP_PROGRAM", flush=True); value=sys.stdin.readline(); print("RECEIVED:"+value, flush=True)'
+        p, _, _ = self.launch(shlex.quote(sys.executable) + ' -c ' + shlex.quote(helper))
+        p.expect_exact(b'STARTUP_PROGRAM\r\n')
+        self.assertEqual(frames(p.before), [])
+        self.assertEqual(p.expect([pexpect.TIMEOUT, pexpect.EOF], timeout=0.25), 0)
+        p.close(force=True)
+        self.assertFalse(p.isalive())
+
+    def test_unsupported_account_shell_remains_manual_on_same_pty(self):
+        p, _, _ = self.launch(account_shell='/bin/sh')
+        p.expect(FRAME)
+        self.assertEqual(p.match.group(1), b'U;unsupported_bash')
+        p.sendline(b"printf 'MANUAL_%s\\n' WORKS")
+        p.expect_exact(b'MANUAL_WORKS\r\n')
+        self.assertEqual(frames(p.before), [])
+
+    def test_unsupported_startup_settings_preserve_manual_shell(self):
+        p, _, _ = self.launch("trap 'true' DEBUG; alias zz='printf PRESERVED_ALIAS'")
+        p.expect_exact(PROMPT)
+        self.assertEqual(frames(p.before), [[b'U', b'unsupported_trap']])
+        p.sendline(b'zz')
+        p.expect_exact(PROMPT)
+        self.assertIn(b'PRESERVED_ALIAS', p.before)
+        self.assertEqual(frames(p.before), [])
 
 if __name__ == '__main__':
     if len(BOOTSTRAP.encode()) >= 16384:

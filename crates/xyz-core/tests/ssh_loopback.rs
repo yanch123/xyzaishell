@@ -232,12 +232,26 @@ async fn explicit_host_trust_then_same_pty_binary_io_resize_and_disconnect() {
     assert_eq!(trace.channels.len(), 1);
     let channel = trace.channels[0];
     assert_eq!(trace.ptys, [(channel, "xterm-256color".into(), 80, 24)]);
-    assert_eq!(trace.shells, [channel]);
+    assert!(trace.shells.is_empty());
+    assert_eq!(trace.exec_commands.len(), 1);
+    assert_eq!(trace.exec_commands[0].0, channel);
+    let nonce = client
+        .manager
+        .shell_integration()
+        .status()
+        .shell_id
+        .unwrap();
+    assert_eq!(
+        trace.exec_commands[0].1,
+        xyz_core::shell_log_protocol::startup_command(&nonce)
+            .unwrap()
+            .as_bytes()
+    );
     assert_eq!(trace.input, [(channel, payload.to_vec())]);
     assert_eq!(trace.resizes, [(channel, 132, 47)]);
     assert_eq!(
-        trace.exec_requests, 0,
-        "all terminal traffic must use the visible shell PTY"
+        trace.exec_requests, 1,
+        "startup exec must use the sole visible terminal PTY"
     );
     client.disconnect(&session).await;
     assert_eq!(
@@ -344,7 +358,7 @@ async fn server_pty_rejection_is_not_reported_as_connected() {
     refused_startup(
         Behavior {
             accept_pty: false,
-            accept_shell: true,
+            ..Behavior::default()
         },
         "SSH_PTY_FAILED",
         false,
@@ -357,6 +371,7 @@ async fn server_shell_rejection_is_not_reported_as_connected() {
     refused_startup(
         Behavior {
             accept_pty: true,
+            accept_exec: false,
             accept_shell: false,
         },
         "SSH_SHELL_FAILED",
@@ -463,7 +478,8 @@ async fn one_live_session_reconnects_with_new_identity_and_rejects_stale_request
     assert_eq!(&client.output[BANNER.len()..], b"current input");
     let trace = server.trace();
     assert_eq!(trace.connections, 2);
-    assert_eq!(trace.shells.len(), 2);
+    assert!(trace.shells.is_empty());
+    assert_eq!(trace.exec_requests, 2);
     assert_eq!(trace.input.len(), 1);
     client.disconnect(&second).await;
 }
@@ -764,8 +780,9 @@ async fn private_key_authentication(encrypt: bool) {
     assert_eq!(trace.public_key_authentications, 1);
     assert_eq!(trace.channels.len(), 1);
     assert_eq!(trace.ptys.len(), 1);
-    assert_eq!(trace.shells.len(), 1);
-    assert_eq!(trace.exec_requests, 0);
+    assert!(trace.shells.is_empty());
+    assert_eq!(trace.exec_requests, 1);
+    assert_eq!(trace.exec_commands[0].0, trace.channels[0]);
     let events = serde_json::to_string(&client.events).unwrap();
     assert!(!events.contains(passphrase));
     assert!(!events.contains("OPENSSH PRIVATE KEY"));
@@ -912,4 +929,126 @@ async fn unavailable_persistent_trust_never_falls_back_or_authenticates() {
         .events
         .iter()
         .any(|event| matches!(event, SshEvent::HostKey { .. })));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_exec_rejection_falls_back_on_same_pty_without_bootstrap_input() {
+    let server = LoopbackServer::start(Behavior {
+        accept_exec: false,
+        ..Behavior::default()
+    })
+    .await;
+    let mut client = Client::new();
+    let session = client.trusted_connection(&server).await;
+    client.output_len(BANNER.len()).await;
+    let trace = server.trace();
+    assert_eq!(trace.channels.len(), 1);
+    assert_eq!(trace.ptys.len(), 1);
+    assert_eq!(trace.exec_requests, 1);
+    assert_eq!(trace.exec_commands[0].0, trace.channels[0]);
+    assert_eq!(trace.shells, trace.channels);
+    assert!(trace.input.is_empty());
+    assert!(client
+        .manager
+        .shell_integration()
+        .ready_snapshot(&session)
+        .is_err());
+    client
+        .manager
+        .write(&session, &STANDARD.encode(b"manual input\n"))
+        .await
+        .unwrap();
+    client
+        .output_len(BANNER.len() + b"manual input\n".len())
+        .await;
+    assert_eq!(
+        server.trace().input,
+        [(trace.channels[0], b"manual input\n".to_vec())]
+    );
+    client.disconnect(&session).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_prompt_or_interactive_read_never_proves_ready_or_receives_bootstrap() {
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let mut client = Client::new();
+    let session = client.trusted_connection(&server).await;
+    client.output_len(BANNER.len()).await;
+    server
+        .send_output(b"Password: startup read is waiting\r\n$ ".to_vec())
+        .await;
+    client
+        .output_len(BANNER.len() + b"Password: startup read is waiting\r\n$ ".len())
+        .await;
+    assert!(client
+        .manager
+        .shell_integration()
+        .ready_snapshot(&session)
+        .is_err());
+    // Compatibility endpoint cannot send old installation text into a read.
+    let _ = client
+        .manager
+        .install_shell_integration(&session, true)
+        .await;
+    assert!(server.trace().input.is_empty());
+    assert_eq!(server.trace().exec_requests, 1);
+    assert!(server.trace().shells.is_empty());
+    client.disconnect(&session).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_startup_remains_manual_without_relaunch_or_stdin_repair() {
+    use xyz_core::shell_integration::IntegrationPhase;
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let mut client = Client::new();
+    let session = client.trusted_connection(&server).await;
+    client.output_len(BANNER.len()).await;
+    let shell_id = client
+        .manager
+        .shell_integration()
+        .status()
+        .shell_id
+        .unwrap();
+    let marker = format!("\x1b]777;xyzlog;2;{shell_id};U;unsupported_bash\x07");
+    server.send_output(marker.as_bytes().to_vec()).await;
+    client.output_len(BANNER.len() + marker.len()).await;
+    assert_eq!(
+        client.manager.shell_integration().status().phase,
+        IntegrationPhase::Unsupported
+    );
+    assert!(client
+        .manager
+        .shell_integration()
+        .ready_snapshot(&session)
+        .is_err());
+    assert!(server.trace().input.is_empty());
+    client
+        .manager
+        .write(&session, &STANDARD.encode(b"manual\n"))
+        .await
+        .unwrap();
+    client
+        .output_len(BANNER.len() + marker.len() + b"manual\n".len())
+        .await;
+    assert_eq!(server.trace().input.len(), 1);
+    assert_eq!(server.trace().exec_requests, 1);
+    assert!(server.trace().shells.is_empty());
+    client.disconnect(&session).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_startup_exit_does_not_request_another_shell() {
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let mut client = Client::new();
+    client.trusted_connection(&server).await;
+    client.output_len(BANNER.len()).await;
+    server
+        .finish_shell(b"startup exited\r\n".to_vec(), 42)
+        .await;
+    client.state(SessionState::Disconnected).await;
+    let trace = server.trace();
+    assert_eq!(trace.channels.len(), 1);
+    assert_eq!(trace.exec_requests, 1);
+    assert!(trace.shells.is_empty());
+    assert!(trace.input.is_empty());
 }

@@ -52,6 +52,7 @@ test('synthetic IPC mock: explicit recipient consent and escaped streamed text',
     const listeners = new Map<string, Set<number>>();
     const calls: string[] = [];
     let nextId = 1;
+    let turns = 0;
     const config = { path: '/synthetic-preview/model.toml', revision: '1', ready: true, destination: 'https://provider.example.invalid/v1/chat/completions', model: 'synthetic-preview-model', consented: false, error: null, warning: null, context_policy: 'explicit_chat_only', persistence: 'memory_only' };
     const chat = { chat_id: 'preview-chat', task_id: 'preview-chat', title: '新任务', revision: '1', active_run_id: null as string | null, messages: [] as Array<{ id: string; role: string; text: string; run_id: string; state: string; error: null; model?: string; destination?: string }> };
     const emit = (event: string, payload: unknown) => listeners.get(event)?.forEach(id => callbacks.get(id)?.({ event, id, payload: structuredClone(payload) }));
@@ -74,31 +75,37 @@ test('synthetic IPC mock: explicit recipient consent and escaped streamed text',
         if (cmd === 'get_model_config_status') return structuredClone(config);
         if (cmd === 'list_chats') return [structuredClone(chat)];
         if (cmd === 'get_chat') return structuredClone(chat);
-        if (cmd === 'confirm_model_destination') {
-          if (args.revision !== config.revision || args.destination !== config.destination) throw new Error('Stale preview consent');
+        if (cmd === 'confirm_conversation_scope') {
+          const request = args.request as Record<string, unknown>;
+          if (request.session !== null || request.revision !== config.revision || request.destination !== config.destination) throw new Error('Stale preview consent');
           config.revision = '2'; config.consented = true; emit('model:event', { kind: 'config_updated', config }); return structuredClone(config);
         }
-        if (cmd === 'send_chat_message') {
+        if (cmd === 'submit_conversation_turn') {
           if (!config.consented) throw new Error('Preview consent is required');
-          chat.revision = '2'; chat.title = '解释一个只读检查步骤'; chat.active_run_id = 'preview-run';
-          chat.messages = [
-            { id: 'preview-user', role: 'user', text: String(args.text), run_id: 'preview-run', state: 'complete', error: null },
-            { id: 'preview-assistant', role: 'assistant', text: '', run_id: 'preview-run', state: 'streaming', error: null, model: config.model, destination: config.destination },
-          ];
-          setTimeout(() => { chat.revision = '3'; chat.messages[1].text = '这是用于界面测试的合成流式回复。\n\n<script>window.unsafe = true</script>\n\n没有连接或操作任何服务器。'; chat.messages[1].state = 'complete'; chat.active_run_id = null; emit('model:event', { kind: 'chat_updated', chat }); }, 250);
-          return structuredClone(chat);
+          if (args.session !== null) throw new Error('Greeting must work without SSH');
+          turns += 1;
+          if (turns === 2 && chat.messages[1]?.state !== 'complete') throw new Error('Previous turn missing');
+          chat.revision = String(Number(chat.revision) + 1); chat.title = '你好'; chat.active_run_id = `preview-run-${turns}`;
+          chat.messages.push(
+            { id: `preview-user-${turns}`, role: 'user', text: String(args.text), run_id: chat.active_run_id, state: 'complete', error: null },
+            { id: `preview-assistant-${turns}`, role: 'assistant', text: '', run_id: chat.active_run_id, state: 'streaming', error: null, model: config.model, destination: config.destination },
+          );
+          setTimeout(() => { chat.revision = String(Number(chat.revision) + 1); chat.messages[chat.messages.length - 1].text = '这是用于界面测试的合成流式回复。\n\n<script>window.unsafe = true</script>\n\n没有连接或操作任何服务器。'; chat.messages[chat.messages.length - 1].state = 'complete'; chat.active_run_id = null; emit('model:event', { kind: 'chat_updated', chat }); }, 250);
+          return { kind: 'chat', chat: structuredClone(chat) };
         }
         throw new Error(`Unexpected synthetic IPC command: ${cmd}`);
       },
     };
   });
   await page.goto('/');
-  await page.getByRole('textbox', { name: '聊天消息' }).fill('解释一个只读检查步骤。');
+  await expect(page.getByRole('tab', { name: '执行终端任务' })).toHaveCount(0);
+  await expect(page.getByRole('textbox', { name: '终端任务指令' })).toHaveCount(0);
+  await page.getByRole('textbox', { name: '聊天消息' }).fill('你好');
   await page.getByRole('button', { name: '确认并发送', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '确认模型接收方' });
   await expect(dialog.getByText('https://provider.example.invalid/v1/chat/completions')).toBeVisible();
   await expect(dialog.getByRole('button', { name: '同意并发送' })).toBeDisabled();
-  expect(await page.evaluate(() => (window as unknown as { __SYNTHETIC_IPC_CALLS__: string[] }).__SYNTHETIC_IPC_CALLS__.includes('send_chat_message'))).toBe(false);
+  expect(await page.evaluate(() => (window as unknown as { __SYNTHETIC_IPC_CALLS__: string[] }).__SYNTHETIC_IPC_CALLS__.includes('submit_conversation_turn'))).toBe(false);
   await page.screenshot({ path: testInfo.outputPath('synthetic-ipc-consent.png'), fullPage: true });
   await dialog.getByRole('checkbox').check(); await dialog.getByRole('button', { name: '同意并发送' }).click();
   await expect(dialog).toBeHidden();
@@ -107,5 +114,14 @@ test('synthetic IPC mock: explicit recipient consent and escaped streamed text',
   expect(await page.evaluate(() => (window as unknown as { unsafe?: boolean }).unsafe)).toBeUndefined();
   await expect(page.getByText('无生成中的聊天')).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('synthetic-ipc-completed-chat.png'), fullPage: true });
+  await page.getByRole('textbox', { name: '聊天消息' }).fill('继续刚才的对话');
+  await page.getByRole('button', { name: '发送', exact: true }).click();
+  await expect(page.getByRole('article', { name: '模型回复' })).toHaveCount(2);
+  await expect(page.getByText('无生成中的聊天')).toBeVisible();
+  await expect(dialog).toBeHidden();
+  const calls = await page.evaluate(() => (window as unknown as { __SYNTHETIC_IPC_CALLS__: string[] }).__SYNTHETIC_IPC_CALLS__);
+  expect(calls.filter(cmd => cmd === 'confirm_conversation_scope')).toHaveLength(1);
+  expect(calls.filter(cmd => cmd === 'submit_conversation_turn')).toHaveLength(2);
+  expect(calls).not.toContain('start_terminal_task');
   expect(errors).toEqual([]);
 });

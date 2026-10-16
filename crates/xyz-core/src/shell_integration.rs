@@ -3,7 +3,7 @@
 //! authenticated audit. No observation text, prompt shape, or silence is readiness.
 use crate::{
     shell_log::ShellLogService,
-    shell_log_protocol::{bootstrap_command, ProtocolParser, WireEvent},
+    shell_log_protocol::{bootstrap_command, startup_command, ProtocolParser, WireEvent},
     ssh::{ApiError, SessionRef, SessionSnapshot, SessionState},
 };
 use serde::{Deserialize, Serialize};
@@ -126,35 +126,35 @@ fn unsupported_shell(reason: &str) -> ApiError {
     let (code, message) = match reason {
         "unsupported_bash" => (
             "SHELL_UNSUPPORTED_BASH",
-            "Task integration requires an interactive Bash 5.1 or 5.2 prompt. Use the manual terminal, or open a supported Bash session yourself and reconnect before confirming an idle prompt. No shell settings were changed.",
+            "自动执行需要交互式 Bash 5.1 或 5.2。当前环境不受支持，请继续使用手动终端；未修改 Shell 设置。",
         ),
         "namespace_conflict" => (
             "SHELL_UNSUPPORTED_NAMESPACE",
-            "The current shell already defines a variable, function, or alias beginning with __xyz_. Use the manual terminal or review the conflict in a fresh session yourself, then reconnect. Existing definitions were preserved.",
+            "Shell 已定义 __xyz_ 开头的变量、函数或别名。为保留现有定义，已停止自动准备；可继续使用手动终端。",
         ),
         "unsupported_options" => (
             "SHELL_UNSUPPORTED_OPTIONS",
-            "The shell options or history settings cannot safely track task commands. Integration requires history, cmdhist, promptvars and interactive_comments, positive HISTSIZE, empty HISTIGNORE and standard histchars; errexit, functrace, allexport, restricted mode, extdebug and POSIX mode are unsupported. Review these settings yourself or use the manual terminal. No options or history settings were changed.",
+            "当前 Shell 选项或历史设置不支持自动执行。需要开启 history、cmdhist、promptvars、interactive_comments，HISTSIZE 为正，HISTIGNORE 为空，histchars 为默认值；不支持 errexit、functrace、allexport、restricted、extdebug 或 POSIX 模式。设置未改动，可继续使用手动终端。",
         ),
         "unsupported_trap" => (
             "SHELL_UNSUPPORTED_TRAP",
-            "The shell has a trap other than EXIT, which can interfere with command lifecycle evidence. Review the traps yourself or use the manual terminal; integration will not remove them. Existing traps were preserved.",
+            "Shell 存在 EXIT 之外的 trap，无法可靠识别命令状态。已有 trap 已保留，可继续使用手动终端。",
         ),
         "dynamic_prompt" => (
             "SHELL_UNSUPPORTED_DYNAMIC_PROMPT",
-            "PS1 contains a dynamic or unsupported prompt expansion, so the application cannot establish a safe ready boundary. Use the manual terminal or choose a simple non-executing prompt yourself in a fresh supported session. The existing prompt was preserved.",
+            "PS1 包含动态或不支持的提示符展开，无法可靠确认 Shell 已就绪。原提示符已保留，可继续使用手动终端。",
         ),
         "unsupported_hook_attributes" => (
             "SHELL_UNSUPPORTED_HOOK_ATTRIBUTES",
-            "PROMPT_COMMAND or PS0 has unsupported variable attributes, such as readonly, export, nameref or an unsupported array type. Review the hook declarations yourself or use the manual terminal. Existing hooks and attributes were preserved.",
+            "PROMPT_COMMAND 或 PS0 包含不支持的属性，例如 readonly、export、nameref 或数组类型。原 hooks 和属性已保留，可继续使用手动终端。",
         ),
         "missing_tools" => (
             "SHELL_UNSUPPORTED_MISSING_TOOLS",
-            "The current shell cannot find base64, which is required for bounded command metadata. Ask the server administrator to make it available, or use the manual terminal. The application did not install software or change PATH.",
+            "Shell 找不到命令状态识别所需的 base64。未安装软件或修改 PATH，可继续使用手动终端。",
         ),
         _ => (
             "SHELL_UNSUPPORTED",
-            "The shell reported an unrecognized integration limitation. Use the manual terminal and review the supported Bash requirements before reconnecting. No automatic repair or retry was attempted.",
+            "Shell 报告了未识别的准备限制。未自动修复或重试，可继续使用手动终端。",
         ),
     };
     error(code, message)
@@ -236,7 +236,7 @@ impl ShellIntegrationService {
     pub fn status(&self) -> IntegrationStatus {
         let mut c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if c.deadline.is_some_and(|d| Instant::now() >= d) {
-            self.unknown(&mut c, "SHELL_INTEGRATION_TIMEOUT", "The current-shell handshake or first ready boundary did not arrive. Automatic input stopped; verify the foreground before any recovery.");
+            self.unknown(&mut c, "SHELL_INTEGRATION_TIMEOUT", "Shell 启动未在期限内完成。自动输入已停止；请查看终端，登录或启动程序可能正在等待手动处理。");
         }
         c.status.clone()
     }
@@ -251,13 +251,37 @@ impl ShellIntegrationService {
             .session
             .filter(|_| snapshot.state == SessionState::Connected)
             .ok_or_else(|| error("SHELL_INTEGRATION_SESSION", "Connect a terminal first."))?;
+        if !readiness_confirmed {
+            let status = self.status();
+            if status.session.as_ref() == Some(&session) && status.phase == IntegrationPhase::Ready
+            {
+                return Ok(None);
+            }
+            return Err(error("SHELL_INTEGRATION_CONFIRMATION", "Confirm that the current foreground is an idle supported Bash prompt before installing temporary hooks."));
+        }
+        self.prepare_install(session, false)
+    }
+    /// Reserve the protocol before the connection actor requests its controlled
+    /// PTY exec. This never asserts that an existing terminal is an idle shell.
+    pub(crate) fn prepare_startup(&self, session: &SessionRef) -> Result<String, ApiError> {
+        self.prepare_install(session.clone(), true)?.ok_or_else(|| {
+            error(
+                "SHELL_INTEGRATION_ALREADY_ATTEMPTED",
+                "此连接已尝试准备 Shell；不会重复发送启动命令。",
+            )
+        })
+    }
+    fn prepare_install(
+        &self,
+        session: SessionRef,
+        startup: bool,
+    ) -> Result<Option<String>, ApiError> {
         let mut c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if c.status.session.as_ref() == Some(&session) && c.status.phase == IntegrationPhase::Ready
+        if !startup
+            && c.status.session.as_ref() == Some(&session)
+            && c.status.phase == IntegrationPhase::Ready
         {
             return Ok(None);
-        }
-        if !readiness_confirmed {
-            return Err(error("SHELL_INTEGRATION_CONFIRMATION", "Confirm that the current foreground is an idle supported Bash prompt before installing temporary hooks."));
         }
         let key = (session.session_id.clone(), session.generation.clone());
         if c.attempted.contains(&key) {
@@ -270,7 +294,12 @@ impl ShellIntegrationService {
             ));
         }
         let nonce = Uuid::new_v4().simple().to_string();
-        let bootstrap = bootstrap_command(&nonce).map_err(|_| {
+        let bootstrap = (if startup {
+            startup_command(&nonce)
+        } else {
+            bootstrap_command(&nonce)
+        })
+        .map_err(|_| {
             error(
                 "SHELL_INTEGRATION_BOOTSTRAP",
                 "Cannot prepare the current-shell integration.",
@@ -295,6 +324,12 @@ impl ShellIntegrationService {
         self.publish(&mut c);
         Ok(Some(bootstrap))
     }
+    pub(crate) fn startup_unavailable(&self, session: &SessionRef, code: &str, message: &str) {
+        let mut c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if c.status.session.as_ref() == Some(session) {
+            self.unknown(&mut c, code, message);
+        }
+    }
     pub fn fail_install(&self, session: &SessionRef, _cause: ApiError) {
         let mut c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if c.status.session.as_ref() == Some(session) {
@@ -306,7 +341,7 @@ impl ShellIntegrationService {
         if s.session.as_ref() != Some(session) || s.phase != IntegrationPhase::Ready {
             return Err(error(
                 "SHELL_NOT_READY",
-                "A separate current-shell ready event is required before automatic input.",
+                "Shell 尚未确认就绪，请查看终端启动状态；自动输入不会发送到正在等待输入的程序。",
             ));
         }
         Ok(ReadyBinding {
@@ -412,7 +447,7 @@ impl ShellIntegrationService {
             if c.deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
-                self.unknown(&mut c, "SHELL_INTEGRATION_TIMEOUT", "The current-shell installation timed out. Late metadata cannot restore readiness; check the manual terminal.");
+                self.unknown(&mut c, "SHELL_INTEGRATION_TIMEOUT", "Shell 准备超时，自动输入已停止。迟到的启动信息不会重新启用执行；请查看手动终端。");
             }
             if c.parser_session
                 .as_ref()

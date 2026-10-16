@@ -11,5 +11,6 @@
 1. [需求与交互](01-requirements-and-interaction.md)
 2. [架构与接口](02-architecture-and-contracts.md)
 3. [验收与交付](03-acceptance-and-delivery.md)
+4. [完整使用指南](05-user-guide.md)
 
 一个进程一条 SSH／一个可见 PTY、多聊天共享单 AI 写入者、无文件传输、无本机 Shell、无 Skills 的范围不变。主 README 继续只写使用方法。旧版指南保留原版本语义。

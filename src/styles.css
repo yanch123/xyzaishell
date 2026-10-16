@@ -32,3 +32,8 @@ select { width: 100%; padding: 9px 10px; color: var(--text-primary, #e5e7eb); ba
   .chat-pane.execution-mode .task-composer-shell textarea{height:52px;min-height:52px;max-height:90px;padding:8px 10px 4px}
   .chat-pane.execution-mode .task-composer-shell .composer-toolbar{padding:4px 7px 6px}
 }
+
+/* Unified conversation: execution evidence shares the transcript, one composer. */
+.conversation-task-timeline { min-width: 0; }
+.conversation-task-timeline .terminal-task { padding: 16px 14px; }
+.connection-shell-notice { color: var(--muted); font-size: 12px; line-height: 1.6; }

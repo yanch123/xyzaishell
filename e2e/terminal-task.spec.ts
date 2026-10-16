@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-test('synthetic terminal task: consent, painted command, approval and honest unknown completion', async ({ page }, testInfo) => {
+test('synthetic unified task: scope consent, painted command, approval and honest unknown completion', async ({ page }, testInfo) => {
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.addInitScript(() => {
@@ -8,7 +8,7 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
     const listeners = new Map<string, Set<number>>();
     const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
     let nextId = 1;
-    const config = { path: '/synthetic-preview/model.toml', revision: '1', ready: true, destination: 'https://provider.example.invalid/v1/chat/completions', model: 'synthetic-preview-model', consented: true, error: null, warning: null, context_policy: 'explicit_chat_only', persistence: 'memory_only' };
+    const config = { path: '/synthetic-preview/model.toml', revision: '1', ready: true, destination: 'https://provider.example.invalid/v1/chat/completions', model: 'synthetic-preview-model', consented: false, error: null, warning: null, context_policy: 'explicit_chat_only', persistence: 'memory_only' };
     const session = { session_id: 'synthetic-ssh', generation: '1' };
     const chat = { chat_id: 'synthetic-chat', task_id: 'synthetic-chat', title: '新任务', revision: '1', active_run_id: null, messages: [] };
     type Action = { action_id: string; display_revision: string; command_text: string; append_enter: boolean; digest: string; policy: string; reason: string; approval_id: string | null; expires_at_unix_ms: number; displayed: boolean; delivery: string };
@@ -39,12 +39,15 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
         if (cmd === 'list_terminal_tasks') return task ? [structuredClone(task)] : [];
         if (cmd === 'get_terminal_task') return structuredClone(task);
         const request = args.request as Record<string, unknown> | undefined;
-        if (cmd === 'start_terminal_task') {
-          const consent = request?.context_consent as Record<string, unknown>;
-          if (request?.readiness_confirmed !== true || consent?.revision !== config.revision || consent?.destination !== config.destination) throw new Error('Missing per-run consent/readiness');
-          task = { chat_id: chat.chat_id, task_id: chat.task_id, run_id: 'synthetic-run', session, target: { host: 'synthetic-server.invalid', username: 'synthetic-user', port: 22 }, revision: '1', phase: 'awaiting_display', instruction: String(request.instruction), assistant_text: '<script>window.unsafe = true</script> 合成模型分析，仅验证界面。', action: { action_id: 'synthetic-action-1', display_revision: '1', command_text: 'uname -a', append_enter: true, digest: 'synthetic-binding-1', policy: 'auto_read_only', reason: '合成测试：基础策略允许。', approval_id: null, expires_at_unix_ms: Date.now() + 120000, displayed: false, delivery: 'not_sent' }, actions: [], error: null, owner: true, remote_outcome: 'not_sent', terminal_ready: true, round: 1 };
+        if (cmd === 'confirm_conversation_scope') {
+          if (JSON.stringify(request?.session) !== JSON.stringify(session) || request?.revision !== config.revision || request?.destination !== config.destination) throw new Error('Missing target scope');
+          config.consented = true; return structuredClone(config);
+        }
+        if (cmd === 'submit_conversation_turn') {
+          if (!config.consented || args.revision !== config.revision || JSON.stringify(args.session) !== JSON.stringify(session)) throw new Error('Missing scope consent');
+          task = { chat_id: chat.chat_id, task_id: chat.task_id, run_id: 'synthetic-run', session, target: { host: 'synthetic-server.invalid', username: 'synthetic-user', port: 22 }, revision: '1', phase: 'awaiting_display', instruction: String(args.text), assistant_text: '<script>window.unsafe = true</script> 合成模型分析，仅验证界面。', action: { action_id: 'synthetic-action-1', display_revision: '1', command_text: 'uname -a', append_enter: true, digest: 'synthetic-binding-1', policy: 'auto_read_only', reason: '合成测试：基础策略允许。', approval_id: null, expires_at_unix_ms: Date.now() + 120000, displayed: false, delivery: 'not_sent' }, actions: [], error: null, owner: true, remote_outcome: 'not_sent', terminal_ready: true, round: 1 };
           task.task_context = { task_id: task.task_id, run_id: task.run_id, session, summary: '合成任务摘要，仅测试界面', confirmed_facts: [], findings: [], hypotheses: [{ id: 'guess-1', text: '尚未核实系统版本', evidence_command_ids: [] }], remaining_steps: [{ id: 'step-1', text: '核查系统版本', status: 'pending', evidence_command_ids: [] }], evidence: [], truncated: false };
-          return update();
+          return { kind: 'terminal', task: update() };
         }
         if (cmd === 'ack_terminal_action' && task) {
           const card = document.querySelector(`[data-action-id="${task.action.action_id}"]`);
@@ -55,7 +58,8 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
           return update();
         }
         if (cmd === 'continue_terminal_task' && task) {
-          if (request?.readiness_confirmed !== true) throw new Error('Missing shell readiness');
+          // Compatibility field records this explicit recovery click; it is not ShellReady evidence.
+          if (request?.readiness_confirmed !== true) throw new Error('Missing explicit recovery request');
           task.actions.push(structuredClone(task.action)); task.round = 2; task.terminal_ready = true;
           task.phase = 'awaiting_display'; task.assistant_text = '第二轮合成分析：需要单次授权。';
           task.action = { ...task.action, action_id: 'synthetic-action-2', command_text: 'touch ./synthetic-marker', digest: 'synthetic-binding-2', policy: 'require_approval', reason: '将修改文件系统，需单次确认。', approval_id: 'synthetic-approval-2', displayed: false, delivery: 'not_sent' };
@@ -73,16 +77,15 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
     };
   });
   await page.goto('/');
-  await expect(page.getByRole('button', { name: '命令识别已就绪', exact: true })).toBeVisible();
-  await page.getByRole('tab', { name: '执行终端任务' }).click();
-  await page.getByRole('textbox', { name: '终端任务指令' }).fill('执行合成检查任务，不连接真实服务器。');
-  await page.getByRole('button', { name: '核对并开始执行' }).click();
-  const dialog = page.getByRole('dialog', { name: '确认终端任务' });
+  await expect(page.getByRole('button', { name: '可执行 · Shell 已就绪', exact: true })).toBeVisible();
+  await expect(page.getByRole('tab', { name: '执行终端任务' })).toHaveCount(0);
+  await page.getByRole('textbox', { name: '聊天消息' }).fill('执行合成检查任务，不连接真实服务器。');
+  await page.getByRole('button', { name: '确认并发送', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '确认模型接收方' });
   await expect(dialog.getByText('https://provider.example.invalid/v1/chat/completions')).toBeVisible();
-  const launch = dialog.getByRole('button', { name: '同意并开始本次任务' });
+  const launch = dialog.getByRole('button', { name: '同意并发送' });
   await expect(launch).toBeDisabled();
   await expect(dialog.getByRole('checkbox')).toHaveCount(1);
-  await expect(dialog.getByText('命令状态识别已确认当前终端可接收命令。执行期间请避免手动输入与 AI 输入冲突。')).toBeVisible();
   await dialog.getByRole('checkbox').check();
   await expect(launch).toBeEnabled();
   await page.screenshot({ path: testInfo.outputPath('synthetic-task-consent.png'), fullPage: true });
@@ -90,7 +93,7 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
   const card = page.getByRole('group', { name: '精确终端命令' });
   // The compact window must leave enough actual task space to show both the
   // exact target and command. Do not bypass the production display-ACK gate.
-  await expect.poll(async () => (await page.locator('.execution-scroll').boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(220);
+  await expect.poll(async () => (await page.locator('.chat-scroll').boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(220);
   await card.locator('.action-target').scrollIntoViewIfNeeded();
   await expect(card.locator('.action-target')).toBeInViewport({ ratio: 1 });
   await expect(card.getByLabel('准确命令文本')).toBeInViewport({ ratio: 1 });
@@ -98,19 +101,22 @@ test('synthetic terminal task: consent, painted command, approval and honest unk
   await page.screenshot({ path: testInfo.outputPath('synthetic-task-dispatched.png'), fullPage: true });
   await expect(page.getByRole('article', { name: '任务模型分析' })).toContainText('<script>window.unsafe = true</script>');
   expect(await page.evaluate(() => (window as unknown as { unsafe?: boolean }).unsafe)).toBeUndefined();
-  const proceed = page.getByRole('button', { name: '确认就绪并继续分析' });
-  await expect(proceed).toBeDisabled();
-  await page.getByRole('checkbox', { name: '我已检查终端，并确认当前可接收下一步命令。' }).check(); await proceed.click();
+  const proceed = page.getByRole('button', { name: '核对状态并继续' });
+  await expect(proceed).toBeEnabled();
+  await expect(page.getByRole('checkbox', { name: '我已检查终端，并确认当前可接收下一步命令。' })).toHaveCount(0);
+  await proceed.click();
   await card.locator('.action-target').scrollIntoViewIfNeeded();
   await expect(card.locator('.action-target')).toBeInViewport({ ratio: 1 });
   await expect(card.getByLabel('准确命令文本')).toBeInViewport({ ratio: 1 });
   await expect(page.getByRole('button', { name: '仅批准这条命令' })).toBeEnabled();
   await expect(card.getByLabel('准确命令文本')).toHaveText('touch ./synthetic-marker');
   await page.screenshot({ path: testInfo.outputPath('synthetic-task-single-approval.png'), fullPage: true });
+  const beforeDecision = await page.evaluate(() => (window as unknown as { __SYNTHETIC_TASK_CALLS__: Array<{ cmd: string }> }).__SYNTHETIC_TASK_CALLS__);
+  expect(beforeDecision.filter(call => call.cmd === 'decide_terminal_action')).toHaveLength(0);
   await page.getByRole('button', { name: '拒绝本次命令' }).click();
   await expect(page.getByText('AI 已停止', { exact: true })).toBeVisible();
   const beforeInterrupt = await page.evaluate(() => (window as unknown as { __SYNTHETIC_TASK_CALLS__: Array<{ cmd: string }> }).__SYNTHETIC_TASK_CALLS__.map(call => call.cmd));
-  expect(beforeInterrupt.filter(cmd => cmd === 'start_terminal_task')).toHaveLength(1);
+  expect(beforeInterrupt.filter(cmd => cmd === 'submit_conversation_turn')).toHaveLength(1);
   expect(beforeInterrupt.filter(cmd => cmd === 'ack_terminal_action')).toHaveLength(2);
   expect(beforeInterrupt.filter(cmd => cmd === 'decide_terminal_action')).toHaveLength(1);
   expect(beforeInterrupt).not.toContain('send_user_input'); expect(beforeInterrupt).not.toContain('send_chat_message');

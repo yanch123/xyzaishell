@@ -118,13 +118,13 @@ export function ShellLogDialog({ native, snapshot, onClose, initialScope = { kin
       <p role="status">记录状态：{effectiveState ? labels[effectiveState] : native ? '正在读取' : '不可用'}{status?.reason && ` · ${status.reason}`}</p>
       {status?.error && <p role="alert" className="inline-error">{status.error.safe_message}</p>}
       {error && <p role="alert" className="inline-error">{error}</p>}
-      <details><summary>记录范围与启动说明</summary><p>使用当前交互 Bash 的显式 Shell 集成，不新建子 shell，不改变工作目录。当前支持 Bash 5.1 / 5.2；请先在工具栏启用命令状态识别并等待就绪，再在此处同意明文记录。只记录该 Shell 顶层命令；嵌套 Shell、不受支持的配置、hook 被修改或断线会造成记录缺口。这不是防篡改审计。暂停只影响日志记录，不关闭执行生命周期集成。</p></details>
-      {native && connected && !integrationReady && !status?.enabled && <p className="notice warning" role="status">开始记录前，请先通过工具栏“命令状态识别”启用识别，等待“命令识别已就绪”。此窗口只开启日志记录，不会启用或重装命令识别。</p>}
+      <details><summary>记录范围与启动说明</summary><p>使用连接时自动准备的当前交互 Bash 集成，不改变工作目录。当前支持 Bash 5.1 / 5.2；请等待工具栏显示“可执行 · Shell 已就绪”，再在此处同意明文记录。只记录该 Shell 顶层命令；嵌套 Shell、不受支持的配置、hook 被修改或断线会造成记录缺口。这不是防篡改审计。暂停只影响日志记录，不关闭执行生命周期集成。</p></details>
+      {native && connected && !integrationReady && !status?.enabled && <p className="notice warning" role="status">开始记录前，请等待自动准备完成，工具栏显示“可执行 · Shell 已就绪”。此窗口只开启日志记录，不会重装命令识别；不兼容或状态未知时请查看具体状态。</p>}
       {effectiveState !== 'recording' && effectiveState !== 'paused' && <div className="shell-log-consent">
         <label><input type="checkbox" checked={consent} disabled={!startable || busy} onChange={e => setConsent(e.target.checked)} />我理解本机明文可能包含秘密，同意本次启动记录。</label>
         <button className="button secondary" disabled={!startable || !consent || busy || uncertain} onClick={start}>启动终端日志</button>
       </div>}
-      {effectiveState === 'disconnected' && matches && connected && <p>命令状态识别已断开。请核对终端状态；需要时重新连接 SSH、重新启用命令识别，再开启日志。</p>}
+      {effectiveState === 'disconnected' && matches && connected && <p>命令状态识别已断开。请核对终端状态；需要时重新连接 SSH 并等待自动准备就绪，再开启日志。</p>}
       {uncertain && <p role="alert">启动结果不确定，已阻止重复提交。请检查终端并关闭、重新打开日志查看状态；不要重复启动。</p>}
       {canPause && <button className="button secondary" disabled={busy || !connected || !matches} onClick={pause}>{effectiveState === 'paused' ? '恢复记录' : '暂停记录'}</button>}
       <div className="shell-log-scope"><label>查看范围<select aria-label="日志查看范围" value={scope.kind} disabled={!native || busy} onChange={e => {

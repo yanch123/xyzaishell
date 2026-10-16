@@ -1,33 +1,31 @@
 #!/usr/bin/env python3
-"""Fetch/verify the digest-pinned public v0.1.2 prerelease upgrade baseline; never install or publish."""
+"""Fetch/verify the digest-pinned public v0.1.3 prerelease upgrade baseline; never install or publish."""
 import argparse
 from pathlib import Path
 import urllib.request
 
 import artifacts
 
-BASE_VERSION = "0.1.2"
-TARGET_VERSION = "0.1.3"
-BASE_COMMIT = "423fc24242ca6b168afc151d7b9f3985a92c1566"
-BASE_RUN = "38594474625"
-RELEASE_URL = "https://github.com/yanch123/xyzaishell/releases/download/v0.1.2/"
-# Public prerelease v0.1.2 (release 412925486), reverified against the GitHub
-# release/tag API on 2026-10-15. Downloaded package/manifest bytes from release
-# run 38594474625 match every public asset size/SHA256. See fixtures/upgrade-v0.1.2.
-# Installed binary hashes match the exact-source native acceptance runs; the
-# Linux hash also matches an independently extracted DEB. The upstream release
-# is not immutable: these fail-closed pins, not the tag alone, bind the baseline.
-# Changing the baseline requires a reviewed update.
+BASE_VERSION = "0.1.3"
+TARGET_VERSION = "0.1.4"
+BASE_COMMIT = "00660aa73474827cbd78e6f821c3e2b9a254dad2"
+BASE_RUN = "38841350614"
+RELEASE_URL = "https://github.com/yanch123/xyzaishell/releases/download/v0.1.3/"
+# Public prerelease v0.1.3 (release 414487406), reverified from public bytes
+# on 2026-10-16. Both application hashes are independently extracted from these
+# exact public packages, not earlier same-source candidate CI artifacts.
+# See fixtures/upgrade-v0.1.3.json. The upstream release is not immutable:
+# fail-closed pins bind the baseline; changes require a reviewed update.
 PINS = {
     "linux-x64": {
-        "package": ("xyzaishell-0.1.2-linux-x64.deb", 11965316, "67a8323a3cbe19c5b876c2abe9a9a3cde69a2f03f7506525d1026f37c36ad984"),
-        "manifest": ("build-linux-x64.json", 1107, "85f4cbbb26c3618ef3120113188768ced9a280a57b9efd7c3bd930e15118e600"),
-        "application_sha256": "22421c99a4dc3984ae32421c35b24bb48f75decf584d16f23a89a47f7dc5d0c9",
+        "package": ("xyzaishell-0.1.3-linux-x64.deb", 12090408, "8067f1c963a8427d3839738baf192a51f410ca192499a98880ca62148e0230e1"),
+        "manifest": ("build-linux-x64.json", 1107, "d708c8deec66ee796ae92b6556f37d4a40da8a8f56c75b86822256ef5db8b700"),
+        "application_sha256": "c9baca85048dfa4f8b5b1ece639e0634b0c454ad243299a9e647f25057b03028",
     },
     "windows-x64": {
-        "package": ("xyzaishell-0.1.2-windows-x64.exe", 6532549, "f1fdb819a23e30f767fabbc16ae916d4d8b254a978b980fb2ae624e5fa6a99c9"),
-        "manifest": ("build-windows-x64.json", 1132, "334cd446aa04915d4c6f8b5e0f4801df88e921eba585effd6a7689f7cfdbabe4"),
-        "application_sha256": "b22b65610ed7ea26bda03144249e7f40862d1e7b7b3463bcd0a170bcc2f9d62d",
+        "package": ("xyzaishell-0.1.3-windows-x64.exe", 6597258, "d6e80d6da81aca9ab451bf8ff4f71b930e544272a77ae7861e4b77b67ecf3894"),
+        "manifest": ("build-windows-x64.json", 1132, "e85105cb41bf5fcd1d995e9d0517e14ed1ab0400feed9b336d111b0581dd4b47"),
+        "application_sha256": "45c43d393089529574d4e9c71f4403ab378fe6ec6dbb9a0f3b8277d9eb685e49",
     },
 }
 

@@ -5,8 +5,9 @@ mod window_launch;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use xyz_core::agent::{
-    AckTerminalAction, AgentManager, ContinueTerminalTask, DecideTerminalAction, EnsureTaskSecrets,
-    PrepareSecretInput, StartTerminalTask, TaskRunRequest, TaskSecretsView, TerminalTaskSnapshot,
+    AckTerminalAction, AgentManager, ContinueTerminalTask, ConversationScopeConsent,
+    ConversationTurn, DecideTerminalAction, EnsureTaskSecrets, PrepareSecretInput,
+    StartTerminalTask, TaskRunRequest, TaskSecretsView, TerminalTaskSnapshot,
 };
 use xyz_core::shell_integration::IntegrationStatus;
 use xyz_core::shell_log::ShellLogService;
@@ -251,6 +252,29 @@ fn create_chat(
 #[tauri::command]
 fn get_chat(chat_id: String, state: State<'_, TaskManager>) -> Result<ChatSnapshot, ApiError> {
     state.get_chat(&chat_id)
+}
+#[tauri::command]
+fn confirm_conversation_scope(
+    request: ConversationScopeConsent,
+    state: State<'_, AgentManager>,
+) -> Result<ModelConfigStatus, ApiError> {
+    state.confirm_conversation_scope(request)
+}
+#[tauri::command]
+async fn submit_conversation_turn(
+    chat_id: String,
+    text: String,
+    revision: String,
+    destination: String,
+    session: Option<SessionRef>,
+    state: State<'_, AgentManager>,
+) -> Result<ConversationTurn, ApiError> {
+    let agent = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        agent.submit_conversation_turn(&chat_id, &text, &revision, &destination, session.as_ref())
+    })
+    .await
+    .map_err(|_| worker_error())?
 }
 #[tauri::command]
 async fn send_chat_message(
@@ -628,6 +652,8 @@ fn main() {
             create_chat,
             get_chat,
             send_chat_message,
+            submit_conversation_turn,
+            confirm_conversation_scope,
             cancel_chat_run,
             probe_model_compatibility,
             list_terminal_tasks,

@@ -122,7 +122,10 @@ impl Fixture {
         // This protocol fixture does not launch an OS shell. Establish the
         // same bounded current-shell handshake used by the real PTY tests.
         let integration = ssh.shell_integration();
-        integration.confirm_install(ssh.snapshot(), true).unwrap();
+        assert!(
+            server.trace().input.is_empty(),
+            "startup must not inject stdin"
+        );
         let nonce = integration.status().shell_id.unwrap();
         integration.ingest(
             &session,
@@ -334,7 +337,8 @@ async fn real_model_command_waits_for_finished_stream_and_visible_preview_then_s
     );
     assert_eq!(trace.input[0].0, trace.input[1].0);
     assert_eq!(trace.channels.len(), 1);
-    assert_eq!(trace.exec_requests, 0);
+    assert_eq!(trace.exec_requests, 1);
+    assert_eq!(trace.exec_commands[0].0, trace.channels[0]);
     let request = responder.await.unwrap();
     let body = request.split("\r\n\r\n").nth(1).unwrap();
     assert!(!body.contains("PRIVATE-HISTORICAL-INPUT"));
@@ -959,7 +963,7 @@ async fn multiple_normal_steps_continue_automatically_but_dangerous_step_needs_o
     assert!(!done.owner);
     assert_eq!(server.trace().input.len(), 3);
     assert_eq!(server.trace().channels.len(), 1);
-    assert_eq!(server.trace().exec_requests, 0);
+    assert_eq!(server.trace().exec_requests, 1);
     let request = responder.await.unwrap();
     assert!(request.contains("command_completed"));
     assert!(!request.contains("xyzlog"));
@@ -1299,4 +1303,373 @@ async fn planning_round_cap_is_explicit_and_preserves_final_command_output_witho
         responder.await.unwrap();
         assert_eq!(server.trace().input.len(), usize::from(final_command));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_ready_greeting_and_followup_keep_conversation_without_terminal_input() {
+    use xyz_core::agent::{ConversationScopeConsent, ConversationTurn};
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let chat = fixture.chats.create_chat("Unified conversation").unwrap();
+    let status = fixture.config.status();
+    let text_only = fixture
+        .chats
+        .confirm_destination(
+            status.revision.as_deref().unwrap(),
+            status.destination.as_deref().unwrap(),
+        )
+        .unwrap();
+    let rejected = fixture.agent.submit_conversation_turn(
+        &chat.chat_id,
+        "Hello",
+        text_only.revision.as_deref().unwrap(),
+        text_only.destination.as_deref().unwrap(),
+        Some(&fixture.session),
+    );
+    assert_eq!(
+        rejected
+            .err()
+            .expect("text consent cannot grant execution")
+            .code,
+        "CONVERSATION_SCOPE_REQUIRED"
+    );
+    let scope = fixture
+        .agent
+        .confirm_conversation_scope(ConversationScopeConsent {
+            revision: text_only.revision.unwrap(),
+            destination: text_only.destination.unwrap(),
+            session: Some(fixture.session.clone()),
+        })
+        .unwrap();
+    let responder = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for answer in [
+            "Hello! I can help with this server.",
+            "We were just getting acquainted.",
+        ] {
+            let (mut socket, _) = http.accept().await.unwrap();
+            requests.push(read_request(&mut socket).await);
+            let body = chunk(
+                serde_json::json!({"role":"assistant","content":answer}),
+                serde_json::Value::Null,
+            ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+                + "data: [DONE]\n\n";
+            reply(&mut socket, &body).await;
+        }
+        requests
+    });
+    for instruction in ["Hello", "What were we discussing?"] {
+        let turn = fixture
+            .agent
+            .submit_conversation_turn(
+                &chat.chat_id,
+                instruction,
+                scope.revision.as_deref().unwrap(),
+                scope.destination.as_deref().unwrap(),
+                Some(&fixture.session),
+            )
+            .unwrap();
+        let ConversationTurn::Terminal { task } = turn else {
+            panic!("ready scope should expose terminal capability");
+        };
+        let completed = phase(&fixture.agent, &task.task_id, "completed").await;
+        assert!(completed.action.is_none());
+        assert!(completed.actions.is_empty());
+    }
+    let requests = responder.await.unwrap();
+    assert!(requests[0].contains("terminal_action"));
+    assert!(
+        requests[1].contains("Hello! I can help with this server."),
+        "follow-up lost prior assistant response"
+    );
+    assert!(
+        server.trace().input.is_empty(),
+        "greeting must not invent a command"
+    );
+    assert_eq!(server.trace().exec_requests, 1);
+    let saved = fixture.chats.get_chat(&chat.chat_id).unwrap();
+    assert!(saved.messages.iter().any(|m| m.text == "Hello"));
+    assert!(saved
+        .messages
+        .iter()
+        .any(|m| m.text.contains("getting acquainted")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_unready_session_answers_as_chat_without_tools_or_queued_input() {
+    use xyz_core::agent::{ConversationScopeConsent, ConversationTurn};
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    // A foreground interactive startup/read has no verified ready boundary.
+    fixture.ssh.shell_integration().ingest(
+        &fixture.session,
+        &fixture.metadata(&format!(
+            "B;1;123;{};{}",
+            STANDARD.encode("/tmp"),
+            STANDARD.encode("read -s secret")
+        )),
+    );
+    let status = fixture.config.status();
+    let scope = fixture
+        .agent
+        .confirm_conversation_scope(ConversationScopeConsent {
+            revision: status.revision.unwrap(),
+            destination: status.destination.unwrap(),
+            session: Some(fixture.session.clone()),
+        })
+        .unwrap();
+    let responder = tokio::spawn(async move {
+        let (mut socket, _) = http.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        let body = chunk(
+            serde_json::json!({"role":"assistant","content":"The terminal is waiting for input. I can discuss the next step."}),
+            serde_json::Value::Null,
+        ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+            + "data: [DONE]\n\n";
+        reply(&mut socket, &body).await;
+        (request, http)
+    });
+    let chat = fixture.chats.create_chat("Unready conversation").unwrap();
+    let turn = fixture
+        .agent
+        .submit_conversation_turn(
+            &chat.chat_id,
+            "Inspect this server",
+            scope.revision.as_deref().unwrap(),
+            scope.destination.as_deref().unwrap(),
+            Some(&fixture.session),
+        )
+        .unwrap();
+    assert!(matches!(turn, ConversationTurn::Chat { .. }));
+    let (request, http) = responder.await.unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert!(body.get("tools").is_none());
+    let availability = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|message| {
+            let parsed: serde_json::Value = serde_json::from_str(
+                message["content"]
+                    .as_str()
+                    .or_else(|| message["content"][0]["text"].as_str())?
+                    .split("Host availability: ")
+                    .nth(1)?,
+            )
+            .ok()?;
+            parsed.get("execution_available").map(|_| parsed.clone())
+        })
+        .unwrap_or_else(|| panic!("bounded capability state missing: {body}"));
+    assert_eq!(availability["execution_available"], false);
+    assert_eq!(availability["request_queued"], false);
+    tokio::time::timeout(WAIT, async {
+        while fixture
+            .chats
+            .get_chat(&chat.chat_id)
+            .unwrap()
+            .active_run_id
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture
+        .ssh
+        .shell_integration()
+        .ingest(&fixture.session, &fixture.metadata("E;1;124;0"));
+    fixture
+        .ssh
+        .shell_integration()
+        .ingest(&fixture.session, &fixture.metadata("R;1;125;"));
+    assert!(fixture
+        .ssh
+        .shell_integration()
+        .ready_snapshot(&fixture.session)
+        .is_ok());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), http.accept())
+            .await
+            .is_err(),
+        "readiness must not replay an earlier conversation request"
+    );
+    assert!(server.trace().input.is_empty());
+    assert_eq!(server.trace().exec_requests, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_scope_reuses_same_target_only_with_fresh_session_and_blocks_other_targets() {
+    use xyz_core::agent::{ConversationScopeConsent, ConversationTurn};
+    async fn reconnect(f: &Fixture, server: &LoopbackServer) -> SessionRef {
+        let current = f.ssh.snapshot().session.unwrap();
+        f.ssh.disconnect(&current).unwrap();
+        tokio::time::timeout(WAIT, async {
+            while f.ssh.snapshot().state != SessionState::Disconnected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let session = f
+            .ssh
+            .connect(ConnectRequest {
+                host: "127.0.0.1".into(),
+                port: server.addr.port(),
+                username: USER.into(),
+                auth: Authentication::Password {
+                    password: Secret::new(PASSWORD.into()),
+                },
+                session_only: true,
+                size: TerminalSize { cols: 80, rows: 24 },
+            })
+            .unwrap()
+            .session
+            .unwrap();
+        tokio::time::timeout(WAIT, async {
+            while f.ssh.snapshot().state != SessionState::Connected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let integration = f.ssh.shell_integration();
+        let nonce = integration.status().shell_id.unwrap();
+        integration.ingest(
+            &session,
+            format!("\x1b]777;xyzlog;2;{nonce};H;5.2.15\x07\x1b]777;xyzlog;2;{nonce};R;0;123;\x07")
+                .as_bytes(),
+        );
+        session
+    }
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let chat = fixture
+        .chats
+        .create_chat_with_source(
+            "Reconnect conversation",
+            xyz_core::tasks::ChatSource::from_session(&fixture.ssh.snapshot()),
+        )
+        .unwrap();
+    let initial = fixture.config.status();
+    let scope = fixture
+        .agent
+        .confirm_conversation_scope(ConversationScopeConsent {
+            revision: initial.revision.unwrap(),
+            destination: initial.destination.unwrap(),
+            session: Some(fixture.session.clone()),
+        })
+        .unwrap();
+    let revision = scope.revision.as_deref().unwrap();
+    let destination = scope.destination.as_deref().unwrap();
+    let fresh = reconnect(&fixture, &server).await;
+    assert_ne!(fresh, fixture.session);
+    assert_eq!(
+        fixture
+            .agent
+            .submit_conversation_turn(
+                &chat.chat_id,
+                "Do not send",
+                revision,
+                destination,
+                Some(&fixture.session)
+            )
+            .err()
+            .unwrap()
+            .code,
+        "SESSION_STALE"
+    );
+    assert_eq!(
+        fixture
+            .agent
+            .confirm_conversation_scope(ConversationScopeConsent {
+                revision: revision.into(),
+                destination: destination.into(),
+                session: Some(fixture.session.clone()),
+            })
+            .unwrap_err()
+            .code,
+        "SESSION_STALE"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), http.accept())
+            .await
+            .is_err()
+    );
+    assert!(server.trace().input.is_empty());
+    assert_eq!(fixture.config.status().revision.as_deref(), Some(revision));
+
+    let turn = fixture
+        .agent
+        .submit_conversation_turn(
+            &chat.chat_id,
+            "Hello after reconnect",
+            revision,
+            destination,
+            Some(&fresh),
+        )
+        .unwrap();
+    let ConversationTurn::Terminal { task } = turn else {
+        panic!("same target scope should be reusable with the new exact session");
+    };
+    let (mut socket, _) = tokio::time::timeout(WAIT, http.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let request = read_request(&mut socket).await;
+    assert!(request.contains("Hello after reconnect"));
+    let body = chunk(
+        serde_json::json!({"role":"assistant","content":"Hello again."}),
+        serde_json::Value::Null,
+    ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+        + "data: [DONE]\n\n";
+    reply(&mut socket, &body).await;
+    phase(&fixture.agent, &task.task_id, "completed").await;
+    assert!(server.trace().input.is_empty());
+
+    let other = LoopbackServer::start(Behavior::default()).await;
+    let other_session = reconnect(&fixture, &other).await;
+    assert_eq!(
+        fixture
+            .agent
+            .submit_conversation_turn(
+                &chat.chat_id,
+                "Do not cross targets",
+                revision,
+                destination,
+                Some(&other_session)
+            )
+            .err()
+            .unwrap()
+            .code,
+        "CHAT_TARGET_CHANGED"
+    );
+    let other_chat = fixture.chats.create_chat("Different server").unwrap();
+    assert_eq!(
+        fixture
+            .agent
+            .submit_conversation_turn(
+                &other_chat.chat_id,
+                "Needs new scope",
+                revision,
+                destination,
+                Some(&other_session)
+            )
+            .err()
+            .unwrap()
+            .code,
+        "CONVERSATION_SCOPE_REQUIRED"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), http.accept())
+            .await
+            .is_err()
+    );
+    assert!(other.trace().input.is_empty());
+    assert!(server.trace().input.is_empty());
+    fixture.ssh.disconnect(&other_session).unwrap();
 }

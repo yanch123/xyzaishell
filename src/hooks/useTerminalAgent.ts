@@ -196,6 +196,6 @@ export function useTerminalAgent(config: ModelConfigStatus, session: SessionSnap
   const unresolved = Object.values(tasks).some(task => task.phase === 'cancelled' && !task.terminal_ready && connected(task));
   const blocked = !!owner || unresolved || Object.keys(pending).length > 0 || Object.keys(uncertain).length > 0;
   const retryLoad = () => { if (native && !ready) setLoadAttempt(value => value + 1); };
-  return { native, ready, tasks, owner, blocked, error, errors, pending, uncertain, drafts, updateDraft, start, acknowledge, decide, cancel, continueTask, prepareSecret, refresh, retryLoad, actionIdentity };
+  return { accept, native, ready, tasks, owner, blocked, error, errors, pending, uncertain, drafts, updateDraft, start, acknowledge, decide, cancel, continueTask, prepareSecret, refresh, retryLoad, actionIdentity };
 }
 export type TerminalAgentController = ReturnType<typeof useTerminalAgent>;

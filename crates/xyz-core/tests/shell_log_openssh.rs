@@ -110,22 +110,8 @@ impl Terminal {
             .unwrap();
         self.until(|t| t.manager.snapshot().state == SessionState::Connected)
             .await;
-        self.output.clear();
-        self.write(
-            &session,
-            "stty -echo; HISTCONTROL=ignoreboth; HISTIGNORE=; HISTSIZE=1000; shopt -s cmdhist promptvars; shopt -s lithist; PS1='XYZ_OPENSSH> '; alias ll='ls -l'; xyz_fixture_function(){ return 23; }; printf '%s%s\\n' XYZ_LOG_READY_ ACK\n",
-        )
-        .await;
-        self.until(|t| {
-            t.output
-                .windows(b"XYZ_LOG_READY_ACK\r\n".len())
-                .any(|s| s == b"XYZ_LOG_READY_ACK\r\n")
-        })
-        .await;
-        self.manager
-            .install_shell_integration(&session, true)
-            .await
-            .unwrap();
+        // Preparation runs before the first prompt, entirely in the SSH exec
+        // payload. Do not repair shell options or inject a bootstrap into stdin.
         self.until(|t| t.manager.shell_integration().status().phase == IntegrationPhase::Ready)
             .await;
         let ready = self
@@ -186,6 +172,22 @@ async fn shell_log_real_openssh_records_commands_without_model() {
         let root = env::temp_dir().join(format!("xyz-shell-log-openssh-{}", Uuid::new_v4()));
         let mut t = Terminal::new(root.clone());
         let first = t.connect().await;
+        // Disposable fixture definitions come from .bashrc, before hooks are
+        // installed. Verify both are preserved in the prepared shell.
+        if env::var_os("XYZ_OPENSSH_FIXTURE_BASHRC").is_some() {
+            assert_eq!(
+                t.completed(&first, "xyz_fixture_function").await.exit_code,
+                Some(23)
+            );
+            assert_eq!(
+                t.completed(&first, "xyz_fixture_alias").await.exit_code,
+                Some(0)
+            );
+            assert!(t
+                .output
+                .windows(b"XYZ_ALIAS_PRESERVED".len())
+                .any(|s| s == b"XYZ_ALIAS_PRESERVED"));
+        }
         let initial = t.completed(&first, "pwd").await;
         let cd = t.completed(&first, "cd /tmp; pwd").await;
         assert_eq!(cd.cwd, initial.cwd);

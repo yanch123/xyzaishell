@@ -1,5 +1,13 @@
 //! Synthetic fixture generator for tests/shell_log_pty.py, not an SSH executor.
 fn main() {
+    if std::env::args().any(|arg| arg == "--startup") {
+        print!(
+            "{}",
+            xyz_core::shell_log_protocol::startup_command("0123456789abcdef0123456789abcdef")
+                .expect("fixed synthetic nonce")
+        );
+        return;
+    }
     print!(
         "{}",
         xyz_core::shell_log_protocol::bootstrap_command("0123456789abcdef0123456789abcdef")

@@ -256,6 +256,33 @@ impl ModelConfigManager {
             )
         })
     }
+    pub(crate) fn authorized_snapshot_for(
+        &self,
+        revision: &str,
+        destination: &str,
+    ) -> Result<Arc<ModelSnapshot>, ApiError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.status.revision.as_deref() != Some(revision)
+            || state.status.destination.as_deref() != Some(destination)
+        {
+            return Err(ApiError::new(
+                "MODEL_CONFIG_CHANGED",
+                "The model destination changed. Review it before sending again.",
+            ));
+        }
+        if !state.status.ready || !state.status.consented {
+            return Err(ApiError::new(
+                "MODEL_CONSENT_REQUIRED",
+                "Review and allow the model destination first.",
+            ));
+        }
+        state.snapshot.clone().ok_or_else(|| {
+            ApiError::new(
+                "MODEL_CONFIG_UNAVAILABLE",
+                "Load a valid model configuration first.",
+            )
+        })
+    }
     pub(crate) fn authorized_snapshot(&self) -> Result<Arc<ModelSnapshot>, ApiError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.status.ready || !state.status.consented {

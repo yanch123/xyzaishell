@@ -60,13 +60,60 @@ fn quote(s: &str) -> String {
 /// Install TEMPORARY hooks in the already idle, explicitly confirmed current Bash.
 /// No child shell, startup-file changes, hidden SSH channel, or automatic retry.
 pub fn bootstrap_command(nonce: &str) -> Result<String, ProtocolError> {
+    bootstrap_with_history_default(nonce, false)
+}
+fn bootstrap_with_history_default(nonce: &str, startup: bool) -> Result<String, ProtocolError> {
     if !valid_nonce(nonce) {
         return Err(ProtocolError("invalid integration nonce"));
     }
-    let script = SCRIPT.replace("@NONCE@", nonce);
+    let mut script = SCRIPT.replace("@NONCE@", nonce);
+    if startup {
+        // Bash 5.1/5.2 initializes an unset HISTSIZE to 500 AFTER rc files.
+        // Anticipate that value without assigning or overriding user settings.
+        // The ready hook still compares the actual post-startup value, so no
+        // readiness is emitted unless Bash really applied that default.
+        script = script
+            .replace("${HISTSIZE-0} -le 0", "${HISTSIZE-500} -le 0")
+            .replace(
+                "__xyz_original_histsize=${HISTSIZE-}",
+                "__xyz_original_histsize=${HISTSIZE-500}",
+            );
+    }
     let command = format!("if builtin shopt -q interactive_comments; then builtin eval {}; else builtin printf '\\033]777;xyzlog;2;{nonce};U;unsupported_options\\007'; fi\n", quote(&script));
     if command.len() > 16 * 1024 {
         return Err(ProtocolError("bootstrap exceeds SSH input frame limit"));
+    }
+    Ok(command)
+}
+
+/// Connection-time command for ONE exec request on the visible SSH PTY.
+/// This is never terminal input. The pipe-backed rc file survives exec and is
+/// consumed by the interactive Bash itself, after which no remote file remains.
+/// This deliberately starts a non-login Bash and preserves its normal .bashrc;
+/// it does not emulate login profiles or replace an already-running shell.
+pub fn startup_command(nonce: &str) -> Result<String, ProtocolError> {
+    if !valid_nonce(nonce) {
+        return Err(ProtocolError("invalid integration nonce"));
+    }
+    let unsupported = format!("printf '\\033]777;xyzlog;2;{nonce};U;unsupported_bash\\007'");
+    let rc = format!(
+        "if [[ -r $HOME/.bashrc ]]; then builtin source \"$HOME/.bashrc\"; fi\n{}",
+        bootstrap_with_history_default(nonce, true)?
+    );
+    let bash = format!(
+        "case ${{BASH_VERSINFO[0]}}.${{BASH_VERSINFO[1]}} in 5.1|5.2) exec \"$BASH\" --noprofile --rcfile <(builtin printf '%s' {}) -i ;; *) {unsupported}; exec \"$BASH\" -i ;; esac",
+        quote(&rc)
+    );
+    // The account shell only parses exec + quoted arguments. POSIX syntax and
+    // Bash-only process substitution are separately confined to their shells.
+    // Unknown account shells retain a manual interactive terminal on this PTY.
+    let launch = format!(
+        "case \"${{SHELL-}}\" in */bash) exec \"$SHELL\" --noprofile --norc -c {} ;; *) {unsupported}; exec \"${{SHELL:-/bin/sh}}\" -i ;; esac",
+        quote(&bash)
+    );
+    let command = format!("exec /bin/sh -c {}", quote(&launch));
+    if command.len() > 128 * 1024 {
+        return Err(ProtocolError("startup command exceeds bound"));
     }
     Ok(command)
 }

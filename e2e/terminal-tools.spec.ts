@@ -35,6 +35,7 @@ test('synthetic IPC: real terminal search, reviewed attachment and persistent di
         if (cmd === 'get_model_config_status') return structuredClone(config);
         if (cmd === 'list_chats') return [structuredClone(chat)];
         if (cmd === 'get_chat') return structuredClone(chat);
+        if (cmd === 'confirm_conversation_scope') return structuredClone(config);
         if (cmd === 'send_chat_message') {
           chat.revision = '2'; chat.messages = [{ id: 'sent-one', role: 'user', text: args.text, state: 'complete', run_id: 'run-one', error: null }];
           return structuredClone(chat);
@@ -59,7 +60,7 @@ test('synthetic IPC: real terminal search, reviewed attachment and persistent di
   const attachment = page.getByRole('region', { name: '终端选区附件草稿' });
   await expect(attachment).toContainText('tester@synthetic.example:22');
   await expect(attachment.getByRole('textbox')).toHaveValue('alpha');
-  const send = page.getByRole('button', { name: '发送', exact: true });
+  const send = page.getByRole('button', { name: '确认并发送', exact: true });
   const composer = page.getByRole('textbox', { name: '聊天消息' });
   // These observation-only checks run before fill/check/click can scroll the UI.
   await expect(send).toBeDisabled();
@@ -87,6 +88,9 @@ test('synthetic IPC: real terminal search, reviewed attachment and persistent di
   await expect(attachment.locator('.attachment-source')).toBeInViewport({ ratio: 1 });
   await expect(send).toBeInViewport({ ratio: 1 });
   await send.click();
+  const scope = page.getByRole('dialog', { name: '确认模型接收方' });
+  await scope.getByRole('checkbox').check();
+  await scope.getByRole('button', { name: '同意并发送' }).click();
   await expect(attachment).toHaveCount(0);
   const calls = await page.evaluate(() => (window as unknown as { __TERMINAL_TOOLS_CALLS__: Array<{ cmd: string; args: Record<string, unknown> }> }).__TERMINAL_TOOLS_CALLS__);
   const sends = calls.filter(call => call.cmd === 'send_chat_message');

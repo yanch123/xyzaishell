@@ -22,7 +22,7 @@ beforeEach(() => {
   mocks.list.mockResolvedValue([chat()]);
   mocks.create.mockResolvedValue(chat('chat-b'));
   mocks.get.mockImplementation(async id => chat(id));
-  mocks.send.mockImplementation(async id => stream(id));
+  mocks.send.mockImplementation(async id => ({ kind: 'chat', chat: stream(id) }));
 });
 async function ready() {
   render(<Harness />);
@@ -31,10 +31,10 @@ async function ready() {
 describe('M2 model chat UI', () => {
   it('sends explicit chat text and streams a real backend response without implying terminal access', async () => {
     const user = userEvent.setup(); await ready();
-    expect(screen.getByText(/不读取终端、不执行命令/)).toBeDefined();
+    expect(screen.getByText(/普通命令可自动在当前终端执行/)).toBeDefined();
     await user.type(screen.getByRole('textbox', { name: '聊天消息' }), '解释这条命令');
     await user.click(screen.getByRole('button', { name: '发送' }));
-    expect(mocks.send).toHaveBeenCalledWith('chat-a', '解释这条命令');
+    expect(mocks.send).toHaveBeenCalledWith('chat-a', '解释这条命令', modelConfig.revision, modelConfig.destination, null);
     expect(screen.getByText('正在等待模型响应…')).toBeDefined();
     act(() => emit({ kind: 'chat_updated', chat: stream('chat-a', '3', 'This is a streamed response.') }));
     expect(screen.getByText('This is a streamed response.')).toBeDefined();

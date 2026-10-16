@@ -37,11 +37,13 @@ pub struct Trace {
     pub resizes: Vec<(ChannelId, u32, u32)>,
     pub closes: Vec<ChannelId>,
     pub exec_requests: usize,
+    pub exec_commands: Vec<(ChannelId, Vec<u8>)>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Behavior {
     pub accept_pty: bool,
+    pub accept_exec: bool,
     pub accept_shell: bool,
 }
 
@@ -49,6 +51,7 @@ impl Default for Behavior {
     fn default() -> Self {
         Self {
             accept_pty: true,
+            accept_exec: true,
             accept_shell: true,
         }
     }
@@ -167,11 +170,23 @@ impl server::Handler for FixtureHandler {
     async fn exec_request(
         &mut self,
         channel: ChannelId,
-        _: &[u8],
+        command: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.trace.send_modify(|t| t.exec_requests += 1);
-        session.channel_failure(channel)?;
+        self.trace.send_modify(|t| {
+            t.exec_requests += 1;
+            t.exec_commands.push((channel, command.to_vec()));
+        });
+        // The production startup is one exec on the already allocated visible
+        // PTY. This fixture records it without interpreting or executing it.
+        if self.behavior.accept_exec {
+            session.channel_success(channel)?;
+            session.data(channel, BANNER.to_vec())?;
+        } else {
+            // An explicit failure means no remote program has started, so a
+            // plain manual-shell request on this same channel is safe.
+            session.channel_failure(channel)?;
+        }
         Ok(())
     }
 

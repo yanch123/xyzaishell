@@ -87,6 +87,7 @@ export function ConnectionDialog({ onClose, onConnect, onConnectSaved, size, ava
   const Container = profile ? NonModalPanel : Modal;
   return <Container title={profile ? '编辑 SSH 连接' : '连接 SSH 服务器'} eyebrow={profile ? 'EDIT CONNECTION' : 'NEW CONNECTION'} onClose={close}>
     <p className="modal-intro">{profile ? '保存只更新此连接资料，不改变已建立的会话。' : '保存连接和记住凭据可以分别选择。凭据仅用于 SSH 认证。'}</p>
+    {!profile && <p className="connection-shell-notice">连接后会在当前终端自动启动 Bash 5.1 / 5.2 并读取 ~/.bashrc，临时准备命令执行。使用非登录 Shell，不读取登录配置文件；不修改远程配置。不兼容或启动需要交互时，可继续使用手动终端。</p>}
     {!available && <p className="notice warning">网页预览无法连接 SSH。请通过桌面应用启动。</p>}
     {!profile && onProfiles && <button className="button secondary" onClick={onProfiles} disabled={busy}>已保存连接</button>}
     {discarding && <div className="notice warning" role="alert"><p>放弃尚未保存的连接修改？本次输入的密码或口令会清除。</p><button className="button secondary" type="button" onClick={() => setDiscarding(false)}>继续编辑</button><button className="button danger" type="button" onClick={() => { setSecret(''); onClose(); }}>放弃修改</button></div>}

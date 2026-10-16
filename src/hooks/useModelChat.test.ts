@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatSnapshot, ModelEvent } from '../lib/model';
 import { chat, modelConfig, stream } from '../test/modelFixtures';
 
-const mocks = vi.hoisted(() => ({ native: vi.fn(), listen: vi.fn(), config: vi.fn(), list: vi.fn(), create: vi.fn(), get: vi.fn(), send: vi.fn(), cancel: vi.fn(), reload: vi.fn(), confirm: vi.fn(), probe: vi.fn(), save: vi.fn(), testSaved: vi.fn(), cancelTest: vi.fn() }));
+const mocks = vi.hoisted(() => ({ native: vi.fn(), listen: vi.fn(), config: vi.fn(), list: vi.fn(), create: vi.fn(), get: vi.fn(), send: vi.fn(), sendText: vi.fn(), cancel: vi.fn(), reload: vi.fn(), confirm: vi.fn(), confirmScope: vi.fn(), probe: vi.fn(), save: vi.fn(), testSaved: vi.fn(), cancelTest: vi.fn() }));
 vi.mock('../lib/bridge', () => ({ desktopAvailable: mocks.native }));
 vi.mock('../lib/modelBridge', () => ({ modelBridge: mocks }));
 import { useModelChat } from './useModelChat';
@@ -17,9 +17,10 @@ beforeEach(() => {
   mocks.list.mockResolvedValue([chat()]);
   mocks.create.mockResolvedValue(chat('chat-b'));
   mocks.get.mockImplementation(async (id: string) => chat(id));
-  mocks.send.mockImplementation(async (id: string) => stream(id));
+  mocks.send.mockImplementation(async (id: string) => ({ kind: 'chat', chat: stream(id) }));
+  mocks.sendText.mockImplementation(async (id: string) => stream(id));
   mocks.cancel.mockImplementation(async (id: string) => ({ ...stream(id, '4', 'partial'), active_run_id: null, messages: stream(id, '4', 'partial').messages.map(message => message.role === 'assistant' ? { ...message, state: 'cancelled' } : message) }));
-  mocks.confirm.mockResolvedValue({ ...modelConfig, revision: '2', consented: true });
+  mocks.confirmScope.mockResolvedValue({ ...modelConfig, revision: '2', consented: true });
   mocks.reload.mockResolvedValue({ ...modelConfig, revision: '3', consented: false });
   mocks.probe.mockResolvedValue(stream('probe'));
 });
@@ -54,14 +55,14 @@ describe('M2 canonical chat lifecycle', () => {
     expect(mocks.listen).not.toHaveBeenCalled(); expect(mocks.send).not.toHaveBeenCalled(); expect(mocks.create).not.toHaveBeenCalled();
   });
   it('does not replace a streaming snapshot with stale send replies or events', async () => {
-    let reply!: (value: ChatSnapshot) => void;
+    let reply!: (value: {kind: 'chat'; chat: ChatSnapshot}) => void;
     mocks.send.mockImplementation(() => new Promise(resolve => { reply = resolve; }));
     const { result } = await ready();
     act(() => result.current.updateDraft('chat-a', 'hello'));
     let sending!: Promise<boolean>;
     act(() => { sending = result.current.send('chat-a'); });
     act(() => emit({ kind: 'chat_updated', chat: stream('chat-a', '9007199254740994', 'streamed') }));
-    await act(async () => { reply(stream('chat-a', '2')); await sending; });
+    await act(async () => { reply({ kind: 'chat', chat: stream('chat-a', '2') }); await sending; });
     act(() => emit({ kind: 'chat_updated', chat: stream('chat-a', '9007199254740993', 'stale') }));
     expect(result.current.current.messages[1].text).toBe('streamed');
     expect(result.current.drafts['chat-a']).toBe('');
@@ -79,7 +80,7 @@ describe('M2 canonical chat lifecycle', () => {
     act(() => emit({ kind: 'chat_updated', chat: stream('chat-a', '3', 'answer A') }));
     expect(result.current.current.messages).toHaveLength(0);
     await act(async () => { await result.current.send('chat-b'); });
-    expect(mocks.send.mock.calls).toEqual([['chat-a', 'message A'], ['chat-b', 'message B']]);
+    expect(mocks.send.mock.calls).toEqual([['chat-a', 'message A', modelConfig.revision, modelConfig.destination, null], ['chat-b', 'message B', modelConfig.revision, modelConfig.destination, null]]);
     expect(result.current.runningCount).toBe(2); expect(mocks.cancel).not.toHaveBeenCalled();
   });
   it('cancels the exact chat and run, retains partial text, ignores late events', async () => {
@@ -100,13 +101,13 @@ describe('M2 canonical chat lifecycle', () => {
     expect(mocks.send).toHaveBeenCalledOnce(); expect(mocks.get).toHaveBeenCalledWith('chat-a');
   });
   it('guards repeated clicks and preserves a new draft edited before IPC resolves', async () => {
-    let reply!: (value: ChatSnapshot) => void;
+    let reply!: (value: {kind: 'chat'; chat: ChatSnapshot}) => void;
     mocks.send.mockImplementation(() => new Promise(resolve => { reply = resolve; }));
     const { result } = await ready();
     act(() => result.current.updateDraft('chat-a', 'first'));
     let sending!: Promise<boolean>;
     act(() => { sending = result.current.send('chat-a'); void result.current.send('chat-a'); result.current.updateDraft('chat-a', 'next draft'); });
-    await act(async () => { reply(stream()); await sending; });
+    await act(async () => { reply({ kind: 'chat', chat: stream() }); await sending; });
     expect(mocks.send).toHaveBeenCalledOnce(); expect(result.current.drafts['chat-a']).toBe('next draft');
   });
   it('enforces the UTF-8 input limit rather than JavaScript character count', async () => {
@@ -122,7 +123,7 @@ describe('M2 canonical chat lifecycle', () => {
     await act(async () => { expect(await result.current.send('chat-a')).toBe(false); });
     expect(mocks.send).not.toHaveBeenCalled();
     await act(async () => { expect(await result.current.confirmDestination(result.current.config)).toBe(true); });
-    expect(mocks.confirm).toHaveBeenCalledWith('1', modelConfig.destination);
+    expect(mocks.confirmScope).toHaveBeenCalledWith('1', modelConfig.destination, null);
     await act(async () => { await result.current.reloadConfig(); });
     act(() => emit({ kind: 'config_updated', config: { ...modelConfig, revision: '2', consented: true } }));
     expect(result.current.config.revision).toBe('3'); expect(result.current.config.consented).toBe(false);
@@ -193,7 +194,8 @@ describe('saved settings and immutable chat provenance', () => {
   });
   it('never transmits restored or different-target context', async () => {
     mocks.list.mockResolvedValue([{ ...chat('restored'), restored_read_only: true }, { ...chat('other-target'), source: { ...target.session, host: 'other.example', port: 22, username: 'user' } }]);
-    const { result } = await ready();
+    const { result } = renderHook(() => useModelChat(target));
+    await waitFor(() => expect(result.current.ready).toBe(true));
     act(() => { result.current.updateDraft('restored', 'no replay'); result.current.updateDraft('other-target', 'wrong server'); });
     await act(async () => { expect(await result.current.send('restored')).toBe(false); expect(await result.current.send('other-target')).toBe(false); });
     expect(mocks.send).not.toHaveBeenCalled();
@@ -243,7 +245,7 @@ describe('explicit terminal attachment lifecycle', () => {
   }
   it('stores only a bounded draft until separate review and send; edits preserve source and revoke consent', async () => {
     const { result } = await attachedReady();
-    expect(mocks.send).not.toHaveBeenCalled(); expect(mocks.create).not.toHaveBeenCalled();
+    expect(mocks.sendText).not.toHaveBeenCalled(); expect(mocks.create).not.toHaveBeenCalled();
     await act(async () => expect(await result.current.send('chat-a')).toBe(false));
     act(() => result.current.consentAttachment('chat-a', true));
     expect(result.current.attachments['chat-a'].consent?.destination).toBe(modelConfig.destination);
@@ -254,8 +256,8 @@ describe('explicit terminal attachment lifecycle', () => {
     await act(async () => expect(await result.current.send('chat-a')).toBe(false));
     act(() => { result.current.updateDraft('chat-a', 'explain'); result.current.consentAttachment('chat-a', true); });
     await act(async () => expect(await result.current.send('chat-a')).toBe(true));
-    expect(mocks.send).toHaveBeenCalledExactlyOnceWith('chat-a', expect.stringContaining('reviewed output'));
-    expect(mocks.send.mock.calls[0][1]).toContain('用户已编辑'); expect(mocks.send.mock.calls[0][1]).toContain('"session_id":"first-session"');
+    expect(mocks.sendText).toHaveBeenCalledExactlyOnceWith('chat-a', expect.stringContaining('reviewed output'));
+    expect(mocks.sendText.mock.calls[0][1]).toContain('用户已编辑'); expect(mocks.sendText.mock.calls[0][1]).toContain('"session_id":"first-session"');
     expect(result.current.attachments['chat-a']).toBeUndefined(); expect(result.current.drafts['chat-a']).toBe('');
   });
   it('refuses replacement and other chats/sessions/history instead of transferring raw output', async () => {
@@ -267,7 +269,7 @@ describe('explicit terminal attachment lifecycle', () => {
       result.current.restoreChat({ ...chat('history'), source, restored_read_only: true });
       expect(result.current.attachSelection('history', selection)).toBe(false);
     });
-    expect(result.current.attachments['chat-a'].text).toBe('disk output'); expect(mocks.send).not.toHaveBeenCalled();
+    expect(result.current.attachments['chat-a'].text).toBe('disk output'); expect(mocks.sendText).not.toHaveBeenCalled();
   });
   it('revokes review after switching chats, even on return, and after config changes', async () => {
     const { result } = await attachedReady();
@@ -279,7 +281,7 @@ describe('explicit terminal attachment lifecycle', () => {
     act(() => result.current.consentAttachment('chat-a', true));
     act(() => emit({ kind: 'config_updated', config: { ...modelConfig, revision: '4', model: 'changed-model' } }));
     expect(result.current.attachments['chat-a'].consent).toBeNull();
-    await act(async () => expect(await result.current.send('chat-a')).toBe(false)); expect(mocks.send).not.toHaveBeenCalled();
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false)); expect(mocks.sendText).not.toHaveBeenCalled();
   });
   it('fences reconnect and disconnect at send time and never restores old approval on return', async () => {
     const { result, rerender } = await attachedReady();
@@ -289,17 +291,122 @@ describe('explicit terminal attachment lifecycle', () => {
     act(() => result.current.consentAttachment('chat-a', true)); expect(result.current.attachments['chat-a'].consent).toBeNull();
     rerender({ target });
     expect(result.current.attachments['chat-a'].consent).toBeNull();
-    await act(async () => expect(await result.current.send('chat-a')).toBe(false)); expect(mocks.send).not.toHaveBeenCalled();
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false)); expect(mocks.sendText).not.toHaveBeenCalled();
   });
   it('preserves newly edited attachment while a prior explicit send completes', async () => {
     const { result } = await attachedReady();
     let done!: (chat: ChatSnapshot) => void;
-    mocks.send.mockImplementationOnce(() => new Promise(resolve => { done = resolve; }));
+    mocks.sendText.mockImplementationOnce(() => new Promise(resolve => { done = resolve; }));
     act(() => result.current.consentAttachment('chat-a', true));
     let pending!: Promise<boolean>;
     act(() => { pending = result.current.send('chat-a'); });
     act(() => result.current.editAttachment('chat-a', 'new draft after send'));
     await act(async () => { done({ ...stream(), source }); expect(await pending).toBe(true); });
     expect(result.current.attachments['chat-a'].text).toBe('new draft after send'); expect(result.current.attachments['chat-a'].consent).toBeNull();
+  });
+});
+
+describe('unified conversation scope and routing', () => {
+  const target = { state: 'connected' as const, host: 'scope.example', port: 22, username: 'user', session: { session_id: 'scope-session', generation: '1' } };
+  const source = { ...target.session, host: target.host, port: 22, username: target.username };
+  async function scopedReady() {
+    mocks.list.mockResolvedValue([{ ...chat(), source }]);
+    const hook = renderHook((props: { target: import('../lib/types').SessionSnapshot }) => useModelChat(props.target), { initialProps: { target: target as import('../lib/types').SessionSnapshot } });
+    await waitFor(() => expect(hook.result.current.ready).toBe(true));
+    return hook;
+  }
+  it('requires target scope once and reuses it across same-target turns and reconnects', async () => {
+    const { result, rerender } = await scopedReady();
+    expect(result.current.scopeConsented).toBe(false);
+    act(() => result.current.updateDraft('chat-a', '你好'));
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false));
+    await act(async () => expect(await result.current.confirmDestination(result.current.config)).toBe(true));
+    expect(result.current.scopeConsented).toBe(true);
+    mocks.send.mockResolvedValue({ kind: 'chat', chat: { ...chat(), source, revision: '3' } });
+    await act(async () => expect(await result.current.send('chat-a')).toBe(true));
+    expect(mocks.send).toHaveBeenLastCalledWith('chat-a', '你好', '2', modelConfig.destination, target.session);
+    rerender({ target: { ...target, session: { ...target.session, generation: '2' } } });
+    expect(result.current.scopeConsented).toBe(true);
+    act(() => result.current.updateDraft('chat-a', '再看一下'));
+    await act(async () => expect(await result.current.send('chat-a')).toBe(true));
+    expect(mocks.confirmScope).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith('chat-a', '再看一下', '2', modelConfig.destination, { ...target.session, generation: '2' });
+  });
+  it('revokes scope for a changed recipient or target without dispatching', async () => {
+    const { result, rerender } = await scopedReady();
+    await act(async () => result.current.confirmDestination(result.current.config));
+    act(() => emit({ kind: 'config_updated', config: { ...modelConfig, revision: '4', destination: 'https://other.example/v1' } }));
+    expect(result.current.scopeConsented).toBe(false);
+    act(() => result.current.updateDraft('chat-a', 'do something'));
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false));
+    rerender({ target: { ...target, host: 'other.example' } });
+    expect(result.current.scopeConsented).toBe(false);
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('allows a disconnected greeting in an existing conversation with no terminal authority', async () => {
+    const { result, rerender } = await scopedReady();
+    rerender({ target: { ...target, state: 'disconnected' } });
+    act(() => result.current.updateDraft('chat-a', '你好'));
+    await act(async () => expect(await result.current.send('chat-a')).toBe(true));
+    expect(mocks.send).toHaveBeenCalledWith('chat-a', '你好', modelConfig.revision, modelConfig.destination, null);
+    expect(mocks.confirmScope).not.toHaveBeenCalled();
+  });
+  it('rejects a scope confirmation captured for a former target', async () => {
+    const { result, rerender } = await scopedReady();
+    const oldConfig = result.current.config;
+    rerender({ target: { ...target, host: 'other.example' } });
+    await act(async () => expect(await result.current.confirmDestination(oldConfig, target)).toBe(false));
+    expect(mocks.confirmScope).not.toHaveBeenCalled();
+  });
+});
+
+describe('ambiguous unified submission fencing', () => {
+  it('keeps an unknown accepted submission fenced when response, events and reads are lost', async () => {
+    mocks.send.mockRejectedValue(new Error('IPC response lost after acceptance'));
+    mocks.get.mockRejectedValue(new Error('snapshot unavailable'));
+    const { result } = await ready();
+    act(() => result.current.updateDraft('chat-a', 'run the task'));
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false));
+    expect(result.current.uncertainSubmissions['chat-a']).toBe(true);
+    expect(result.current.drafts['chat-a']).toBe('run the task');
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false));
+    await act(async () => result.current.reconcileSubmission('chat-a'));
+    expect(mocks.send).toHaveBeenCalledOnce();
+    expect(result.current.uncertainSubmissions['chat-a']).toBe(true);
+  });
+  it('consumes an accepted draft before unlocking when the first run already completed', async () => {
+    mocks.send.mockRejectedValue(new Error('IPC response lost'));
+    const completed = { ...stream('chat-a', '3', 'Done'), active_run_id: null };
+    completed.messages[0].text = 'run once'; completed.messages[1].state = 'complete';
+    mocks.get.mockResolvedValue(completed);
+    const { result } = await ready();
+    act(() => result.current.updateDraft('chat-a', 'run once'));
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false));
+    expect(result.current.uncertainSubmissions['chat-a']).toBeUndefined();
+    expect(result.current.drafts['chat-a']).toBe('');
+    await act(async () => expect(await result.current.send('chat-a')).toBe(false));
+    expect(mocks.send).toHaveBeenCalledOnce();
+  });
+  it('does not treat an unchanged snapshot as proof, then reconciles a later authoritative event without replay', async () => {
+    mocks.send.mockRejectedValue(new Error('IPC response lost'));
+    mocks.get.mockResolvedValue(chat());
+    const { result } = await ready();
+    act(() => result.current.updateDraft('chat-a', 'one execution'));
+    await act(async () => result.current.send('chat-a'));
+    expect(result.current.uncertainSubmissions['chat-a']).toBe(true);
+    const accepted = stream('chat-a', '3'); accepted.messages[0].text = 'one execution';
+    act(() => emit({ kind: 'chat_updated', chat: accepted }));
+    expect(result.current.uncertainSubmissions['chat-a']).toBeUndefined();
+    expect(result.current.drafts['chat-a']).toBe('');
+    expect(mocks.send).toHaveBeenCalledOnce();
+  });
+  it('allows correction after a proven preflight rejection, without reissuing automatically', async () => {
+    mocks.send.mockRejectedValue({ code: 'SESSION_STALE', safe_message: '连接已变化。' });
+    const { result } = await ready();
+    act(() => result.current.updateDraft('chat-a', 'keep instruction'));
+    await act(async () => result.current.send('chat-a'));
+    expect(result.current.uncertainSubmissions['chat-a']).toBeUndefined();
+    expect(result.current.drafts['chat-a']).toBe('keep instruction');
+    expect(mocks.send).toHaveBeenCalledOnce();
   });
 });

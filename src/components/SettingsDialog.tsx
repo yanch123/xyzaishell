@@ -103,7 +103,7 @@ export function SettingsDialog({ onClose, model, onConsent, onHistoryStatus }: {
   };
   const testResultCurrent = model.configTest?.file_revision === config.file_revision;
   const canSave = model.native && !model.configBusy && !model.configWriteBlocked && !!baseline.file_revision && !stale;
-  return <NonModalPanel title="工作空间设置" eyebrow="XYZAI SHELL · v0.1.3" onClose={() => requestLeave('close')} className="settings-modal">
+  return <NonModalPanel title="工作空间设置" eyebrow="XYZAI SHELL · v0.1.4" onClose={() => requestLeave('close')} className="settings-modal">
     <nav className="settings-categories" aria-label="设置分类">
       {([['model', '模型'], ['terminal', '终端'], ['general', '通用'], ['history', '历史记录']] as const).map(([value, label]) => <button key={value} type="button" aria-current={category === value ? 'page' : undefined} onClick={() => setCategory(value)}>{label}</button>)}
     </nav>
@@ -155,7 +155,7 @@ export function SettingsDialog({ onClose, model, onConsent, onHistoryStatus }: {
       </details>
     </div>}
     {category === 'terminal' && <TerminalSettings />}
-    {category === 'general' && <><div className="settings-section"><div className="settings-icon"><Icon name="terminal" /></div><div><h3>SSH 终端 <span className="feature-badge">独立连接</span></h3><p>密码认证、本机私钥认证、主机指纹核验、交互终端和窗口尺寸同步。每个进程只连接一台服务器；另一目标可以在独立工作窗口打开。</p></div></div><div className="settings-section"><div className="settings-icon"><Icon name="shield" /></div><div><h3>能力与边界</h3><p>文字聊天与终端任务分开。启动终端任务需要数据授权及 Shell 就绪；普通命令在验证就绪后继续，危险或不确定操作保留明确决定。停止 AI 不等于远端程序已停止。历史恢复只供阅读，不恢复执行或批准。</p></div></div></>}
+    {category === 'general' && <><div className="settings-section"><div className="settings-icon"><Icon name="terminal" /></div><div><h3>SSH 终端 <span className="feature-badge">独立连接</span></h3><p>密码认证、本机私钥认证、主机指纹核验、交互终端和窗口尺寸同步。每个进程只连接一台服务器；另一目标可以在独立工作窗口打开。</p></div></div><div className="settings-section"><div className="settings-icon"><Icon name="shield" /></div><div><h3>能力与边界</h3><p>同一对话中可以聊天或执行任务。首次确认模型接收方、数据与当前目标范围后，普通命令在后端验证 Shell 就绪时自动执行；危险命令逐条批准，未知状态暂停。停止 AI 不等于远端程序已停止。历史恢复只供阅读，不恢复执行或批准。</p></div></div></>}
     {category === 'history' && <HistorySettings onStatus={onHistoryStatus} native={model.native} onRestore={chat => { model.restoreChat(chat); requestLeave('close'); }} />}
     {leaveDecision && <div className="settings-decision" role="group" aria-label="处理未保存修改"><p>模型设置有未保存修改。{leaveDecision === 'reload' ? '重新读取会丢弃草稿。' : '关闭会丢弃草稿。'}</p><div className="settings-actions"><button className="button primary" disabled={!canSave} onClick={() => void save(false, leaveDecision)}>保存后{leaveDecision === 'reload' ? '重新读取' : '关闭'}</button><button className="button secondary" onClick={() => void performLeave(leaveDecision)}>放弃修改并{leaveDecision === 'reload' ? '重新读取' : '关闭'}</button><button className="button secondary" onClick={() => setLeaveDecision(null)}>继续编辑</button></div></div>}
     <div className="modal-footer"><button type="button" className="button secondary" disabled={model.configBusy} onClick={() => requestLeave('close')}>关闭设置</button></div>

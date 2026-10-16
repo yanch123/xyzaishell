@@ -12,12 +12,12 @@ import upgrade_baseline as baseline
 
 
 class ReviewedReleasePinsTests(unittest.TestCase):
-    def test_pins_match_reviewed_public_v012_bytes_and_release_run(self):
-        evidence = json.loads((Path(__file__).parent / "fixtures/upgrade-v0.1.2.json").read_text())
-        self.assertEqual((baseline.BASE_VERSION, baseline.TARGET_VERSION), ("0.1.2", "0.1.3"))
+    def test_pins_match_reviewed_public_v013_bytes_and_release_run(self):
+        evidence = json.loads((Path(__file__).parent / "fixtures/upgrade-v0.1.3.json").read_text())
+        self.assertEqual((baseline.BASE_VERSION, baseline.TARGET_VERSION), ("0.1.3", "0.1.4"))
         self.assertEqual(baseline.BASE_COMMIT, evidence["source_commit"])
         self.assertEqual(baseline.BASE_RUN, evidence["workflow_run"])
-        self.assertEqual(baseline.RELEASE_URL, "https://github.com/yanch123/xyzaishell/releases/download/v0.1.2/")
+        self.assertEqual(baseline.RELEASE_URL, "https://github.com/yanch123/xyzaishell/releases/download/v0.1.3/")
         for platform, pins in baseline.PINS.items():
             with self.subTest(platform=platform):
                 reviewed = evidence["platforms"][platform]
@@ -33,12 +33,16 @@ class ReviewedReleasePinsTests(unittest.TestCase):
                         "workflow_run": baseline.BASE_RUN, "workflow_attempt": "1", "platform": platform,
                         "package_file": pins["package"][0], "package_sha256": pins["package"][2]}.items():
                     self.assertEqual(manifest[key], value)
-                installed = reviewed["installed_evidence"]
-                self.assertEqual(installed["result"], "passed")
-                self.assertEqual(installed["application_version"], baseline.BASE_VERSION)
-                self.assertEqual(installed["application_sha256"], pins["application_sha256"])
-                if platform == "linux-x64":
-                    self.assertEqual(reviewed["independently_extracted_application_sha256"], pins["application_sha256"])
+                self.assertEqual(reviewed["independently_extracted_application_sha256"], pins["application_sha256"])
+                self.assertEqual(reviewed["extraction"]["package_sha256"], pins["package"][2])
+                self.assertGreater(reviewed["extraction"]["application_size"], 0)
+
+
+    def test_public_release_identity_is_not_candidate_ci_identity(self):
+        self.assertEqual(baseline.BASE_RUN, "38841350614")
+        self.assertEqual(baseline.PINS["windows-x64"]["package"][2], "d6e80d6da81aca9ab451bf8ff4f71b930e544272a77ae7861e4b77b67ecf3894")
+        self.assertEqual(baseline.PINS["windows-x64"]["application_sha256"], "45c43d393089529574d4e9c71f4403ab378fe6ec6dbb9a0f3b8277d9eb685e49")
+        self.assertNotEqual(baseline.PINS["windows-x64"]["application_sha256"], "dc101bb4af086041fb1deac1c88de56a422f13ffd387ed33590191fc6af43217")
 
 
 class UpgradeBaselineTests(unittest.TestCase):
@@ -77,23 +81,23 @@ class UpgradeBaselineTests(unittest.TestCase):
             directory = self.fixture(platform)
             app = self.root / (platform + "-app")
             app.write_bytes(b"baseline executable")
-            self.assertEqual(baseline.verify(directory, platform, "0.1.3", app).name, self.pins[platform]["package"][0])
+            self.assertEqual(baseline.verify(directory, platform, "0.1.4", app).name, self.pins[platform]["package"][0])
             app.write_bytes(b"other executable")
             with self.assertRaises(ValueError):
-                baseline.verify(directory, platform, "0.1.3", app)
+                baseline.verify(directory, platform, "0.1.4", app)
 
     def test_unknown_target_missing_or_changed_assets_fail(self):
         directory = self.fixture("linux-x64")
-        for version in ("0.1.0", "0.1.1", "0.1.2", "0.1.4", "latest"):
+        for version in ("0.1.0", "0.1.1", "0.1.3", "0.1.5", "latest"):
             with self.assertRaises(ValueError):
                 baseline.verify(directory, "linux-x64", version)
         package = directory / self.pins["linux-x64"]["package"][0]
         package.write_bytes(b"changed")
         with self.assertRaises(ValueError):
-            baseline.verify(directory, "linux-x64", "0.1.3")
+            baseline.verify(directory, "linux-x64", "0.1.4")
         package.unlink()
         with self.assertRaises(ValueError):
-            baseline.verify(directory, "linux-x64", "0.1.3")
+            baseline.verify(directory, "linux-x64", "0.1.4")
 
     def test_symlink_asset_rejected(self):
         directory = self.fixture("linux-x64")
@@ -102,7 +106,7 @@ class UpgradeBaselineTests(unittest.TestCase):
         path.rename(target)
         path.symlink_to(target)
         with self.assertRaises(ValueError):
-            baseline.verify(directory, "linux-x64", "0.1.3")
+            baseline.verify(directory, "linux-x64", "0.1.4")
 
     def test_manifest_fields_are_bound_even_if_manifest_pin_is_updated(self):
         directory = self.fixture("linux-x64")
@@ -114,7 +118,7 @@ class UpgradeBaselineTests(unittest.TestCase):
                 body = json.dumps(changed).encode();path.write_bytes(body)
                 self.pins["linux-x64"]["manifest"] = (path.name, len(body), hashlib.sha256(body).hexdigest())
                 with self.assertRaises(ValueError):
-                    baseline.verify(directory, "linux-x64", "0.1.3")
+                    baseline.verify(directory, "linux-x64", "0.1.4")
 
     def test_installed_executable_must_be_regular_and_not_a_symlink(self):
         directory = self.fixture("linux-x64")
@@ -123,10 +127,10 @@ class UpgradeBaselineTests(unittest.TestCase):
         application = self.root / "symlink-application"
         application.symlink_to(target)
         with self.assertRaises(ValueError):
-            baseline.verify(directory, "linux-x64", "0.1.3", application)
+            baseline.verify(directory, "linux-x64", "0.1.4", application)
         application.unlink()
         with self.assertRaises(ValueError):
-            baseline.verify(directory, "linux-x64", "0.1.3", application)
+            baseline.verify(directory, "linux-x64", "0.1.4", application)
 
     def test_download_is_bounded_and_never_overwrites_output(self):
         def response(request, timeout):
@@ -138,10 +142,10 @@ class UpgradeBaselineTests(unittest.TestCase):
             return stream
         directory = self.root / "downloaded"
         with patch.object(baseline, "open_https", side_effect=response) as opened:
-            baseline.download(directory, "windows-x64", "0.1.3")
+            baseline.download(directory, "windows-x64", "0.1.4")
             self.assertEqual(opened.call_count, 2)
             with self.assertRaises(FileExistsError):
-                baseline.download(directory, "windows-x64", "0.1.3")
+                baseline.download(directory, "windows-x64", "0.1.4")
             self.assertEqual(opened.call_count, 2)
 
     def test_http_redirect_is_rejected_before_following_it(self):
@@ -158,7 +162,7 @@ class UpgradeBaselineTests(unittest.TestCase):
                 return stream
             with patch.object(baseline, "open_https", side_effect=response):
                 with self.assertRaises(ValueError):
-                    baseline.download(self.root / kind, "linux-x64", "0.1.3")
+                    baseline.download(self.root / kind, "linux-x64", "0.1.4")
 
 
 if __name__ == "__main__":

@@ -162,7 +162,7 @@ describe('log startup requires independent command recognition', () => {
   beforeEach(() => { vi.resetAllMocks(); vi.mocked(shellLogBridge.status).mockResolvedValue(status); vi.mocked(shellLogBridge.listen).mockResolvedValue(vi.fn()); vi.mocked(shellLogBridge.query).mockResolvedValue(page); });
   it('blocks an unintegrated or wrong-session start without invoking native startup', async () => {
     const view=render(<ShellLogDialog native snapshot={snapshot} integration={{...integration,phase:'unintegrated'}} onClose={vi.fn()}/>);
-    await screen.findByText(/请先通过工具栏/);
+    await screen.findByText(/请等待自动准备完成/);
     expect(screen.getAllByRole('checkbox')).toHaveLength(1);
     expect((screen.getByRole('checkbox') as HTMLInputElement).disabled).toBe(true);
     fireEvent.click(screen.getByRole('button',{name:'启动终端日志'}));expect(shellLogBridge.start).not.toHaveBeenCalled();

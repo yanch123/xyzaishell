@@ -1,3 +1,4 @@
+import type { TerminalTaskSnapshot } from './agent';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { ChatSnapshot, ModelConfigStatus, ModelEvent, SaveModelConfigRequest, ModelTestRequest, ModelTestResult } from './model';
@@ -15,7 +16,9 @@ export const modelBridge = {
   list: () => invoke<ChatSnapshot[]>('list_chats'),
   create: (title = '新任务', source: SessionRef | null = null) => invoke<ChatSnapshot>('create_chat', { title, source }),
   get: (chatId: string) => invoke<ChatSnapshot>('get_chat', { chatId }),
-  send: (chatId: string, text: string) => invoke<ChatSnapshot>('send_chat_message', { chatId, text }),
+  send: (chatId: string, text: string, revision: string, destination: string, session: SessionRef | null) => invoke<{ kind: 'chat'; chat: ChatSnapshot } | { kind: 'terminal'; task: TerminalTaskSnapshot }>('submit_conversation_turn', { chatId, text, revision, destination, session }),
+  confirmScope: (revision: string, destination: string, session: SessionRef | null) => invoke<ModelConfigStatus>('confirm_conversation_scope', { request: { revision, destination, session } }),
+  sendText: (chatId: string, text: string) => invoke<ChatSnapshot>('send_chat_message', { chatId, text }),
   cancel: (chatId: string, runId: string) => invoke<ChatSnapshot>('cancel_chat_run', { chatId, runId }),
   listen: (handler: (event: ModelEvent) => void) => listen<ModelEvent>('model:event', event => handler(event.payload)),
 };

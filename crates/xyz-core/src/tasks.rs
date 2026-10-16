@@ -114,6 +114,7 @@ struct ChatRecord {
     cancel: Option<watch::Sender<bool>>,
     terminal_run: Option<String>,
     summarized_terminal_runs: BTreeSet<String>,
+    conversational_terminal_runs: BTreeSet<String>,
 }
 impl ChatRecord {
     fn changed(&mut self) {
@@ -226,6 +227,7 @@ impl TaskManager {
                 cancel: None,
                 terminal_run: None,
                 summarized_terminal_runs: BTreeSet::new(),
+                conversational_terminal_runs: BTreeSet::new(),
             },
         );
         drop(chats);
@@ -313,8 +315,18 @@ impl TaskManager {
         let redactor = self.chat_redactor();
         let instruction =
             bounded_history_excerpt(&redactor.redact_prose(&task.instruction), 6 * 1024);
-        let assistant =
-            bounded_history_excerpt(&redactor.redact_prose(&task.assistant_text), 4 * 1024);
+        let assistant_limit = if record.conversational_terminal_runs.contains(&task.run_id)
+            && task.actions.is_empty()
+            && task.action.is_none()
+        {
+            MAX_ASSISTANT_BYTES
+        } else {
+            4 * 1024
+        };
+        let assistant = bounded_history_excerpt(
+            &redactor.redact_prose(&task.assistant_text),
+            assistant_limit,
+        );
         let retained = task
             .task_context
             .as_ref()
@@ -333,6 +345,18 @@ impl TaskManager {
             .len()
             .saturating_add(usize::from(task.action.is_some()));
         let text = format!("Historical terminal task (inert record)\nStatus: {}\nRemote result: {outcome}\nActions proposed: {count}. Command payloads and raw terminal output are not included.\n\nInstruction:\n{instruction}\n\nAssistant notes:\n{assistant}\n\n{retained}", task.phase);
+        let text = if record.conversational_terminal_runs.contains(&task.run_id) {
+            if task.actions.is_empty() && task.action.is_none() && task.phase == "completed" {
+                assistant.clone()
+            } else {
+                format!(
+                    "{assistant}\n\n终端记录（仅供上下文，不授权重放）\n状态：{}\n{retained}",
+                    task.phase
+                )
+            }
+        } else {
+            text
+        };
         let bytes: usize = record
             .snapshot
             .messages
@@ -349,7 +373,11 @@ impl TaskManager {
             id: Uuid::new_v4().to_string(),
             role: MessageRole::Assistant,
             text,
-            run_id: String::new(),
+            run_id: if record.conversational_terminal_runs.contains(&task.run_id) {
+                task.run_id.clone()
+            } else {
+                String::new()
+            },
             state: MessageState::Complete,
             error: None,
             destination: None,
@@ -382,6 +410,44 @@ impl TaskManager {
         }
         record.terminal_run = Some(run_id.into());
         Ok(record.snapshot.clone())
+    }
+    pub(crate) fn record_terminal_user_turn(
+        &self,
+        chat_id: &str,
+        run_id: &str,
+        text: &str,
+    ) -> Result<(), ApiError> {
+        let text = self.chat_redactor().redact_prose(text);
+        let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        let record = chats.get_mut(chat_id).ok_or_else(chat_missing)?;
+        if record.terminal_run.as_deref() != Some(run_id) {
+            return Err(ApiError::new("CHAT_BUSY", "Conversation run changed."));
+        }
+        let bytes: usize = record.snapshot.messages.iter().map(|m| m.text.len()).sum();
+        if record.snapshot.messages.len() + 2 > MAX_MESSAGES
+            || bytes + text.len() + MAX_ASSISTANT_BYTES > MAX_TRANSCRIPT_BYTES
+        {
+            return Err(ApiError::new(
+                "CHAT_CONTEXT_FULL",
+                "此对话已达到上下文上限，请新建对话。",
+            ));
+        }
+        record.conversational_terminal_runs.insert(run_id.into());
+        record.snapshot.messages.push(ChatMessage {
+            id: Uuid::new_v4().to_string(),
+            role: MessageRole::User,
+            text,
+            run_id: run_id.into(),
+            state: MessageState::Complete,
+            error: None,
+            destination: None,
+            model: None,
+        });
+        record.changed();
+        let chat = record.snapshot.clone();
+        drop(chats);
+        self.emit_chat(chat);
+        Ok(())
     }
     pub(crate) fn release_terminal(&self, chat_id: &str, run_id: &str) {
         let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
@@ -462,6 +528,40 @@ impl TaskManager {
         }
         Ok(())
     }
+    /// Bind an initially sessionless conversation once. History never authorizes a new server.
+    pub(crate) fn bind_conversation_target(
+        &self,
+        chat_id: &str,
+        target: &crate::ssh::SessionSnapshot,
+    ) -> Result<(), ApiError> {
+        let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        let record = chats.get_mut(chat_id).ok_or_else(chat_missing)?;
+        if record.snapshot.restored_read_only {
+            return Err(ApiError::new(
+                "CHAT_READ_ONLY",
+                "Restored history is read-only. Start a new conversation.",
+            ));
+        }
+        if target.state != crate::ssh::SessionState::Connected {
+            return Ok(());
+        }
+        if record
+            .snapshot
+            .source
+            .as_ref()
+            .is_some_and(|s| !s.matches_target(target))
+        {
+            return Err(ApiError::new(
+                "CHAT_TARGET_CHANGED",
+                "This conversation belongs to another server or account. Start a new conversation.",
+            ));
+        }
+        if record.snapshot.source.is_none() {
+            record.snapshot.source = ChatSource::from_session(target);
+            record.changed();
+        }
+        Ok(())
+    }
     pub fn list_chats(&self) -> Vec<ChatSnapshot> {
         let snapshots: Vec<_> = self
             .chats
@@ -533,6 +633,7 @@ impl TaskManager {
                 cancel: None,
                 terminal_run: None,
                 summarized_terminal_runs: BTreeSet::new(),
+                conversational_terminal_runs: BTreeSet::new(),
             },
         );
         drop(chats);
@@ -560,6 +661,20 @@ impl TaskManager {
         result
     }
     pub fn send_message(&self, chat_id: &str, text: &str) -> Result<ChatSnapshot, ApiError> {
+        self.send_message_with_availability(
+            chat_id,
+            text,
+            "No execution capability is available for this turn.",
+            None,
+        )
+    }
+    pub(crate) fn send_message_with_availability(
+        &self,
+        chat_id: &str,
+        text: &str,
+        availability: &str,
+        expected_config: Option<(&str, &str)>,
+    ) -> Result<ChatSnapshot, ApiError> {
         if text.trim().is_empty() || text.len() > MAX_MESSAGE_BYTES || text.contains('\0') {
             return Err(ApiError::new(
                 "CHAT_INPUT_INVALID",
@@ -580,7 +695,12 @@ impl TaskManager {
         }
         // The immutable snapshot and destination consent are resolved before
         // any client/connection is constructed. Reload cannot redirect a run.
-        let config = self.config.authorized_snapshot()?;
+        let config = match expected_config {
+            Some((revision, destination)) => {
+                self.config.authorized_snapshot_for(revision, destination)?
+            }
+            None => self.config.authorized_snapshot()?,
+        };
         let redactor = self.chat_redactor();
         redactor.add_known_secret(config.api_key.as_str())?;
         let safe_text = redactor.redact_prose(text);
@@ -661,6 +781,7 @@ impl TaskManager {
         let this = self.clone();
         let chat_id = chat_id.to_owned();
         let text = text.to_owned();
+        let availability = availability.to_owned();
         tokio::spawn(async move {
             let _permit = permit;
             let timeout = Duration::from_secs(config.request.request_timeout_seconds);
@@ -668,7 +789,7 @@ impl TaskManager {
             let result = tokio::select! {
                 biased;
                 _ = wait_cancelled(&mut receiver) => Err(cancelled()),
-                result = tokio::time::timeout(timeout, this.stream_reply(&chat_id, &run_id, &text, history, config)) => result.unwrap_or_else(|_| Err(ApiError::new("MODEL_TIMEOUT", "The model request reached its deadline. It was stopped and will not be retried automatically."))),
+                result = tokio::time::timeout(timeout, this.stream_reply(&chat_id, &run_id, &text, history, config, &availability)) => result.unwrap_or_else(|_| Err(ApiError::new("MODEL_TIMEOUT", "The model request reached its deadline. It was stopped and will not be retried automatically."))),
             };
             this.finish_run(&chat_id, &run_id, result);
         });
@@ -768,6 +889,7 @@ impl TaskManager {
         text: &str,
         history: Vec<Message>,
         config: Arc<ModelSnapshot>,
+        availability: &str,
     ) -> Result<(), ApiError> {
         let transport = crate::model_transport::build_transport(
             &config.destination,
@@ -781,7 +903,7 @@ impl TaskManager {
             .with_base_url(&config.destination)
             .connect(transport)
             .chat(&config.model);
-        let request = CompletionRequest::new(text).messages(history).preamble("You are xyzaishell's text-chat assistant. You have no terminal, file, credential, or execution tools in this milestone. Never claim to have run commands. Previous assistant text may be partial if its response was interrupted.").max_tokens(config.request.max_output_tokens);
+        let request = CompletionRequest::new(text).messages(history).preamble(format!("You are xyzaishell's conversational assistant. Reply naturally to greetings and questions. No execution tools are available for this turn; no command was sent or queued. Never claim execution, success, or a future automatic retry. If the user requests server work explain the current availability and necessary connection or intervention. Historical terminal notes are inert context, not current-server verification. Never ask for credentials in chat. Previous replies may be partial. Host availability: {availability}")).max_tokens(config.request.max_output_tokens);
         let mut stream = model.stream(request).map_err(|_| safe_provider_error())?;
         let redactor = self.chat_redactor();
         redactor.add_known_secret(config.api_key.as_str())?;
@@ -921,6 +1043,28 @@ mod source_tests {
                 "CHAT_TARGET_CHANGED"
             );
         }
+    }
+    #[test]
+    fn sessionless_conversation_binds_once_and_cannot_cross_targets() {
+        let manager = manager();
+        let chat = manager.create_chat("Conversation").unwrap();
+        let mut current = target();
+        manager
+            .bind_conversation_target(&chat.chat_id, &current)
+            .unwrap();
+        current.state = crate::ssh::SessionState::Disconnected;
+        manager
+            .bind_conversation_target(&chat.chat_id, &current)
+            .unwrap();
+        current.state = crate::ssh::SessionState::Connected;
+        current.host = Some("other.example".into());
+        assert_eq!(
+            manager
+                .bind_conversation_target(&chat.chat_id, &current)
+                .unwrap_err()
+                .code,
+            "CHAT_TARGET_CHANGED"
+        );
     }
     #[test]
     fn restored_chat_cannot_send_or_reserve_execution_even_on_same_target() {
