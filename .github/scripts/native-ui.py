@@ -383,14 +383,42 @@ def enable_history(driver, version):
     wait_for(lambda: driver.find(driver.button("停止保存聊天历史")))
 
 
+SETTINGS_BASIC_FIELDS_SCRIPT = """
+const visible = element => {
+  if (!element.getClientRects().length) return false;
+  for (let node = element; node; node = node.parentElement) {
+    const style = getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+    // WebKit/WebView2 may retain geometry for children of closed details.
+    // Such descendants are not exposed unless they belong to the summary.
+    if (node.tagName === 'DETAILS' && !node.open) {
+      const summary = [...node.children].find(child => child.tagName === 'SUMMARY');
+      if (!summary?.contains(element)) return false;
+    }
+  }
+  return true;
+};
+const fields = [...document.querySelectorAll('.settings-modal input')]
+  .filter(element => !['checkbox', 'radio'].includes(element.type) && visible(element))
+  .map(element => element.closest('label')?.firstChild?.textContent.trim());
+const collapsed = ['.settings-advanced-tests', '.settings-key-management', '.settings-context-budget']
+  .every(selector => { const nodes = document.querySelectorAll(selector); return nodes.length === 1 && !nodes[0].open; });
+return { fields, collapsed };
+"""
+
+
+def verify_basic_model_fields(driver):
+    result = driver.js(SETTINGS_BASIC_FIELDS_SCRIPT)
+    assert result == {"fields": ["Base URL", "API Key", "模型名"], "collapsed": True}, f"Unexpected visible basic model form: {result}"
+
+
 def configure_candidate_model(driver, server, version):
     # The fixture file authorizes loopback HTTP and advanced options only. The
     # synthetic key is entered/saved through the actual candidate UI, not IPC.
     driver.click(driver.button("打开设置"))
     wait_for(lambda: driver.js("return document.querySelector('.settings-modal')?.getAttribute('aria-modal') === 'false'"))
     if version == TARGET_VERSION:
-        assert driver.js("return !document.querySelector('.settings-advanced-tests').open && !document.querySelector('.settings-key-management').open")
-        assert driver.js("return [...document.querySelectorAll('.settings-modal input')].filter(e=>e.getClientRects().length && e.type !== 'checkbox' && e.type !== 'radio').length === 3")
+        verify_basic_model_fields(driver)
     save = wait_for(lambda: driver.find(driver.button("保存")))
     wait_for(lambda: driver.command("GET", f"/element/{save}/enabled"))
     assert driver.js("return !document.querySelector('.app-shell').hasAttribute('inert')")

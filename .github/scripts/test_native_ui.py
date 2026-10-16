@@ -40,6 +40,24 @@ class NativeVersionPhaseTests(unittest.TestCase):
                 native.verify_phase_version(phase, version, "hash", None)
 
 
+class NativeSettingsVisibilityTests(unittest.TestCase):
+    def test_exact_named_basic_fields_and_closed_advanced_sections_required(self):
+        driver = mock.Mock()
+        driver.js.return_value = {"fields": ["Base URL", "API Key", "模型名"], "collapsed": True}
+        native.verify_basic_model_fields(driver)
+        script = driver.js.call_args.args[0]
+        self.assertIn("node.tagName === 'DETAILS' && !node.open", script)
+        self.assertIn("summary?.contains(element)", script)
+        self.assertIn("getComputedStyle(node)", script)
+        self.assertIn(".settings-context-budget", script)
+        for result in ({"fields": ["Base URL", "API Key", "模型名", "上下文窗口（tokens）"], "collapsed": True},
+                       {"fields": ["Base URL", "API Key", "模型名"], "collapsed": False},
+                       {"fields": ["Base URL", "API Key"], "collapsed": True}):
+            driver.js.return_value = result
+            with self.assertRaisesRegex(AssertionError, "basic model form"):
+                native.verify_basic_model_fields(driver)
+
+
 class NativeIdleSelectorTests(unittest.TestCase):
     def test_released_baseline_retains_its_actual_status_selector(self):
         driver = mock.Mock()

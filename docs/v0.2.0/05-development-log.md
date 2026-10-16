@@ -45,3 +45,9 @@ GitHub Actions [38946919401](https://github.com/yanch123/xyzaishell/actions/runs
 ## 03 — Windows 静态检查兼容修正
 
 集成提交 `89d912b39a145cbcd5a67b78e34798e0b89ec9ad` 的云端运行 [38950409484](https://github.com/yanch123/xyzaishell/actions/runs/38950409484) 已通过前端、浏览器、三个 SSH／PTY 场景及 Windows 核心测试；Windows Clippy 在安装包构建前发现测试模块之后仍有实现项。现将该文件的测试模块统一移到全部实现项之后，不添加 lint 豁免、不改变运行逻辑。安装后的原生验收须等待修正提交的完整流水线，当前不能标记整版验收完成。
+
+## 04 — 原生折叠设置可见性断言修正
+
+修正提交 `d560fbd029519364a2f29130ab5fe739e21b43af` 的 Windows Clippy、两平台安装包、安装烟雾检查均通过。运行 [38952035582](https://github.com/yanch123/xyzaishell/actions/runs/38952035582) 的三平台原生界面测试在同一设置表单断言停止：截图与 DOM 证明界面只显示 Base URL／API Key／模型名，高级容量项处于折叠状态，但 WebKit／WebView2 的 `getClientRects()` 仍可能返回折叠子项的几何信息。
+
+测试脚本改为结合祖先样式、闭合 details 状态及三个基本字段的精确名称检查，继续要求高级设置默认折叠，不放宽为“至少三个字段”。新增捕获 DOM 回归用例后，92 项辅助脚本测试通过。应用代码不变；后续压缩与升级路径仍须重新执行，不能由本次断言修正推定通过。
