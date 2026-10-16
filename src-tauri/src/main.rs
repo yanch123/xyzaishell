@@ -255,6 +255,68 @@ fn get_chat(chat_id: String, state: State<'_, TaskManager>) -> Result<ChatSnapsh
     state.get_chat(&chat_id)
 }
 #[tauri::command]
+async fn get_context_usage(
+    chat_id: String,
+    expected_context_revision: Option<String>,
+    draft: Option<String>,
+    state: State<'_, TaskManager>,
+) -> Result<xyz_core::context::ContextUsageSnapshot, ApiError> {
+    state
+        .get_context_usage(
+            &chat_id,
+            expected_context_revision.as_deref(),
+            draft.as_deref(),
+        )
+        .await
+}
+#[tauri::command]
+async fn compact_context(
+    chat_id: String,
+    expected_context_revision: String,
+    mode: xyz_core::context::CompactionMode,
+    client_request_id: String,
+    state: State<'_, TaskManager>,
+) -> Result<xyz_core::tasks::CompactionJobStatus, ApiError> {
+    state
+        .compact_context(
+            &chat_id,
+            &expected_context_revision,
+            mode,
+            &client_request_id,
+        )
+        .await
+}
+#[tauri::command]
+fn get_context_compaction(
+    chat_id: String,
+    state: State<'_, TaskManager>,
+) -> Result<Option<xyz_core::tasks::CompactionJobStatus>, ApiError> {
+    state.get_context_compaction(&chat_id)
+}
+#[tauri::command]
+fn cancel_context_compaction(
+    chat_id: String,
+    job_id: String,
+    state: State<'_, TaskManager>,
+) -> Result<xyz_core::tasks::CompactionJobStatus, ApiError> {
+    state.cancel_context_compaction(&chat_id, &job_id)
+}
+#[tauri::command]
+async fn read_saved_chat_page(
+    chat_id: String,
+    expected_revision: String,
+    before_sequence: Option<u64>,
+    limit: usize,
+    state: State<'_, TaskManager>,
+) -> Result<xyz_core::history::HistoryPage, ApiError> {
+    let tasks = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        tasks.read_saved_chat_page(&chat_id, &expected_revision, before_sequence, limit)
+    })
+    .await
+    .map_err(|_| worker_error())?
+}
+#[tauri::command]
 fn confirm_conversation_scope(
     request: ConversationScopeConsent,
     state: State<'_, AgentManager>,
@@ -674,6 +736,11 @@ fn main() {
             list_chats,
             create_chat,
             get_chat,
+            get_context_usage,
+            compact_context,
+            get_context_compaction,
+            cancel_context_compaction,
+            read_saved_chat_page,
             send_chat_message,
             submit_conversation_turn,
             get_conversation_submission,

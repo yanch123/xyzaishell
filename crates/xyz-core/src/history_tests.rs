@@ -658,3 +658,225 @@ fn opt_in_snapshot_handoff_serializes_concurrent_chat_creation() {
     assert!(saved.iter().any(|entry| entry.chat_id == chat.chat_id));
     manager.set_history_enabled(false).unwrap();
 }
+
+#[test]
+fn archive_page_is_display_only_and_saved_revision_requires_success() {
+    let fixture = Fixture::new();
+    let service = fixture.service(ObservationBuffer::new());
+    let mut source = snapshot();
+    let template = source.messages[0].clone();
+    source.messages = (0..300)
+        .map(|index| {
+            let mut message = template.clone();
+            message.id = id();
+            message.text = format!("Original display message {index}");
+            message
+        })
+        .collect();
+    assert_eq!(service.saved_live_revision(&source.chat_id), None);
+    service.set_enabled(true, &[source.clone()]).unwrap();
+    assert_eq!(service.saved_live_revision(&source.chat_id), Some(1));
+    let entry = service.list().unwrap().remove(0);
+    assert_eq!(entry.message_count, 300);
+    let latest = service
+        .page(&source.chat_id, &entry.revision, None, 128)
+        .unwrap();
+    assert_eq!(latest.chat.messages.len(), 128);
+    assert!(latest.chat.restored_read_only);
+    assert!(latest.chat.active_run_id.is_none());
+    assert_eq!(latest.total_messages, 300);
+    let older = service
+        .page(&source.chat_id, &entry.revision, latest.next_before, 128)
+        .unwrap();
+    assert_eq!(older.chat.messages.len(), 128);
+    assert_ne!(older.chat.messages[0].id, latest.chat.messages[0].id);
+    source.messages = source.messages.split_off(290);
+    source.revision = "2".into();
+    service.capture(&source);
+    service.flush().unwrap();
+    assert_eq!(service.saved_live_revision(&source.chat_id), Some(2));
+    assert_eq!(service.list().unwrap()[0].message_count, 300);
+    service.set_enabled(false, &[]).unwrap();
+    assert_eq!(
+        service
+            .page(&source.chat_id, &entry.revision, None, 128)
+            .unwrap_err()
+            .code,
+        "HISTORY_DISABLED"
+    );
+}
+
+#[test]
+fn cache_marker_error_text_cannot_suppress_unregistered_originals() {
+    let fixture = Fixture::new();
+    let service = fixture.service(ObservationBuffer::new());
+    let mut source = snapshot();
+    source.messages[0].error = Some(ApiError::new(
+        "HISTORY_ARCHIVED_CACHE",
+        "A model-like marker is not authority",
+    ));
+    service.set_enabled(true, &[source.clone()]).unwrap();
+    let entry = service.list().unwrap().remove(0);
+    let page = service
+        .page(&source.chat_id, &entry.revision, None, 128)
+        .unwrap();
+    assert_eq!(page.chat.messages[0].text, source.messages[0].text);
+    assert_eq!(page.total_messages, 1);
+}
+
+#[test]
+fn archive_queue_byte_budget_releases_on_drop_consume_and_disabled_epoch() {
+    let fixture = Fixture::new();
+    let service = fixture.service(ObservationBuffer::new());
+    let mut source = snapshot();
+    let template = source.messages[0].clone();
+    source.messages = (0..40)
+        .map(|_| {
+            let mut m = template.clone();
+            m.id = id();
+            m.text = "x".repeat(60_000);
+            m
+        })
+        .collect();
+    let first = service.prepare(&source, 0).unwrap();
+    let second = service.prepare(&source, 0).unwrap();
+    let third = service.prepare(&source, 0).unwrap();
+    assert!(service.shared.capture_bytes.load(Ordering::SeqCst) <= QUEUE_BYTES);
+    assert_eq!(
+        service.prepare(&source, 0).err().unwrap().code,
+        "HISTORY_QUEUE_FULL"
+    );
+    drop(second);
+    assert!(service.prepare(&source, 0).is_ok());
+    drop(first);
+    drop(third);
+    assert_eq!(service.shared.capture_bytes.load(Ordering::SeqCst), 0);
+    service
+        .set_enabled(true, std::slice::from_ref(&source))
+        .unwrap();
+    service.flush().unwrap();
+    assert_eq!(service.shared.capture_bytes.load(Ordering::SeqCst), 0);
+    let stale = service
+        .prepare(&source, service.shared.epoch.load(Ordering::SeqCst))
+        .unwrap();
+    service.set_enabled(false, &[]).unwrap();
+    service.sender.send(Command::Capture(stale)).unwrap();
+    service.flush().unwrap();
+    assert_eq!(service.shared.capture_bytes.load(Ordering::SeqCst), 0);
+}
+#[test]
+fn oversized_capture_stops_saving_visibly_before_queue_allocates() {
+    let fixture = Fixture::new();
+    let service = fixture.service(ObservationBuffer::new());
+    service.set_enabled(true, &[]).unwrap();
+    let mut source = snapshot();
+    let template = source.messages[0].clone();
+    source.messages = (0..140)
+        .map(|_| {
+            let mut m = template.clone();
+            m.id = id();
+            m.text = "x".repeat(60_000);
+            m
+        })
+        .collect();
+    service.capture(&source);
+    assert!(!service.status().enabled);
+    assert_eq!(service.status().error.unwrap().code, "HISTORY_QUEUE_FULL");
+    assert_eq!(service.shared.capture_bytes.load(Ordering::SeqCst), 0);
+    assert!(service.list().unwrap().is_empty());
+}
+fn compaction_record() -> CompactionArchiveRecord {
+    CompactionArchiveRecord {
+        event_id: id(),
+        context_revision: "9".into(),
+        summary_text: "Synthetic inert summary known-summary-secret".into(),
+        source_ids: vec![id()],
+        omitted_ranges: vec!["old wording abbreviated".into()],
+        mode: "quick".into(),
+        reason: "manual".into(),
+        before_tokens: 4000,
+        after_tokens: 200,
+        before_bytes: 16000,
+        after_bytes: 800,
+    }
+}
+#[test]
+fn compaction_archive_is_opt_in_redacted_paged_inert_and_survives_reopen() {
+    let fixture = Fixture::new();
+    let redactor = ObservationBuffer::new();
+    redactor.add_known_secret("known-summary-secret").unwrap();
+    let service = fixture.service(redactor);
+    let source = snapshot();
+    let first = compaction_record();
+    service.capture_compaction(&source.chat_id, &first);
+    service.flush().unwrap();
+    assert!(!fixture.path.exists());
+    service
+        .set_enabled(true, std::slice::from_ref(&source))
+        .unwrap();
+    service.capture_compaction(&source.chat_id, &first);
+    let second = compaction_record();
+    service.capture_compaction(&source.chat_id, &second);
+    service.flush().unwrap();
+    let page = service.compaction_page(&source.chat_id, None, 1).unwrap();
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(page.records[0].event_id, second.event_id);
+    assert!(page.next_before.is_some());
+    assert!(!page.records[0]
+        .summary_text
+        .contains("known-summary-secret"));
+    let old = service
+        .compaction_page(&source.chat_id, page.next_before, 1)
+        .unwrap();
+    assert_eq!(old.records[0].event_id, first.event_id);
+    let entry = service.list().unwrap().remove(0);
+    let restored = service.restore(&source.chat_id, &entry.revision).unwrap();
+    assert!(restored.restored_read_only);
+    assert!(restored.active_run_id.is_none());
+    assert_eq!(restored.messages.len(), 1);
+    service.set_enabled(false, &[]).unwrap();
+    let restarted = fixture.service(ObservationBuffer::new());
+    restarted.set_enabled(true, &[]).unwrap();
+    assert_eq!(
+        restarted
+            .compaction_page(&source.chat_id, None, 128)
+            .unwrap()
+            .records
+            .len(),
+        2
+    );
+    let bytes = fs::read(fixture.path.join(DATABASE_NAME)).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("known-summary-secret"));
+    restarted.forget(&source.chat_id, &entry.revision).unwrap();
+    assert!(restarted
+        .compaction_page(&source.chat_id, None, 128)
+        .unwrap()
+        .records
+        .is_empty());
+}
+
+#[test]
+fn structured_compaction_redacts_decoded_values_without_corrupting_protocol_keys() {
+    let fixture = Fixture::new();
+    let redactor = ObservationBuffer::new();
+    let secret = "quoted \"value\"\nwith newline";
+    redactor.add_known_secret(secret).unwrap();
+    redactor.add_known_secret("summary_text").unwrap();
+    let service = fixture.service(redactor);
+    let source = snapshot();
+    service
+        .set_enabled(true, std::slice::from_ref(&source))
+        .unwrap();
+    let mut event = compaction_record();
+    event.mode = "llm".into();
+    event.summary_text=serde_json::json!({"summary_text":secret,"coverage":{"source_ids":event.source_ids,"omitted_ranges":[]}}).to_string();
+    service.capture_compaction(&source.chat_id, &event);
+    service.flush().unwrap();
+    let page = service.compaction_page(&source.chat_id, None, 128).unwrap();
+    let decoded: serde_json::Value = serde_json::from_str(&page.records[0].summary_text).unwrap();
+    assert!(decoded.get("summary_text").is_some());
+    assert!(!decoded["summary_text"].as_str().unwrap().contains("quoted"));
+    service.set_enabled(false, &[]).unwrap();
+    let bytes = fs::read(fixture.path.join(DATABASE_NAME)).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("with newline"));
+}

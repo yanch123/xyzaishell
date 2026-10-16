@@ -42,6 +42,7 @@ export function SettingsDialog({ onClose, model, onConsent, onHistoryStatus }: {
   const [baseline, setBaseline] = useState(config);
   const [baseUrl, setBaseUrl] = useState(config.base_url ?? config.destination ?? '');
   const [modelName, setModelName] = useState(config.model ?? '');
+  const [contextWindow, setContextWindow] = useState(config.context_window_override_tokens?.toString() ?? '');
   const [newKey, setNewKey] = useState('');
   const [keyMode, setKeyMode] = useState<'keep' | 'replace' | 'clear'>('keep');
   const [reuse, setReuse] = useState(false);
@@ -52,7 +53,7 @@ export function SettingsDialog({ onClose, model, onConsent, onHistoryStatus }: {
   const [testConsent, setTestConsent] = useState(false);
   const [validation, setValidation] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  const dirty = baseUrl !== (baseline.base_url ?? baseline.destination ?? '') || modelName !== (baseline.model ?? '') || keyMode !== 'keep';
+  const dirty = baseUrl !== (baseline.base_url ?? baseline.destination ?? '') || modelName !== (baseline.model ?? '') || keyMode !== 'keep' || contextWindow !== (baseline.context_window_override_tokens?.toString() ?? '');
   const latest = useRef({ config, dirty });
   latest.current = { config, dirty };
   const normalized = normalizeDestination(baseUrl);
@@ -60,9 +61,11 @@ export function SettingsDialog({ onClose, model, onConsent, onHistoryStatus }: {
   const reuseRequired = changedTarget && keyMode === 'keep';
   const stale = dirty && baseline.file_revision !== config.file_revision;
   const invalidModel = !modelName.trim() || new TextEncoder().encode(modelName).length > 256 || /[\x00-\x1f\x7f]/.test(modelName) || modelName.includes('REPLACE_WITH');
+  const windowNumber = contextWindow === '' ? null : Number(contextWindow);
+  const invalidWindow = windowNumber !== null && (!Number.isSafeInteger(windowNumber) || windowNumber <= (config.output_reserve_tokens ?? 4096) + Math.max(1024, Math.ceil(windowNumber * .05)));
   const invalidKey = keyMode === 'replace' && (!newKey || newKey.trim() !== newKey || new TextEncoder().encode(newKey).length > 16384 || /[\x00-\x1f\x7f]/.test(newKey) || newKey.includes('REPLACE_WITH'));
   const reset = (next: ModelConfigStatus) => {
-    setBaseline(next); setBaseUrl(next.base_url ?? next.destination ?? ''); setModelName(next.model ?? '');
+    setBaseline(next); setBaseUrl(next.base_url ?? next.destination ?? ''); setModelName(next.model ?? ''); setContextWindow(next.context_window_override_tokens?.toString() ?? '');
     setNewKey(''); setKeyMode('keep'); setReuse(false); setClearDecision(false); setValidation(false);
   };
   useEffect(() => {
@@ -81,9 +84,9 @@ export function SettingsDialog({ onClose, model, onConsent, onHistoryStatus }: {
   const save = async (testAfter = false, leaveAfter: 'close' | 'reload' | null = null) => {
     const selectedKind = testKind;
     setValidation(true); setMessage(null); setPendingTest(null);
-    if (!normalized || invalidModel || invalidKey || reuseRequired && !reuse || !baseline.file_revision || stale) return;
+    if (!normalized || invalidModel || invalidKey || invalidWindow || reuseRequired && !reuse || !baseline.file_revision || stale) return;
     const keyUpdate: ModelKeyUpdate = keyMode === 'replace' ? { kind: 'replace', value: newKey } : { kind: keyMode };
-    const saved = await model.saveConfig({ expected_file_revision: baseline.file_revision, base_url: baseUrl, model: modelName, key_update: keyUpdate, reuse_key_for_destination: reuseRequired && reuse ? normalized : null });
+    const saved = await model.saveConfig({ expected_file_revision: baseline.file_revision, base_url: baseUrl, model: modelName, context_window_tokens: windowNumber, key_update: keyUpdate, reuse_key_for_destination: reuseRequired && reuse ? normalized : null });
     if (!saved) return;
     reset(saved); setLeaveDecision(null);
     setMessage(saved.ready ? '模型设置已保存。发送聊天前需确认接收方。' : '模型设置已保存，尚未配置 API Key，发送已禁用。');
@@ -103,7 +106,7 @@ export function SettingsDialog({ onClose, model, onConsent, onHistoryStatus }: {
   };
   const testResultCurrent = model.configTest?.file_revision === config.file_revision;
   const canSave = model.native && !model.configBusy && !model.configWriteBlocked && !!baseline.file_revision && !stale;
-  return <NonModalPanel title="工作空间设置" eyebrow="XYZAI SHELL · v0.1.4" onClose={() => requestLeave('close')} className="settings-modal">
+  return <NonModalPanel title="工作空间设置" eyebrow="XYZAI SHELL · v0.2.0" onClose={() => requestLeave('close')} className="settings-modal">
     <nav className="settings-categories" aria-label="设置分类">
       {([['model', '模型'], ['terminal', '终端'], ['general', '通用'], ['history', '历史记录']] as const).map(([value, label]) => <button key={value} type="button" aria-current={category === value ? 'page' : undefined} onClick={() => setCategory(value)}>{label}</button>)}
     </nav>
@@ -111,12 +114,13 @@ export function SettingsDialog({ onClose, model, onConsent, onHistoryStatus }: {
       <div className="settings-model-heading"><h3>模型连接</h3><span className={dirty ? 'subtle-badge' : 'feature-badge'}>{!model.native ? '网页预览' : dirty ? '有未保存修改' : config.file_revision ? '已读取保存状态' : '需要重新读取'}</span></div>
       <p>填写这三项，保存后即可聊天。</p>
       <fieldset className="model-fields" disabled={!model.native || model.configBusy}>
-        <label className="field">Base URL<input type="url" value={baseUrl} onChange={event => { setBaseUrl(event.target.value); setReuse(false); setPendingTest(null); setMessage(null); }} placeholder="https://api.example.com/v1" autoComplete="off" spellCheck={false} aria-invalid={validation && !normalized} /><span className="field-hint">API 根地址，不包含 /chat/completions。</span>{validation && !normalized && <span className="field-error">请填写有效 HTTPS API 根地址，不含账号、查询参数或片段。</span>}</label>
+        <label className="field">Base URL<input type="url" value={baseUrl} onChange={event => { setBaseUrl(event.target.value); setContextWindow(''); setReuse(false); setPendingTest(null); setMessage(null); }} placeholder="https://api.example.com/v1" autoComplete="off" spellCheck={false} aria-invalid={validation && !normalized} /><span className="field-hint">API 根地址，不包含 /chat/completions。</span>{validation && !normalized && <span className="field-error">请填写有效 HTTPS API 根地址，不含账号、查询参数或片段。</span>}</label>
         <label className="field">API Key<input type="password" value={newKey} onChange={event => { const value = event.target.value; setNewKey(value); setKeyMode(value ? 'replace' : 'keep'); setPendingTest(null); setMessage(null); }} placeholder={baseline.key_present ? '已配置，留空保持不变' : '输入新的 API Key'} autoComplete="new-password" spellCheck={false} disabled={keyMode === 'clear'} aria-invalid={validation && invalidKey} /><span className="field-hint">{keyMode === 'clear' ? '保存后将清除 Key，并禁用模型发送。' : baseline.key_present ? '已有 Key 只保留在本机后端，不会回填。' : 'Key 将以明文保存在受限的本机 model.toml 中。'}</span>{validation && invalidKey && <span className="field-error">请输入非占位 Key，不含首尾空格或控制字符。</span>}</label>
         <details className="settings-key-management"><summary>密钥管理</summary><div className="settings-key-actions">{keyMode !== 'keep' && <button type="button" className="button secondary" onClick={() => { setNewKey(''); setKeyMode('keep'); setClearDecision(false); }}>取消{keyMode === 'clear' ? '清除' : '替换'}</button>}{baseline.key_present && keyMode !== 'clear' && <button type="button" className="button secondary" onClick={() => setClearDecision(true)}>清除已保存 Key…</button>}</div>
         </details>
         {clearDecision && <div className="settings-decision" role="group" aria-label="确认清除 Key"><p>清除这个模型配置的 API Key？保存后不能再发送新模型请求，已启动请求仍使用原快照。</p><button type="button" className="button danger" onClick={() => { setKeyMode('clear'); setNewKey(''); setClearDecision(false); setPendingTest(null); }}>确认清除，保存时生效</button><button type="button" className="button secondary" onClick={() => setClearDecision(false)}>保留 Key</button></div>}
-        <label className="field">模型名<input value={modelName} onChange={event => { setModelName(event.target.value); setPendingTest(null); setMessage(null); }} placeholder="精确模型标识" autoComplete="off" spellCheck={false} aria-invalid={validation && invalidModel} />{validation && invalidModel && <span className="field-error">请输入有效模型名，最多 256 字节。</span>}</label>
+        <label className="field">模型名<input value={modelName} onChange={event => { setModelName(event.target.value); setContextWindow(''); setPendingTest(null); setMessage(null); }} placeholder="精确模型标识" autoComplete="off" spellCheck={false} aria-invalid={validation && invalidModel} />{validation && invalidModel && <span className="field-error">请输入有效模型名，最多 256 字节。</span>}</label>
+        <details className="settings-context-budget"><summary>高级：模型容量</summary><label className="field">上下文窗口（tokens）<input type="number" min="1" step="1" value={contextWindow} placeholder="256000（产品默认）" onChange={event => setContextWindow(event.target.value)} aria-invalid={validation && invalidWindow} /><span className="field-hint">留空采用默认 256000 tokens（十进制 256K），并非供应商容量保证。切换地址或模型会清除旧覆盖值。</span>{validation && invalidWindow && <span className="field-error">请填写有效整数，并为输出及安全余量留出空间。</span>}</label><p>输出预留继承现有最大输出配置；更改容量不会自动减少输出。自动压缩方式可在聊天输入框旁调整。</p></details>
         {reuseRequired && <label className="check-field model-reuse"><input type="checkbox" checked={reuse} onChange={event => setReuse(event.target.checked)} /><span>将已有 Key 用于这个新目标：{normalized ?? '请先填写有效地址'}。这只允许保存，发送数据仍需另行确认。</span></label>}
         {validation && reuseRequired && !reuse && <div className="inline-error" role="alert">地址已变化。请输入新 Key、清除 Key，或明确选择将已有 Key 用于新目标。</div>}
       </fieldset>

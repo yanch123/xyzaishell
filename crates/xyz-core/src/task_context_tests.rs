@@ -474,3 +474,34 @@ fn evidence_filters_full_command_with_late_shared_secret_before_clipping() {
     assert!(!wire.contains("late-load") && !wire.contains("SENSITIVE-SUFFIX"));
     assert!(wire.contains("REDACT"));
 }
+
+#[test]
+fn seventeenth_command_remains_citable_without_replay() {
+    let redactor = ObservationBuffer::new();
+    let mut c = context();
+    for n in 0..20 {
+        let id = format!("command-{n}");
+        c.observe_action(&action(&id, true), &redactor);
+        c.retain_output(&id, &output(&format!("observed result {n}")), &redactor);
+    }
+    assert_eq!(c.evidence.len(), 20);
+    c.apply_model(
+        ModelTaskContext {
+            findings: vec![finding("seventeenth", "command-16")],
+            remaining_steps: vec![RemainingStep {
+                id: "step".into(),
+                text: "Foreground returned; business success unknown".into(),
+                status: StepStatus::Completed,
+                evidence_command_ids: vec!["command-16".into()],
+            }],
+            ..Default::default()
+        },
+        &redactor,
+    )
+    .unwrap();
+    assert_eq!(c.findings[0].evidence_command_ids, vec!["command-16"]);
+    assert!(c
+        .confirmed_facts
+        .iter()
+        .any(|f| f.command_id == "command-16"));
+}

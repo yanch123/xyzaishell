@@ -16,7 +16,9 @@ export const storageBridge = {
 
 export type HistoryStatus = { enabled: boolean; manageable?: boolean; available: boolean; plaintext: true; revision: string; error: import('./types').ApiError | null };
 export type HistoryEntry = { chat_id: string; task_id: string; title: string; message_count: number; revision: string; updated_ms: number; listed: boolean };
+export type HistoryPage = { chat: import('./model').ChatSnapshot; total_messages: number; next_before: number | null };
 export const historyBridge = {
+  page: (chatId: string, expectedRevision: string, beforeSequence: number | null = null, limit = 64) => invoke<HistoryPage>('read_saved_chat_page', { chatId, expectedRevision, beforeSequence, limit }),
   listen: (handler: (status: HistoryStatus) => void) => listen<HistoryStatus>('history:event', event => handler(event.payload)),
   status: () => invoke<HistoryStatus>('get_history_status'),
   enable: (enabled: boolean) => invoke<HistoryStatus>('set_history_enabled', { enabled }),

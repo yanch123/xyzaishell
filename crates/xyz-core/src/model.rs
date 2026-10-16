@@ -64,6 +64,11 @@ pub(crate) struct RequestOptions {
     pub request_timeout_seconds: u64,
     pub stream_idle_timeout_seconds: u64,
     pub max_output_tokens: u64,
+    /// An explicit user setting, never the resolved product default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u64>,
+    pub context_auto_compact: bool,
+    pub context_auto_mode: crate::context::CompactionMode,
 }
 impl Default for RequestOptions {
     fn default() -> Self {
@@ -72,6 +77,19 @@ impl Default for RequestOptions {
             request_timeout_seconds: 120,
             stream_idle_timeout_seconds: 30,
             max_output_tokens: 4096,
+            context_window_tokens: None,
+            context_auto_compact: true,
+            context_auto_mode: crate::context::CompactionMode::Llm,
+        }
+    }
+}
+impl RequestOptions {
+    pub(crate) fn context_budget(&self) -> crate::context::ContextBudgetConfig {
+        crate::context::ContextBudgetConfig {
+            context_window_override: self.context_window_tokens,
+            verified_context_window: None,
+            output_reserve_tokens: self.max_output_tokens,
+            safety_margin_override: None,
         }
     }
 }
@@ -104,6 +122,15 @@ pub struct ModelConfigStatus {
     pub warning: Option<String>,
     pub context_policy: String,
     pub persistence: String,
+    /// Resolved budget and persisted override are deliberately separate.
+    pub context_window_tokens: Option<u64>,
+    pub context_window_override_tokens: Option<u64>,
+    pub capacity_source: crate::context::CapacitySource,
+    pub output_reserve_tokens: Option<u64>,
+    pub safety_margin_tokens: Option<u64>,
+    pub input_budget_tokens: Option<u64>,
+    pub context_auto_compact: bool,
+    pub context_auto_mode: crate::context::CompactionMode,
 }
 struct ConfigState {
     status: ModelConfigStatus,
@@ -153,6 +180,14 @@ impl ModelConfigManager {
             warning: None,
             context_policy: "explicit_chat_only".into(),
             persistence: "memory_only".into(),
+            context_window_tokens: None,
+            context_window_override_tokens: None,
+            capacity_source: crate::context::CapacitySource::Unavailable,
+            output_reserve_tokens: None,
+            safety_margin_tokens: None,
+            input_budget_tokens: None,
+            context_auto_compact: true,
+            context_auto_mode: crate::context::CompactionMode::Llm,
         };
         let this = Self {
             path,
@@ -180,6 +215,16 @@ impl ModelConfigManager {
         }
         Ok(())
     }
+    /// Host-only snapshot for local budget previews and deterministic quick
+    /// compaction. Possession does not grant permission to transmit; callers
+    /// must still use authorized_snapshot_for/terminal_snapshot before network.
+    pub(crate) fn local_snapshot(&self) -> Option<Arc<ModelSnapshot>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot
+            .clone()
+    }
     pub fn status(&self) -> ModelConfigStatus {
         self.state
             .lock()
@@ -204,6 +249,14 @@ impl ModelConfigManager {
         state.status.ready = false;
         state.status.destination = None;
         state.status.model = None;
+        state.status.context_window_tokens = None;
+        state.status.context_window_override_tokens = None;
+        state.status.capacity_source = crate::context::CapacitySource::Unavailable;
+        state.status.output_reserve_tokens = None;
+        state.status.safety_margin_tokens = None;
+        state.status.input_budget_tokens = None;
+        state.status.context_auto_compact = true;
+        state.status.context_auto_mode = crate::context::CompactionMode::Llm;
         state.snapshot = None;
         state.file_bytes = None;
         match result {
@@ -385,6 +438,9 @@ fn parse_config(text: &str) -> Result<ModelSnapshot, ApiError> {
             "Model request limits are outside their documented ranges.",
         ));
     }
+    r.context_budget()
+        .resolve(crate::context::TurnPhase::ActiveTurn, 0)
+        .map_err(|_| invalid("The context window must exceed the output reserve plus the safety margin. Correct the explicit capacity setting; it cannot fall back to the default."))?;
     Ok(ModelSnapshot {
         destination,
         model: raw.model.name.clone(),

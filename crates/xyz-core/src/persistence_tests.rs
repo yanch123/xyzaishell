@@ -324,7 +324,7 @@ fn text_message_count_and_utf8_byte_bounds_are_enforced_after_redaction() {
         HistoryError::InvalidRecord
     );
     source = snapshot();
-    source.messages = vec![source.messages[0].clone(); MAX_MESSAGES + 1];
+    source.messages = vec![source.messages[0].clone(); ARCHIVE_PAGE_MESSAGES + 1];
     assert_eq!(
         error(RedactedChat::from_snapshot(&source, str::to_owned)),
         HistoryError::InvalidRecord
@@ -924,7 +924,7 @@ fn synthetic_crash_writer_process() {
             store
                 .connection
                 .execute_batch(
-                    "PRAGMA cache_size=1; BEGIN IMMEDIATE; UPDATE chats SET payload='{}';",
+                    "PRAGMA cache_size=1; BEGIN IMMEDIATE; UPDATE chats SET payload='{}'; UPDATE entries SET payload='{}';",
                 )
                 .unwrap();
             // Terminate with both SQLite's transaction and the access lock held.
@@ -1262,6 +1262,17 @@ fn version_one_archive_migrates_without_inventing_chat_source() {
         .unwrap();
     store
         .connection
+        .execute(
+            "UPDATE chats SET payload=?1",
+            [serde_json::to_string(&prepared(&source).0).unwrap()],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute_batch("DROP TABLE compaction_sources; DROP TABLE compactions; DROP TABLE entries; DROP TABLE legacy_backups;")
+        .unwrap();
+    store
+        .connection
         .pragma_update(None, "user_version", 1)
         .unwrap();
     drop(store);
@@ -1270,7 +1281,7 @@ fn version_one_archive_migrates_without_inventing_chat_source() {
         .connection
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let restored = migrated.read(&saved.chat.chat_id).unwrap().to_snapshot();
     assert!(restored.source.is_none());
     assert!(restored.restored_read_only);
@@ -1294,6 +1305,10 @@ fn legacy_archive_with_unknown_payload_fields_is_not_upgraded() {
         .unwrap();
     store
         .connection
+        .execute_batch("DROP TABLE compaction_sources; DROP TABLE compactions; DROP TABLE entries; DROP TABLE legacy_backups;")
+        .unwrap();
+    store
+        .connection
         .pragma_update(None, "user_version", 1)
         .unwrap();
     drop(store);
@@ -1306,4 +1321,302 @@ fn legacy_archive_with_unknown_payload_fields_is_not_upgraded() {
         HistoryError::UnsupportedSchema
     );
     assert_eq!(fs::read(fixture.database()).unwrap(), bytes);
+}
+
+#[test]
+fn long_archive_pages_survive_cache_eviction_reopen_and_exceed_old_payload_limit() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let mut source = snapshot();
+    source.messages.clear();
+    let mut revision = store.create(&prepared(&source)).unwrap().revision;
+    let mut ids = Vec::new();
+    // Only one cache batch is present in each capture, but all nine MiB remain
+    // on disk. Neither 128 messages, 256 KiB nor 2 MiB limits the whole chat.
+    for batch in 0..9 {
+        source.messages = (0..100)
+            .map(|index| {
+                let mut message = snapshot().messages.remove(0);
+                message.text = format!("{batch}:{index}:{}", "界".repeat(3400));
+                ids.push(message.id.clone());
+                message
+            })
+            .collect();
+        revision = store
+            .replace(&prepared(&source), revision)
+            .unwrap()
+            .revision;
+    }
+    drop(store);
+    let store = fixture.open();
+    assert_eq!(store.list(true).unwrap()[0].message_count, 900);
+    let mut before = None;
+    let mut pages = Vec::new();
+    loop {
+        let page = store.page(&source.chat_id, revision, before, 128).unwrap();
+        assert_eq!(page.message_count, 900);
+        assert!(page.chat.messages.len() <= ARCHIVE_PAGE_MESSAGES);
+        assert!(
+            page.chat
+                .messages
+                .iter()
+                .map(|m| m.text.len())
+                .sum::<usize>()
+                <= ARCHIVE_PAGE_BYTES
+        );
+        assert!(page.to_snapshot().restored_read_only);
+        pages.push(
+            page.chat
+                .messages
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
+        );
+        before = page.next_before;
+        if before.is_none() {
+            break;
+        }
+    }
+    let loaded: Vec<_> = pages.into_iter().rev().flatten().collect();
+    assert_eq!(loaded, ids);
+    assert!(store.read(&source.chat_id).unwrap().chat.messages.len() < 900);
+    assert_eq!(
+        error(store.page(&source.chat_id, revision - 1, None, 128)),
+        HistoryError::Conflict
+    );
+}
+
+#[test]
+fn migration_preserves_backup_and_old_reader_marker_without_restoring_authority() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let source = snapshot();
+    store.create(&prepared(&source)).unwrap();
+    let legacy = serde_json::to_string(&prepared(&source).0).unwrap();
+    store
+        .connection
+        .execute("UPDATE chats SET payload=?1", [&legacy])
+        .unwrap();
+    store
+        .connection
+        .execute_batch("DROP TABLE compaction_sources; DROP TABLE compactions; DROP TABLE entries; DROP TABLE legacy_backups; PRAGMA user_version=2;")
+        .unwrap();
+    drop(store);
+    let store = fixture.open();
+    let backup: String = store
+        .connection
+        .query_row("SELECT payload FROM legacy_backups", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(backup, legacy);
+    let version: i64 = store
+        .connection
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 3); // v0.1.x refuses this format rather than rewriting it.
+    let restored = store.read(&source.chat_id).unwrap().to_snapshot();
+    assert_eq!(restored.messages.len(), 2);
+    assert!(restored.restored_read_only);
+    assert!(restored.active_run_id.is_none());
+    assert!(restored.messages.iter().all(|m| m.run_id.is_empty()));
+}
+
+#[test]
+fn invalid_legacy_data_rolls_back_entire_migration() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let source = snapshot();
+    store.create(&prepared(&source)).unwrap();
+    store.connection.execute_batch("DROP TABLE compaction_sources; DROP TABLE compactions; DROP TABLE entries; DROP TABLE legacy_backups; UPDATE chats SET payload='{}'; PRAGMA user_version=2;").unwrap();
+    drop(store);
+    let before = fs::read(fixture.database()).unwrap();
+    assert_eq!(
+        error(HistoryStore::open(
+            &fixture.path,
+            HistoryPreference::SaveRedactedText
+        )),
+        HistoryError::Corrupt
+    );
+    assert_eq!(before, fs::read(fixture.database()).unwrap());
+}
+
+#[test]
+fn page_validation_and_explicit_forget_cover_entries_and_migration_backup() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let source = snapshot();
+    let saved = store.create(&prepared(&source)).unwrap();
+    assert_eq!(
+        error(store.page(&source.chat_id, saved.revision, None, 0)),
+        HistoryError::InvalidRecord
+    );
+    assert_eq!(
+        error(store.page(&source.chat_id, saved.revision, None, 129)),
+        HistoryError::InvalidRecord
+    );
+    assert_eq!(
+        error(store.page(&source.chat_id, saved.revision, Some(0), 128)),
+        HistoryError::InvalidRecord
+    );
+    store.forget(&source.chat_id, saved.revision).unwrap();
+    let entries: i64 = store
+        .connection
+        .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(entries, 0);
+}
+
+#[test]
+fn disk_quota_during_legacy_migration_rolls_back_without_pruning() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    store
+        .connection
+        .execute_batch("DROP TABLE compaction_sources; DROP TABLE compactions; DROP TABLE entries; DROP TABLE legacy_backups; PRAGMA user_version=2;")
+        .unwrap();
+    for revision in 1..=12 {
+        let mut source = snapshot();
+        let template = source.messages[1].clone();
+        source.messages = (0..4)
+            .map(|_| {
+                let mut message = template.clone();
+                message.id = id();
+                // Escaping keeps legacy text below 256 KiB but exercises the 2 MiB
+                // serialized payload and independent 32 MiB database boundaries.
+                message.text = "\u{1}".repeat(60_000);
+                message
+            })
+            .collect();
+        let legacy = serde_json::to_string(&prepared(&source).0).unwrap();
+        assert!(legacy.len() < MAX_PAYLOAD_BYTES);
+        store.connection.execute("INSERT INTO chats(chat_id,task_id,revision,listed,updated_ms,payload) VALUES(?1,?2,?3,1,0,?4)", params![source.chat_id,source.task_id,revision,legacy]).unwrap();
+    }
+    store
+        .connection
+        .execute("UPDATE metadata SET revision=12", [])
+        .unwrap();
+    drop(store);
+    let before = fs::read(fixture.database()).unwrap();
+    assert_eq!(
+        error(HistoryStore::open(
+            &fixture.path,
+            HistoryPreference::SaveRedactedText
+        )),
+        HistoryError::LimitReached
+    );
+    assert_eq!(fs::read(fixture.database()).unwrap(), before);
+    let connection = Connection::open(fixture.database()).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM chats", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        12
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='entries'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+fn inert_compaction() -> CompactionArchiveRecord {
+    CompactionArchiveRecord {
+        event_id: id(),
+        context_revision: "5".into(),
+        summary_text: "Inert historical interpretation".into(),
+        source_ids: vec![id()],
+        omitted_ranges: vec![],
+        mode: "quick".into(),
+        reason: "manual".into(),
+        before_tokens: 50000,
+        after_tokens: 100,
+        before_bytes: 200000,
+        after_bytes: 400,
+    }
+}
+#[test]
+fn compaction_disk_quota_rolls_back_event_index_without_touching_originals() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let source = snapshot();
+    store.create(&prepared(&source)).unwrap();
+    let first = inert_compaction();
+    store
+        .append_compaction(
+            &source.chat_id,
+            &RedactedCompaction::new(&first, str::to_owned).unwrap(),
+        )
+        .unwrap();
+    let pages: i64 = store
+        .connection
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    store
+        .connection
+        .pragma_update(None, "max_page_count", pages)
+        .unwrap();
+    let mut next = inert_compaction();
+    next.summary_text = "large inert summary ".repeat(3000);
+    assert_eq!(
+        error(store.append_compaction(
+            &source.chat_id,
+            &RedactedCompaction::new(&next, str::to_owned).unwrap()
+        )),
+        HistoryError::LimitReached
+    );
+    let page = store.compaction_page(&source.chat_id, None, 128).unwrap();
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(page.records[0].event_id, first.event_id);
+    assert_eq!(
+        store.read(&source.chat_id).unwrap().chat.messages[0].text,
+        source.messages[0].text
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT count(*) FROM compaction_sources", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+#[test]
+fn corrupt_compaction_reference_index_is_not_silently_accepted_on_reopen() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let source = snapshot();
+    store.create(&prepared(&source)).unwrap();
+    store
+        .append_compaction(
+            &source.chat_id,
+            &RedactedCompaction::new(&inert_compaction(), str::to_owned).unwrap(),
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE compaction_sources SET source_id='foreign-reference'",
+            [],
+        )
+        .unwrap();
+    drop(store);
+    let before = fs::read(fixture.database()).unwrap();
+    assert_eq!(
+        error(HistoryStore::open(
+            &fixture.path,
+            HistoryPreference::SaveRedactedText
+        )),
+        HistoryError::Corrupt
+    );
+    assert_eq!(before, fs::read(fixture.database()).unwrap());
 }

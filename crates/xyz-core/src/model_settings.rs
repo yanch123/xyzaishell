@@ -36,6 +36,19 @@ pub struct SaveModelConfigRequest {
     pub key_update: ModelKeyUpdate,
     /// Explicit reuse decision bound to the exact normalized new destination.
     pub reuse_key_for_destination: Option<String>,
+    /// Omitted by old clients: preserve. JSON null: remove explicit override.
+    #[serde(default, deserialize_with = "optional_context_override")]
+    pub context_window_tokens: Option<Option<u64>>,
+    #[serde(default)]
+    pub context_auto_compact: Option<bool>,
+    #[serde(default)]
+    pub context_auto_mode: Option<crate::context::CompactionMode>,
+}
+fn optional_context_override<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer).map(Some)
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -122,6 +135,21 @@ pub(super) fn apply_snapshot(state: &mut ConfigState, snapshot: ModelSnapshot) {
     state.status.base_url = Some(snapshot.destination.clone());
     state.status.destination = Some(snapshot.destination.clone());
     state.status.model = Some(snapshot.model.clone());
+    state.status.context_window_override_tokens = snapshot.request.context_window_tokens;
+    state.status.context_auto_compact = snapshot.request.context_auto_compact;
+    state.status.context_auto_mode = snapshot.request.context_auto_mode;
+    // parse_config already validated this exact immutable request configuration.
+    if let Ok(budget) = snapshot
+        .request
+        .context_budget()
+        .resolve(crate::context::TurnPhase::ActiveTurn, 0)
+    {
+        state.status.context_window_tokens = budget.context_window_tokens;
+        state.status.capacity_source = budget.capacity_source;
+        state.status.output_reserve_tokens = Some(budget.output_reserve_tokens);
+        state.status.safety_margin_tokens = budget.safety_margin_tokens;
+        state.status.input_budget_tokens = budget.input_budget_tokens;
+    }
     state.status.error = None;
     state.snapshot = Some(Arc::new(snapshot));
 }
@@ -161,6 +189,22 @@ impl ModelConfigManager {
             }
             None => empty_file(),
         };
+        // Capacity overrides are scoped to one destination/model identity. Old
+        // clients keep an override only while that identity stays unchanged.
+        let identity_changed = raw.model.base_url.trim_end_matches('/')
+            != request.base_url.trim_end_matches('/')
+            || raw.model.name != request.model;
+        raw.request.context_window_tokens = match request.context_window_tokens {
+            Some(value) => value,
+            None if identity_changed => None,
+            None => raw.request.context_window_tokens,
+        };
+        if let Some(enabled) = request.context_auto_compact {
+            raw.request.context_auto_compact = enabled;
+        }
+        if let Some(mode) = request.context_auto_mode {
+            raw.request.context_auto_mode = mode;
+        }
         raw.model.base_url = request.base_url;
         raw.model.name = request.model;
         let keeping = matches!(request.key_update, ModelKeyUpdate::Keep);
@@ -214,6 +258,12 @@ impl ModelConfigManager {
                 state.status.consented = false;
                 state.status.file_revision = None;
                 state.status.error = Some(error.clone());
+                state.status.context_window_tokens = None;
+                state.status.context_window_override_tokens = None;
+                state.status.capacity_source = crate::context::CapacitySource::Unavailable;
+                state.status.output_reserve_tokens = None;
+                state.status.safety_margin_tokens = None;
+                state.status.input_budget_tokens = None;
                 state.snapshot = None;
                 state.file_bytes = None;
             }

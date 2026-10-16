@@ -504,39 +504,50 @@ async fn local_input_and_concurrency_limits_fail_before_transmission() {
 
 #[tokio::test]
 async fn transcript_byte_and_message_limits_do_not_silently_trim() {
-    for (turns, answer) in [(3, "x".repeat(65536)), (64, "ok".into())] {
+    // v0.2.0 replaces these transcript-wide gates with prepared-request
+    // admission. Disable automatic compaction to prove both gates are retired.
+    for (turns, answer) in [(5, "x".repeat(65536)), (65, "ok".into())] {
         let (server, base) = listener().await;
-        let fixture = Fixture::new(&base, "");
+        let fixture = Fixture::new(&base, "[request]\ncontext_auto_compact=false\n");
         let manager = fixture.manager();
         consent(&manager);
+        let expected_answer = answer.clone();
         let server = tokio::spawn(async move {
+            let mut last = String::new();
             for _ in 0..turns {
                 let (mut socket, _) = server.accept().await.unwrap();
-                read_request(&mut socket).await;
+                last = read_request(&mut socket).await;
                 reply(&mut socket, "200 OK", &sse_text(&answer, "stop")).await;
             }
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), server.accept())
-                    .await
-                    .is_err()
-            );
+            last
         });
-        let chat = manager.create_chat("Bounded history").unwrap();
+        let chat = manager.create_chat("History beyond old gates").unwrap();
         for _ in 0..turns {
             manager.send_message(&chat.chat_id, "a").unwrap();
             let done = finished(&manager, &chat.chat_id).await;
-            assert_eq!(done.messages.last().unwrap().state, MessageState::Complete);
+            assert_eq!(
+                done.messages.last().unwrap().state,
+                MessageState::Complete,
+                "{:?}",
+                done.messages.last().unwrap().error
+            );
         }
-        let before = manager.get_chat(&chat.chat_id).unwrap();
-        assert_eq!(
-            manager.send_message(&chat.chat_id, "b").unwrap_err().code,
-            "CHAT_CONTEXT_FULL"
-        );
         let after = manager.get_chat(&chat.chat_id).unwrap();
         assert_eq!(after.messages.len(), turns * 2);
-        assert_eq!(after.messages[0].text, "a");
-        assert_eq!(before.revision, after.revision);
-        server.await.unwrap();
+        for pair in after.messages.as_chunks::<2>().0 {
+            assert_eq!(pair[0].text, "a");
+            assert_eq!(pair[1].text, expected_answer);
+        }
+        let request = server.await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let dialogue = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] != "system" && m["role"] != "developer")
+            .count();
+        assert_eq!(dialogue, turns * 2 - 1);
     }
 }
 

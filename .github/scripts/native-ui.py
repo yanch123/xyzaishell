@@ -29,9 +29,9 @@ from upgrade_baseline import BASE_VERSION, TARGET_VERSION
 
 ELEMENT = "element-6066-11e4-a52e-4f735466cecf"
 PROMPT = "Native fixture history message 中文"
-REPLY = "Native fixture streamed reply 中文 <script>window.unsafe=true</script>"
+REPLY = "Native fixture streamed reply 中文 <script>window.unsafe=true</script> " + ("Synthetic retained history detail. " * 120).rstrip()
 FOLLOWUP = "Native fixture follow-up: retain the previous answer 中文"
-FOLLOWUP_REPLY = "Native fixture contextual follow-up reply 中文"
+FOLLOWUP_REPLY = "Native fixture contextual follow-up reply 中文 " + ("Additional synthetic history detail. " * 120).rstrip()
 PROFILE = "Native fixture profile 中文"
 TOKEN = "synthetic-native-fixture-token"
 
@@ -104,6 +104,11 @@ class ModelFixture(http.server.BaseHTTPRequestHandler):
             self.send_error(400)
             return
         body = json.loads(self.rfile.read(size))
+        messages = body.get("messages", [])
+        compaction = any(m.get("role") == "system" and "You summarize historical data, with no tools." in str(m.get("content")) for m in messages)
+        if compaction:
+            self.compaction(body)
+            return
         probe = body.get("messages") == [{"role": "user", "content": "Reply with OK."}]
         (self.server.test_requests if probe else self.server.requests).append(body)
         valid = (self.path == "/v1/chat/completions"
@@ -111,14 +116,14 @@ class ModelFixture(http.server.BaseHTTPRequestHandler):
                  and body.get("model") == "native-fixture-model"
                  and body.get("stream") is True
                  and not body.get("tools")
-                 and (probe or any(m.get("role") == "user" and m.get("content") == PROMPT
+                 and (probe or any(m.get("role") == "user" and m.get("content") in (PROMPT, FOLLOWUP)
                                    for m in body.get("messages", []))))
         if not valid:
             self.server.invalid_requests += 1
             self.send_error(400)
             return
         followup = body.get("messages", [])[-1].get("content") == FOLLOWUP
-        if followup and not any(m.get("role") == "assistant" and m.get("content") == REPLY for m in body["messages"]):
+        if followup and not any(m.get("role") == "assistant" and m.get("content") in (REPLY, FOLLOWUP_REPLY) for m in body["messages"]):
             self.server.invalid_requests += 1
             self.send_error(400)
             return
@@ -133,6 +138,40 @@ class ModelFixture(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def compaction(self, body):
+        """Synthetic provider only: accept exact inert source-manifest requests."""
+        try:
+            payload = json.loads(body["messages"][-1]["content"])
+            ids = payload["source_manifest"]
+            assert isinstance(ids, list) and ids and all(isinstance(value, str) for value in ids)
+            assert len(ids) == len(set(ids))
+            assert "sources" in payload or "partial_summaries" in payload
+            assert self.path == "/v1/chat/completions" and self.headers.get("Authorization") == f"Bearer {TOKEN}"
+            assert body.get("model") == "native-fixture-model" and body.get("stream") is True and not body.get("tools")
+        except (AssertionError, ValueError, KeyError, TypeError):
+            self.server.invalid_requests += 1
+            self.send_error(400)
+            return
+        self.server.compaction_requests.append(body)
+        self.server.compaction_started.set()
+        if self.server.hold_compaction:
+            if not self.server.release_compaction.wait(timeout=25):
+                self.send_error(504)
+                return
+        summary = {"goal": "Preserve the synthetic conversation", "user_constraints": [], "findings": [],
+                   "hypotheses": [], "remaining_steps": [], "uncertainties": ["Synthetic fixture only; source details and prior partial evidence may be omitted"],
+                   "coverage": {"source_ids": ids, "omitted_ranges": ids}, "summary_text": "Earlier synthetic history was summarized; no command was executed."}
+        chunks = [{"choices": [{"index": 0, "delta": {"role": "assistant", "content": json.dumps(summary)}, "finish_reason": None}]},
+                  {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}]
+        data = ("".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks) + "data: [DONE]\n\n").encode()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
 
 
 class WebDriverError(RuntimeError):
@@ -366,7 +405,7 @@ def configure_candidate_model(driver, server, version):
     time.sleep(1)
     assert not server.requests and not server.test_requests
     driver.screenshot("model-settings-saved-test-awaits-consent")
-    # v0.1.3 names the selected test scope in this label. The same exact
+    # v0.1.4 names the selected test scope in this label. The same exact
     # recipient-confirmation group still owns the explicit consent checkbox.
     consent = "//*[@role='group' and @aria-label='确认测试接收方']//input[@type='checkbox']"
     assert len(driver.command("POST", "/elements", {"using": "xpath", "value": consent})) == 1
@@ -388,22 +427,79 @@ def assert_literal_reply(driver):
 
 
 def wait_for_chat_idle(driver, version):
-    if version == BASE_VERSION:
-        wait_for(lambda: driver.js("return document.body.textContent.includes('无生成中的聊天')"))
-    else:
-        wait_for(lambda: driver.js("return ![...document.querySelectorAll('button')].some(e=>['停止生成','正在提交…'].includes(e.textContent.trim())) && document.querySelector('textarea[aria-label=\"聊天消息\"]')?.value === ''"))
+    # Both reviewed v0.1.4 and v0.2.0 use the simplified unified composer.
+    wait_for(lambda: driver.js("return ![...document.querySelectorAll('button')].some(e=>['停止生成','正在提交…'].includes(e.textContent.trim())) && document.querySelector('textarea[aria-label=\"聊天消息\"]')?.value === ''"))
 
 
 def rendered_task_identity(driver, version):
-    if version == BASE_VERSION:
-        label = driver.js("return document.querySelector('.chat-status span[title]')?.getAttribute('title')")
-        assert isinstance(label, str) and label.startswith("任务 ID: "), "Missing released task identity"
-        return label.removeprefix("任务 ID: ")
-    # This DOM attribute comes from the real backend ChatSnapshot. No injected
-    # IPC or test-only application endpoint is used; default UI stays uncluttered.
+    # Backend-rendered identity; no injected IPC or test-only app endpoint.
     value = driver.js("return document.querySelector('.conversation-details')?.getAttribute('data-task-id')")
     assert isinstance(value, str) and value, "Missing rendered candidate task identity"
     return value
+
+
+def verify_context_controls(driver, server):
+    """Real UI/IPC estimator and local compaction; provider is still synthetic."""
+    indicator = "//button[starts-with(@aria-label,'可用输入预算占用')]"
+    driver.click(indicator)
+    panel = "//*[@role='dialog' and @aria-label='上下文占用与压缩']"
+    wait_for(lambda: driver.find(panel))
+    wait_for(lambda: driver.js("return document.querySelector('.context-total')?.textContent.includes('输入约') && !document.querySelector('.context-total')?.textContent.includes('未知')"))
+    assert driver.js("return document.querySelector('.context-popover').getAttribute('aria-modal') === 'false'")
+    assert driver.js("return document.querySelector('.context-popover').textContent.includes('回复后 80%，任务中 95%')")
+    driver.click(panel + "//summary[normalize-space(.)='详情']")
+    assert driver.js("return document.querySelector('.context-popover').textContent.includes('256K = 256000 tokens')")
+    assert driver.js("return document.querySelector('.context-popover').textContent.includes('保守估算')")
+    assert driver.js("return !document.querySelector('.context-popover').textContent.includes('50%')")
+    assert driver.js("return document.querySelector('select[aria-label=\"本次压缩方式\"]').value === 'llm'")
+    driver.screenshot("native-context-default-budget-and-sources")
+    driver.click("//select[@aria-label='本次压缩方式']/option[@value='quick']")
+    requests_before = len(server.requests)
+    driver.click(driver.button("立即压缩"))
+    wait_for(lambda: driver.js("return [...document.querySelectorAll('.context-popover [role=status]')].some(e=>e.textContent.trim()==='上下文已整理')"))
+    assert len(server.requests) == requests_before, "Quick compaction unexpectedly called the model"
+    driver.screenshot("native-quick-compaction-positive-reduction")
+    driver.click(driver.button("关闭上下文"))
+
+
+def verify_llm_compaction_and_cancel(driver, server):
+    driver.click("//button[starts-with(@aria-label,'可用输入预算占用')]")
+    driver.click("//select[@aria-label='本次压缩方式']/option[@value='llm']")
+    server.hold_compaction = True
+    server.release_compaction.clear()
+    server.compaction_started.clear()
+    before = len(server.compaction_requests)
+    driver.click(driver.button("立即压缩"))
+    wait_for(lambda: server.compaction_started.is_set())
+    wait_for(lambda: driver.find(driver.button("取消压缩")))
+    driver.screenshot("native-llm-compaction-real-http-in-progress")
+    driver.click(driver.button("取消压缩"))
+    wait_for(lambda: driver.js("return document.querySelector('.context-popover')?.textContent.includes('压缩已取消，原上下文保留')"))
+    assert len(server.compaction_requests) == before + 1
+    driver.screenshot("native-llm-compaction-cancelled-before-response")
+    # Only release the fixture's held HTTP response after native cancellation
+    # has reached the terminal state. Retry must make a new real provider call.
+    server.hold_compaction = False
+    server.release_compaction.set()
+    driver.click(driver.button("立即压缩"))
+    wait_for(lambda: driver.js("return [...document.querySelectorAll('.context-popover [role=status]')].some(e=>e.textContent.trim()==='上下文已整理')"))
+    assert len(server.compaction_requests) > before + 1
+    assert not server.invalid_requests
+    driver.screenshot("native-llm-compaction-positive-reduction")
+    driver.click(driver.button("关闭上下文"))
+
+
+def verify_archive_page(driver, message_count):
+    driver.click(driver.button("翻阅已保存对话"))
+    wait_for(lambda: driver.js("return document.querySelector('[aria-label=\"归档历史页\"]')?.textContent.includes(" + json.dumps(PROMPT) + ")"))
+    assert driver.js("return document.querySelector('[aria-label=\"归档历史页\"]').textContent.includes(" + json.dumps(REPLY) + ")")
+    wait_for(lambda: driver.js("return document.querySelectorAll('[aria-label=\"归档历史页\"] article').length") == message_count)
+    older = driver.find(driver.button("更早一页"))
+    assert driver.command("GET", f"/element/{older}/enabled") is False
+    driver.click(driver.button("最新一页"))
+    wait_for(lambda: driver.js("return document.querySelectorAll('[aria-label=\"归档历史页\"] article').length") == message_count)
+    driver.screenshot("native-durable-archive-page")
+    driver.click(driver.button("收起历史页"))
 
 
 def seed(driver, server, version):
@@ -439,14 +535,23 @@ def seed(driver, server, version):
     assert len(server.requests) == 1 and server.invalid_requests == 0
     driver.screenshot("actual-ipc-streamed-chat")
     if version == TARGET_VERSION:
-        driver.command("POST", f"/element/{element}/value", {"text": FOLLOWUP, "value": list(FOLLOWUP)})
-        driver.click(driver.button("发送"))
-        wait_for(lambda: driver.js("return [...document.querySelectorAll('article[aria-label=\"模型回复\"] p')].some(e=>e.textContent === " + json.dumps(FOLLOWUP_REPLY) + ")"))
-        assert not driver.command("POST", "/elements", {"using": "xpath", "value": "//*[@role='dialog' and @aria-label='确认模型接收方']"})
-        wait_for_chat_idle(driver, version)
-        assert len(server.requests) == 2 and server.invalid_requests == 0
-        assert server.requests[1]["messages"][-1]["content"] == FOLLOWUP
+        # The engine protects the two newest complete turns. Six real turns
+        # provide older eligible sources for separate positive quick and LLM
+        # compactions; no source ledger or IPC is injected by this fixture.
+        for turn in range(2, 7):
+            element = driver.find("//textarea[@aria-label='聊天消息']")
+            driver.command("POST", f"/element/{element}/value", {"text": FOLLOWUP, "value": list(FOLLOWUP)})
+            driver.click(driver.button("发送"))
+            wait_for(lambda: driver.js("return document.querySelectorAll('article[aria-label=\"模型回复\"]').length") == turn)
+            wait_for_chat_idle(driver, version)
+            assert len(server.requests) == turn and server.invalid_requests == 0
+            assert server.requests[-1]["messages"][-1]["content"] == FOLLOWUP
+            assert not driver.command("POST", "/elements", {"using": "xpath", "value": "//*[@role='dialog' and @aria-label='确认模型接收方']"})
+            if turn == 3:
+                verify_context_controls(driver, server)
         driver.screenshot("unified-no-ssh-contextual-followup")
+        verify_llm_compaction_and_cancel(driver, server)
+        verify_archive_page(driver, 12)
     return profile_id
 
 
@@ -474,12 +579,19 @@ def verify_preserved(driver, server, version, expected_profile_id, message_count
     time.sleep(1)
     assert server.requests == [], "Restore/restart unexpectedly started a model request"
     driver.screenshot("restored-text-no-execution")
+    if version == TARGET_VERSION:
+        verify_archive_page(driver, message_count)
+        assert not server.requests, "Archive pagination unexpectedly called the model"
 
 
 def stored_identity(history):
     database = history / "history.sqlite3"
     with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
         rows = connection.execute("SELECT chat_id,task_id,payload FROM chats").fetchall()
+        if connection.execute("PRAGMA user_version").fetchone()[0] == 3:
+            rows = [(chat_id, task_id, "\n".join(entry[0] for entry in connection.execute(
+                "SELECT payload FROM entries WHERE chat_id=? ORDER BY sequence", (chat_id,))))
+                for chat_id, task_id, _ in rows]
     matches = [(chat_id, task_id) for chat_id, task_id, payload in rows if PROMPT in payload and REPLY in payload]
     assert len(matches) == 1, "Expected one persisted synthetic conversation"
     assert TOKEN.encode() not in database.read_bytes(), "Synthetic API token leaked into persisted history"
@@ -497,11 +609,42 @@ def history_rows(history):
 
 def verify_history_upgrade(history, expected_rows):
     version, rows = history_rows(history)
-    assert version == 2, "Candidate did not retain the supported history format marker"
+    assert version == 3, "Candidate did not migrate to the supported history format marker"
     indexed = {row[0]: row for row in rows}
     assert expected_rows, "Upgrade must start with real baseline history rows"
-    for row in expected_rows:
-        assert indexed.get(row[0]) == row, "Upgrade changed a preexisting history row"
+    database = history / "history.sqlite3"
+    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+        for row in expected_rows:
+            assert indexed.get(row[0], [])[:5] == row[:5], "Upgrade changed a preexisting history row identity"
+            backup = connection.execute("SELECT payload FROM legacy_backups WHERE chat_id=?", (row[0],)).fetchone()
+            assert backup and backup[0] == row[5], "Upgrade lost exact preexisting history row backup"
+            original = json.loads(row[5])
+            entries = connection.execute("SELECT sequence,message_id,payload FROM entries WHERE chat_id=? ORDER BY sequence", (row[0],)).fetchall()
+            assert [json.loads(entry[2]) for entry in entries] == original["messages"], "Archive migration lost original message fields"
+            assert [entry[0] for entry in entries] == list(range(1, len(entries) + 1)), "Archive sequence is not contiguous"
+            assert [entry[1] for entry in entries] == [message["id"] for message in original["messages"]], "Archive message identities changed"
+            assert json.loads(indexed[row[0]][5])["messages"] == [], "Archive metadata retained a bounded transcript copy"
+
+
+def verify_compaction_archive(history):
+    database = history / "history.sqlite3"
+    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+        rows = connection.execute("SELECT event_id,payload FROM compactions ORDER BY event_id").fetchall()
+        assert len(rows) == 2, "Only the successful quick and LLM compactions should be archived"
+        modes = set()
+        for event_id, payload in rows:
+            event = json.loads(payload)
+            assert event["version"] == 1
+            record = event["record"]
+            assert record["event_id"] == event_id
+            modes.add(record["mode"])
+            assert record["summary_text"].strip()
+            assert record["before_tokens"] >= record["after_tokens"]
+            assert record["before_bytes"] >= record["after_bytes"]
+            assert record["before_tokens"] > record["after_tokens"] or record["before_bytes"] > record["after_bytes"]
+            indexed = connection.execute("SELECT source_id FROM compaction_sources WHERE event_id=? ORDER BY ordinal", (event_id,)).fetchall()
+            assert [row[0] for row in indexed] == record["source_ids"], "Durable compaction source index differs from its event"
+        assert modes == {"quick", "llm"}
 
 
 def verify_private_file(path, expected_digest, label):
@@ -527,7 +670,7 @@ def verify_private_file(path, expected_digest, label):
 
 def verify_profile_backup(config, expected_digest):
     # Retain the strict legacy migration helper and regression coverage. The
-    # reviewed v0.1.3 baseline already writes v2, so this is not its upgrade gate.
+    # reviewed v0.1.4 baseline already writes v2, so this is not its upgrade gate.
     verify_private_file(config / "connections.v1.backup.toml", expected_digest, "Legacy profile backup")
 
 
@@ -540,7 +683,7 @@ def profile_schema_version(config):
 
 
 def verify_current_profile_upgrade(config, expected):
-    assert expected["profile_schema_version"] == 2, "Upgrade must start with real v0.1.3 profiles"
+    assert expected["profile_schema_version"] == 2, "Upgrade must start with real v0.1.4 profiles"
     verify_private_file(config / "connections.toml", expected["profile_file_sha256"], "Profile file")
     assert profile_schema_version(config) == 2, "Upgrade changed the profile schema marker"
     backup = config / "connections.v1.backup.toml"
@@ -638,6 +781,9 @@ def main():
     verify_phase_version(args.phase, args.application_version, application_hash, expected)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", expected["port"] if expected else 0), ModelFixture)
     server.requests, server.test_requests, server.invalid_requests = [], [], 0
+    server.compaction_requests = []
+    server.compaction_started, server.release_compaction = threading.Event(), threading.Event()
+    server.hold_compaction = False
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     if expected is None:
@@ -670,7 +816,7 @@ allow_loopback_http = true
         phases = ["seed", "restart"] if expected is None else [args.phase]
         identity = expected["identity"] if expected else None
         profile_id = expected["profile_id"] if expected else None
-        message_count = expected.get("message_count", 2) if expected else (4 if args.application_version == TARGET_VERSION else 2)
+        message_count = expected.get("message_count", 2) if expected else (12 if args.application_version == TARGET_VERSION else 2)
         for phase in phases:
             directory = args.evidence / phase
             directory.mkdir(exist_ok=True)
@@ -693,6 +839,10 @@ allow_loopback_http = true
             assert len(server.requests) == (message_count // 2 if phase == "seed" else 0), "Unexpected model request before process exit"
             assert len(server.test_requests) == (1 if phase == "seed" else 0), "Unexpected model configuration test"
             assert server.invalid_requests == 0
+            if phase == "seed" and args.application_version == TARGET_VERSION:
+                assert len(server.compaction_requests) >= 2, "Expected cancelled and successful real compaction requests"
+            else:
+                assert not server.compaction_requests, "Restoration unexpectedly started compaction"
             actual = list(stored_identity(history))
             assert visible_task_identity == actual[1], "Visible native task identity differs from persisted history"
             if identity is None:
@@ -705,12 +855,15 @@ allow_loopback_http = true
                 assert advanced in model_text, "Saving model settings lost an advanced fixture option"
             server.requests.clear()
             server.test_requests.clear()
+            server.compaction_requests.clear()
         history_version, preserved_rows = history_rows(history)
-        assert history_version == 2, "Reviewed native fixture must use history schema v2"
+        assert history_version == (3 if args.application_version == TARGET_VERSION else 2), "Unexpected native history schema"
+        if args.phase == "seed" and args.application_version == TARGET_VERSION:
+            verify_compaction_archive(history)
         profile_version = profile_schema_version(config)
         assert profile_version == 2, "Reviewed native fixture must use profile schema v2"
         if args.phase == "upgrade":
-            assert expected["history_version"] == 2, "Upgrade must start with real v0.1.3 history"
+            assert expected["history_version"] == 2, "Upgrade must start with real v0.1.4 history"
             verify_history_upgrade(history, expected["history_rows"])
             verify_current_profile_upgrade(config, expected)
             verify_private_file(config / "model.toml", expected["model_file_sha256"], "Model settings")
@@ -726,6 +879,10 @@ allow_loopback_http = true
             "application_sha256": application_hash, "application_version": args.application_version,
             "upgrade_from": expected["application_version"] if args.phase == "upgrade" else None,
             "native_ipc": True, "synthetic_loopback_model": True,
+            "native_llm_compaction_cancel_retry_positive_reduction": args.phase == "seed" and args.application_version == TARGET_VERSION,
+            "context_estimator_and_quick_positive_reduction": args.phase == "seed" and args.application_version == TARGET_VERSION,
+            "durable_archive_page_read": args.application_version == TARGET_VERSION,
+            "durable_compaction_event_and_source_index": args.phase == "seed" and args.application_version == TARGET_VERSION,
             "profile_and_history_persisted": True, "restored_task_identity_preserved": True,
             "history_requires_new_process_consent": True, "restore_model_requests": 0,
             "shell_log_empty_export_fail_closed": True,
@@ -734,10 +891,11 @@ allow_loopback_http = true
             "legacy_profile_migration_tested": False,
             "model_settings_saved_and_tested_via_ui": args.phase == "seed",
             "unified_no_ssh_followup_context_tested": args.phase == "seed" and args.application_version == TARGET_VERSION,
-            "not_tested": ["real provider", "SSH via UI", "desktop input methods", "Windows 10/11"]
+            "not_tested": ["real provider", "SSH via UI", "desktop input methods", "Windows 10/11", "native multi-page archive"]
                 + ([] if args.phase == "upgrade" else ["version upgrade in this phase"]),
         }, indent=2), encoding="utf-8")
     finally:
+        server.release_compaction.set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)

@@ -2,6 +2,14 @@ import type { ApiError, SessionRef } from './types';
 
 /** Safe native DTOs. Configuration secrets never cross this boundary. */
 export type ModelConfigStatus = {
+  context_window_tokens?: number | null;
+  context_window_override_tokens?: number | null;
+  capacity_source?: 'product_default' | 'user_override' | 'verified_metadata' | 'unavailable';
+  output_reserve_tokens?: number | null;
+  safety_margin_tokens?: number | null;
+  input_budget_tokens?: number | null;
+  context_auto_compact?: boolean;
+  context_auto_mode?: 'llm' | 'quick';
   path: string | null;
   revision: string | null;
   file_revision: string | null;
@@ -29,6 +37,9 @@ export type ChatMessage = {
 };
 export type ModelKeyUpdate = { kind: 'keep' } | { kind: 'replace'; value: string } | { kind: 'clear' };
 export type SaveModelConfigRequest = {
+  context_window_tokens?: number | null;
+  context_auto_compact?: boolean;
+  context_auto_mode?: 'llm' | 'quick';
   expected_file_revision: string;
   base_url: string;
   model: string;
@@ -52,7 +63,7 @@ export type ChatSnapshot = {
   active_run_id: string | null;
   revision: string;
 };
-export type ModelEvent = { kind: 'chat_updated'; chat: ChatSnapshot } | { kind: 'config_updated'; config: ModelConfigStatus };
+export type ModelEvent = { kind: 'chat_updated'; chat: ChatSnapshot } | { kind: 'config_updated'; config: ModelConfigStatus } | import('./contextBridge').ContextEvent;
 export const INITIAL_MODEL_CONFIG: ModelConfigStatus = {
   path: null, revision: null, file_revision: null, base_url: null, key_present: false, path_overridden: false, ready: false, destination: null, model: null,
   consented: false, error: null, warning: null, context_policy: 'explicit_chat_only', persistence: 'memory_only',

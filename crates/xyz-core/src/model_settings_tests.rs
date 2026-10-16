@@ -223,3 +223,134 @@ fn diagnostic_kind_defaults_to_chat_and_unknown_kinds_are_rejected() {
     invalid["kind"] = serde_json::json!("execute_terminal");
     assert!(serde_json::from_value::<ModelTestRequest>(invalid).is_err());
 }
+
+#[test]
+fn legacy_configuration_resolves_default_without_persisting_override() {
+    let fixture = Fixture::new();
+    fixture.write(&text());
+    let manager = fixture.manager();
+    let status = manager.status();
+    assert_eq!(status.context_window_tokens, Some(256_000));
+    assert_eq!(status.context_window_override_tokens, None);
+    assert_eq!(
+        status.capacity_source,
+        crate::context::CapacitySource::ProductDefault
+    );
+    assert_eq!(status.safety_margin_tokens, Some(12_800));
+    assert_eq!(status.input_budget_tokens, Some(256_000 - 12_800 - 777));
+    assert!(status.context_auto_compact);
+    assert_eq!(
+        status.context_auto_mode,
+        crate::context::CompactionMode::Llm
+    );
+    manager
+        .save(request(&manager, serde_json::json!({"kind":"keep"})))
+        .unwrap();
+    let persisted = fs::read_to_string(&fixture.path).unwrap();
+    assert!(!persisted.contains("context_window_tokens"));
+    assert!(!serde_json::to_string(&manager.status())
+        .unwrap()
+        .contains("synthetic-private-key"));
+}
+
+#[test]
+fn context_override_is_explicit_preserved_resettable_and_identity_scoped() {
+    let fixture = Fixture::new();
+    fixture.write(&text());
+    let manager = fixture.manager();
+    let mut change = request(&manager, serde_json::json!({"kind":"keep"}));
+    change.context_window_tokens = Some(Some(32_000));
+    change.context_auto_compact = Some(false);
+    change.context_auto_mode = Some(crate::context::CompactionMode::Quick);
+    let status = manager.save(change).unwrap();
+    assert_eq!(status.context_window_tokens, Some(32_000));
+    assert_eq!(status.context_window_override_tokens, Some(32_000));
+    assert_eq!(
+        status.capacity_source,
+        crate::context::CapacitySource::UserOverride
+    );
+    assert!(!status.context_auto_compact);
+    assert_eq!(
+        status.context_auto_mode,
+        crate::context::CompactionMode::Quick
+    );
+    // Old clients omit these fields, preserving explicit choices for same model.
+    manager
+        .save(request(&manager, serde_json::json!({"kind":"keep"})))
+        .unwrap();
+    assert_eq!(
+        manager.status().context_window_override_tokens,
+        Some(32_000)
+    );
+    let mut change = request(&manager, serde_json::json!({"kind":"keep"}));
+    change.model = "a-different-model".into();
+    let status = manager.save(change).unwrap();
+    assert_eq!(status.context_window_override_tokens, None);
+    assert_eq!(
+        status.capacity_source,
+        crate::context::CapacitySource::ProductDefault
+    );
+    let mut change = request(&manager, serde_json::json!({"kind":"keep"}));
+    change.context_window_tokens = Some(Some(64_000));
+    manager.save(change).unwrap();
+    let value = serde_json::json!({
+        "expected_file_revision": manager.status().file_revision,
+        "base_url":"https://example.com/v1", "model":"new-model",
+        "key_update":{"kind":"keep"}, "context_window_tokens":null
+    });
+    let reset: SaveModelConfigRequest = serde_json::from_value(value).unwrap();
+    assert_eq!(reset.context_window_tokens, Some(None));
+    let status = manager.save(reset).unwrap();
+    assert_eq!(status.context_window_override_tokens, None);
+    assert_eq!(status.context_window_tokens, Some(256_000));
+    assert!(!fs::read_to_string(&fixture.path)
+        .unwrap()
+        .contains("context_window_tokens"));
+}
+
+#[test]
+fn invalid_capacity_never_falls_back_or_changes_saved_file() {
+    let fixture = Fixture::new();
+    fixture.write(&text());
+    let manager = fixture.manager();
+    let before = fs::read_to_string(&fixture.path).unwrap();
+    for invalid_window in [0, 1, 777, 1801] {
+        let mut change = request(&manager, serde_json::json!({"kind":"keep"}));
+        change.context_window_tokens = Some(Some(invalid_window));
+        assert_eq!(
+            manager.save(change).unwrap_err().code,
+            "MODEL_CONFIG_INVALID"
+        );
+        assert_eq!(fs::read_to_string(&fixture.path).unwrap(), before);
+        assert_eq!(
+            manager.status().capacity_source,
+            crate::context::CapacitySource::ProductDefault
+        );
+    }
+    fixture.write(&text().replace("[request]", "[request]\ncontext_window_tokens=0"));
+    let invalid = manager.reload();
+    assert!(!invalid.ready);
+    assert_eq!(invalid.context_window_tokens, None);
+    assert_eq!(invalid.input_budget_tokens, None);
+    assert_eq!(
+        invalid.capacity_source,
+        crate::context::CapacitySource::Unavailable
+    );
+    assert_eq!(invalid.error.unwrap().code, "MODEL_CONFIG_INVALID");
+}
+
+#[test]
+fn local_snapshot_does_not_grant_destination_consent() {
+    let fixture = Fixture::new();
+    fixture.write(&text());
+    let manager = fixture.manager();
+    assert!(manager.local_snapshot().is_some());
+    assert!(!manager.status().consented);
+    assert_eq!(
+        manager.authorized_snapshot().err().unwrap().code,
+        "MODEL_CONSENT_REQUIRED"
+    );
+    fixture.write(&text().replace("[request]", "[request]\ncontext_window_tokens=0"));
+    manager.reload();
+    assert!(manager.local_snapshot().is_none());
+}

@@ -38,39 +38,44 @@ WebView2 user-data folder. It does not alter machine browser/registry settings.
   hashes remain unchanged during installer operations; the binary disappears on
   uninstall; the restored native UI still reads the synthetic saved state.
 
-A separate fresh private fixture then installs the public v0.1.2 prerelease pinned
-by installer and manifest SHA256, exact source/run provenance and installed binary
-SHA256. The release itself is not immutable; pinned bytes and provenance fail
-closed if an upstream asset is replaced. It creates the synthetic profile/history
-through the released real UI, including model settings saved and tested with
-explicit consent, restarts, then directly installs v0.1.3 over it. Before
-launching the new application it checks the installed version, replacement
-executable identity and unchanged data-file hashes. Both reviewed versions use
-profile/history schema v2: every old history row must remain exact, the profile
-ID/target and complete profile-file bytes must be preserved, and unrelated model
-settings must retain their exact hash. Profile and model files must remain
-owner-only on Linux and retain current-user ownership and protected private ACLs
-on Windows. No v1 backup may be invented for the fresh v2 fixture. SQLite sidecars must be
-absent after clean exit. The new real UI must
-restore the same text/task identity with fresh history consent and zero model
-requests, then actually uninstall without deleting the data. This is the reviewed
-0.1.2→0.1.3 upgrade path, not arbitrary upgrades or downgrade support.
+A separate fresh private fixture installs the public v0.1.4 prerelease pinned
+by installer and manifest SHA256, exact source/run provenance and independently
+extracted installed-binary SHA256. Pins fail closed if an upstream asset changes.
+The reviewed source is `0e29b1e5912f35e9eabd73ac073524af143cd622`, public
+[release run 38937958608](https://github.com/yanch123/xyzaishell/actions/runs/38937958608),
+[release 415214180](https://github.com/yanch123/xyzaishell/releases/tag/v0.1.4).
+The [reviewed fixture](scripts/fixtures/upgrade-v0.1.4.json) records exact manifest
+bytes and both application identities extracted from the public packages.
+No earlier candidate or v0.1.3 Windows binary hash is reused.
 
-The v0.1.2 baseline is source `423fc24242ca6b168afc151d7b9f3985a92c1566`,
-[build run `38594474625`](https://github.com/yanch123/xyzaishell/actions/runs/38594474625),
-[public prerelease `412925486`](https://github.com/yanch123/xyzaishell/releases/tag/v0.1.2).
-Asset sizes/digests and tag were reverified against the public GitHub API on
-2026-10-15. Downloaded release-run installer and manifest bytes match the public
-asset pins exactly. Linux executable bytes were also extracted and hashed;
-Windows executable pins come from that release run's installed-app acceptance
-evidence, not an earlier candidate build. The
-[reviewed fixture](scripts/fixtures/upgrade-v0.1.2.json) records the asset and
-artifact identities, exact manifest bytes (base64 preserves Windows line endings),
-and installed-binary evidence. Previous 0.1.1→0.1.2 results remain evidence for
-that older migration only; they do not establish 0.1.2→0.1.3 acceptance. Legacy
-v1 backup-integrity regression helpers and Rust migration tests remain separate.
-Updating these checks is not a claim that the new candidate has passed a hosted
-native run.
+The baseline is seeded through its real UI, restarted and directly upgraded to
+v0.2.0. Before candidate launch, installer operations must preserve data-file
+hashes. On launch, history migrates from schema v2 to v3: original scalar chat
+identity fields stay exact; `legacy_backups` retains original payload bytes; all
+original message fields and ordered identities are copied to `entries`; the chat
+metadata no longer contains a bounded transcript copy. Profile/model files retain
+exact hashes and private ownership/permissions. The candidate restores text with
+fresh opt-in and no model requests. This establishes only the reviewed upgrade
+path after a successful hosted run, never arbitrary upgrade/downgrade support.
+
+Candidate-only native checks send six completed synthetic conversation turns
+through the real composer. The engine protects the two newest complete turns;
+long older replies therefore make positive reduction possible. At turn three,
+local quick compaction must succeed (not merely report no effect), without any
+model call. After additional turns, an LLM compaction calls the loopback provider
+with real serialized source manifests. The fixture holds that response until
+the UI cancels and the backend reports cancellation; only then is it released.
+A retry must issue another real request and commit a validated, manifest-bound
+strict JSON summary with positive reduction. No IPC, ledger, or command state
+is injected. The popover also verifies default 256000 capacity/source/80%-95%
+explanation. After both compactions, the archive must still contain every
+original message. Archive reads and page refresh never call a model or SSH.
+
+Browser synthetic IPC tests additionally cover draft isolation and 130-message
+cursor pagination. These do not establish native multi-page archive behavior.
+Real-provider behavior and native multi-page history remain explicit gaps.
+All native coverage above requires a successful hosted run; helper unit tests
+and source changes alone do not establish application acceptance.
 
 Fresh-install and upgrade scenarios do not share HOME/XDG/AppData or WebView
 profiles. Only the native driver download is reused; Windows signature/version

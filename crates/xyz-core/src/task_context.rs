@@ -11,8 +11,11 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const MAX_CONTEXT_BYTES: usize = 32 * 1024;
-pub const MAX_EVIDENCE: usize = 16;
+// Independent host evidence-store budget, not a model request allowance.
+// A run has at most 256 planning actions; every command can retain an anchor.
+// The actual request selects/compacts these sources through tasks_evidence.
+pub const MAX_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_EVIDENCE: usize = 256;
 const MAX_FINDINGS: usize = 8;
 const MAX_STEPS: usize = 12;
 const MAX_REFERENCES: usize = 4;

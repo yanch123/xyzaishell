@@ -140,3 +140,12 @@ describe('terminal attachment review layout', () => {
     expect(mocks.send).not.toHaveBeenCalled();
   });
 });
+
+it('does not reject a send merely because display history exceeds the retired global message cap', async () => {
+  const longChat = chat();
+  longChat.messages = Array.from({ length: 130 }, (_, index) => ({ id: `old-${index}`, role: index % 2 ? 'assistant' : 'user', text: '已保存的历史原文。'.repeat(200), run_id: `run-${Math.floor(index / 2)}`, state: 'complete', error: null }));
+  mocks.list.mockResolvedValue([longChat]); await ready();
+  fireEvent.change(screen.getByRole('textbox', { name: '聊天消息' }), { target: { value: '继续' } });
+  const send = screen.getByRole('button', { name: '发送' }); expect(send.hasAttribute('disabled')).toBe(false); fireEvent.click(send);
+  await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(1));
+});

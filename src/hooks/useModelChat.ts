@@ -2,7 +2,7 @@ import type { TerminalTaskSnapshot } from '../lib/agent';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { desktopAvailable } from '../lib/bridge';
 import { modelBridge } from '../lib/modelBridge';
-import { MAX_CHATS, MAX_DRAFT_LENGTH, MAX_MESSAGE_BYTES, MAX_MESSAGES, utf8Length } from '../lib/chats';
+import { MAX_CHATS, MAX_DRAFT_LENGTH, MAX_MESSAGE_BYTES, utf8Length } from '../lib/chats';
 import { INITIAL_MODEL_CONFIG, MAX_CONCURRENT_CHATS, newerRevision } from '../lib/model';
 import type { ChatSnapshot, ModelConfigStatus, SaveModelConfigRequest, ModelTestResult, ModelTestKind } from '../lib/model';
 import type { SessionSnapshot } from '../lib/types';
@@ -247,7 +247,7 @@ export function useModelChat(target?: SessionSnapshot) {
       return false;
     }
     const text = composeAttachedMessage(draftsRef.current[chatId] ?? '', attachment);
-    if (!native || !ready || configWriteBlocked || !chat || !chatMatchesTarget(chat, targetRef.current) || !text || utf8Length(text) > MAX_MESSAGE_BYTES || chat.messages.length > MAX_MESSAGES - 2 || chat.active_run_id || pendingRef.current.has(chatId) || uncertainSubmissionsRef.current.has(chatId) || !configRef.current.ready || !configRef.current.consented || (!attachment && targetIdentity(targetRef.current) && scopeGrantRef.current !== scopeKey(configRef.current, targetRef.current))) return false;
+    if (!native || !ready || configWriteBlocked || !chat || !chatMatchesTarget(chat, targetRef.current) || !text || utf8Length(text) > MAX_MESSAGE_BYTES || chat.active_run_id || pendingRef.current.has(chatId) || uncertainSubmissionsRef.current.has(chatId) || !configRef.current.ready || !configRef.current.consented || (!attachment && targetIdentity(targetRef.current) && scopeGrantRef.current !== scopeKey(configRef.current, targetRef.current))) return false;
     if (chatsRef.current.filter(item => item.active_run_id || pendingRef.current.get(item.chat_id) === 'sending').length >= MAX_CONCURRENT_CHATS) return false;
     markPending(chatId, 'sending');
     setErrors(items => ({ ...items, [chatId]: null }));

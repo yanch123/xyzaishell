@@ -29,7 +29,7 @@ use crate::{
     storage::{private_files::PrivateDirectory, StorageError},
     tasks::{
         ChatMessage, ChatSnapshot, ChatSource, MessageRole, MessageState, MAX_ASSISTANT_BYTES,
-        MAX_CHATS, MAX_MESSAGES, MAX_MESSAGE_BYTES, MAX_TRANSCRIPT_BYTES,
+        MAX_CHATS, MAX_MESSAGE_BYTES,
     },
 };
 use rusqlite::{
@@ -51,9 +51,12 @@ const MAX_JOURNAL_BYTES: usize = MAX_DATABASE_BYTES + 1024 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 const PAGE_SIZE: usize = 4096;
 const APPLICATION_ID: i64 = 0x58595a48;
-// v2 persists immutable chat source. v1 readers must refuse the archive rather
-// than misread new payloads. The table layout is unchanged and v1 rows migrate.
-const SCHEMA_VERSION: i64 = 2;
+// v3 separates durable message entries from display pages and model memory.
+// v1/v2 readers must refuse this archive; legacy payloads migrate atomically.
+const SCHEMA_VERSION: i64 = 3;
+pub const ARCHIVE_PAGE_MESSAGES: usize = 128;
+pub const ARCHIVE_PAGE_BYTES: usize = 256 * 1024;
+const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 // Keep the original startup lock name so initialization and every subsequent
 // operation participate in one protocol. Never replace/delete this lock file.
@@ -61,6 +64,150 @@ const ACCESS_LOCK: &str = "history.initialize";
 const CHAT_SCHEMA: &str = "CREATE TABLE chats (chat_id TEXT PRIMARY KEY NOT NULL, task_id TEXT UNIQUE NOT NULL, revision INTEGER NOT NULL CHECK(revision > 0), listed INTEGER NOT NULL CHECK(listed IN (0,1)), updated_ms INTEGER NOT NULL CHECK(updated_ms >= 0), payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 2097152)) STRICT";
 const METADATA_SCHEMA: &str = "CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL CHECK(revision >= 0)) STRICT";
 const AUDIT_SCHEMA: &str = "CREATE TABLE audit (event_id TEXT PRIMARY KEY NOT NULL, chat_id TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE, run_id TEXT, kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 8), created_ms INTEGER NOT NULL CHECK(created_ms >= 0)) STRICT";
+
+const ENTRY_SCHEMA: &str = "CREATE TABLE entries (chat_id TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE, sequence INTEGER NOT NULL CHECK(sequence > 0), message_id TEXT NOT NULL, payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 524288), PRIMARY KEY(chat_id,sequence), UNIQUE(chat_id,message_id)) STRICT";
+// Migration backups are retained until explicit forget; they are never replayed.
+const BACKUP_SCHEMA: &str = "CREATE TABLE legacy_backups (chat_id TEXT PRIMARY KEY NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE, payload TEXT NOT NULL) STRICT";
+
+const COMPACTION_SCHEMA: &str = "CREATE TABLE compactions (event_id TEXT PRIMARY KEY NOT NULL, chat_id TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE, payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 262144)) STRICT";
+const COMPACTION_SOURCE_SCHEMA: &str = "CREATE TABLE compaction_sources (event_id TEXT NOT NULL REFERENCES compactions(event_id) ON DELETE CASCADE, ordinal INTEGER NOT NULL CHECK(ordinal >= 0), source_id TEXT NOT NULL, PRIMARY KEY(event_id,ordinal)) STRICT";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionArchiveRecord {
+    pub event_id: String,
+    pub context_revision: String,
+    pub summary_text: String,
+    pub source_ids: Vec<String>,
+    pub omitted_ranges: Vec<String>,
+    pub mode: String,
+    pub reason: String,
+    pub before_tokens: u64,
+    pub after_tokens: u64,
+    pub before_bytes: usize,
+    pub after_bytes: usize,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionedCompaction {
+    version: u32,
+    record: CompactionArchiveRecord,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct CompactionArchivePage {
+    pub records: Vec<CompactionArchiveRecord>,
+    pub next_before: Option<u64>,
+}
+pub(crate) struct RedactedCompaction(CompactionArchiveRecord);
+impl RedactedCompaction {
+    pub(crate) fn new(
+        record: &CompactionArchiveRecord,
+        mut redact: impl FnMut(&str) -> String,
+    ) -> Result<Self> {
+        validate_compaction(record)?;
+        let mut record = record.clone();
+        record.summary_text = if record.mode == "llm" {
+            // Structured summaries are redacted before JSON re-encoding. Keys
+            // are protocol, and quoted/newline secrets must be matched decoded.
+            let mut value: serde_json::Value = serde_json::from_str(&record.summary_text)
+                .map_err(|_| HistoryError::InvalidRecord)?;
+            if !value.is_object() {
+                return Err(HistoryError::InvalidRecord);
+            }
+            redact_json_leaves(&mut value, &mut redact);
+            serde_json::to_string(&value).map_err(|_| HistoryError::InvalidRecord)?
+        } else {
+            redact(&record.summary_text)
+        };
+        for text in &mut record.omitted_ranges {
+            *text = redact(text);
+        }
+        validate_compaction(&record)?;
+        Ok(Self(record))
+    }
+    pub(crate) fn redact_again(&self, redact: impl FnMut(&str) -> String) -> Result<Self> {
+        Self::new(&self.0, redact)
+    }
+    pub(crate) fn into_record(self) -> CompactionArchiveRecord {
+        self.0
+    }
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.0.summary_text.capacity()
+            + self
+                .0
+                .source_ids
+                .iter()
+                .chain(&self.0.omitted_ranges)
+                .map(|s| s.capacity() + 64)
+                .sum::<usize>()
+            + 2048
+    }
+}
+fn redact_json_leaves(value: &mut serde_json::Value, redact: &mut impl FnMut(&str) -> String) {
+    match value {
+        serde_json::Value::String(text) => *text = redact(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_leaves(value, redact);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_json_leaves(value, redact);
+            }
+        }
+        _ => {}
+    }
+}
+fn validate_compaction(record: &CompactionArchiveRecord) -> Result<()> {
+    require_id(&record.event_id)?;
+    if record
+        .context_revision
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .is_none()
+        || record.summary_text.is_empty()
+        || record.summary_text.len() > MAX_ASSISTANT_BYTES
+        || record.summary_text.contains('\0')
+        || !["quick", "llm"].contains(&record.mode.as_str())
+        || !["manual", "token_pressure", "hard_byte_limit", "both"]
+            .contains(&record.reason.as_str())
+        || record.source_ids.is_empty()
+        || record.source_ids.len() > 4096
+        || record.omitted_ranges.len() > 4096
+        || record.source_ids.iter().any(|id| {
+            id.is_empty()
+                || id.len() > 128
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_:./".contains(&b))
+        })
+        || record
+            .omitted_ranges
+            .iter()
+            .any(|text| text.len() > 1024 || text.contains('\0'))
+        || record.after_tokens > record.before_tokens
+        || record.after_bytes > record.before_bytes
+        || (record.after_tokens == record.before_tokens
+            && record.after_bytes == record.before_bytes)
+    {
+        return Err(HistoryError::InvalidRecord);
+    }
+    if record.source_ids.iter().collect::<BTreeSet<_>>().len() != record.source_ids.len() {
+        return Err(HistoryError::InvalidRecord);
+    }
+    Ok(())
+}
+fn decode_compaction(payload: &str) -> Result<CompactionArchiveRecord> {
+    let value: VersionedCompaction =
+        serde_json::from_str(payload).map_err(|_| HistoryError::Corrupt)?;
+    if value.version != 1 {
+        return Err(HistoryError::UnsupportedSchema);
+    }
+    validate_compaction(&value.record).map_err(|_| HistoryError::Corrupt)?;
+    Ok(value.record)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HistoryPreference {
@@ -162,6 +309,20 @@ pub struct ArchivedChat {
 /// not a proof that every secret is known or that a caller supplied a real filter.
 pub struct RedactedChat(ArchivedChat);
 impl RedactedChat {
+    pub(crate) fn retained_memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.0.chat_id.capacity()
+            + self.0.task_id.capacity()
+            + self.0.title.capacity()
+            + self.0.messages.capacity() * std::mem::size_of::<ArchivedMessage>()
+            + self
+                .0
+                .messages
+                .iter()
+                .map(|m| m.id.capacity() + m.text.capacity())
+                .sum::<usize>()
+            + 1024
+    }
     /// Refresh filtering immediately before a queued write, since the host may
     /// have learned additional secret values after taking the snapshot.
     pub(crate) fn redact_again(
@@ -183,7 +344,7 @@ impl RedactedChat {
         snapshot: &ChatSnapshot,
         mut redact_known_secrets: impl FnMut(&str) -> String,
     ) -> Result<Self> {
-        if snapshot.messages.len() > MAX_MESSAGES || snapshot.title.len() > 256 {
+        if snapshot.title.len() > 256 {
             return Err(HistoryError::InvalidRecord);
         }
         let mut total = 0usize;
@@ -192,7 +353,7 @@ impl RedactedChat {
             total = total
                 .checked_add(message.text.len())
                 .ok_or(HistoryError::InvalidRecord)?;
-            if total > MAX_TRANSCRIPT_BYTES || message.text.len() > text_limit(&message.role) {
+            if total > MAX_CAPTURE_BYTES || message.text.len() > text_limit(&message.role) {
                 return Err(HistoryError::InvalidRecord);
             }
             messages.push(ArchivedMessage {
@@ -236,6 +397,8 @@ pub struct StoredChat {
     pub listed: bool,
     pub updated_ms: i64,
     pub chat: ArchivedChat,
+    pub message_count: usize,
+    pub next_before: Option<u64>,
 }
 impl StoredChat {
     /// Inert transcript only. The host must initialize every runtime handle,
@@ -379,6 +542,12 @@ impl HistoryStore {
         if mode != "delete" {
             return Err(HistoryError::UnsupportedSchema);
         }
+        // Enforce the independent disk quota before migration allocates pages.
+        self.connection.pragma_update(
+            None,
+            "max_page_count",
+            (MAX_DATABASE_BYTES / PAGE_SIZE) as i64,
+        )?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -393,13 +562,17 @@ impl HistoryStore {
             tx.execute_batch(CHAT_SCHEMA)?;
             tx.execute_batch(AUDIT_SCHEMA)?;
             tx.execute_batch(METADATA_SCHEMA)?;
+            tx.execute_batch(ENTRY_SCHEMA)?;
+            tx.execute_batch(BACKUP_SCHEMA)?;
+            tx.execute_batch(COMPACTION_SCHEMA)?;
+            tx.execute_batch(COMPACTION_SOURCE_SCHEMA)?;
             tx.execute("INSERT INTO metadata(id,revision) VALUES(1,0)", [])?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if version == 1 && app == APPLICATION_ID {
+        } else if (version == 1 || version == 2) && app == APPLICATION_ID {
             // Verify the complete old layout and every row before changing its
             // format marker. Invalid/future archives are left untouched.
-            verify_schema(&tx)?;
+            verify_schema_version(&tx, false)?;
             {
                 let mut statement = tx.prepare(
                     "SELECT chat_id,task_id,revision,listed,updated_ms,payload FROM chats",
@@ -410,14 +583,40 @@ impl HistoryStore {
                     let value: serde_json::Value =
                         serde_json::from_str(&row.5).map_err(|_| HistoryError::Corrupt)?;
                     let fields = value.as_object().ok_or(HistoryError::Corrupt)?;
-                    if fields.len() != 4
-                        || fields.keys().any(|key| {
-                            !["chat_id", "task_id", "title", "messages"].contains(&key.as_str())
-                        })
+                    if version == 1
+                        && (fields.len() != 4
+                            || fields.keys().any(|key| {
+                                !["chat_id", "task_id", "title", "messages"].contains(&key.as_str())
+                            }))
                     {
                         return Err(HistoryError::UnsupportedSchema);
                     }
                     decode(row)?;
+                }
+            }
+            tx.execute_batch(ENTRY_SCHEMA)?;
+            tx.execute_batch(BACKUP_SCHEMA)?;
+            tx.execute_batch(COMPACTION_SCHEMA)?;
+            tx.execute_batch(COMPACTION_SOURCE_SCHEMA)?;
+            {
+                let mut statement = tx.prepare(
+                    "SELECT chat_id,task_id,revision,listed,updated_ms,payload FROM chats",
+                )?;
+                let rows = statement.query_map([], raw_chat)?;
+                for row in rows {
+                    let raw = row?;
+                    let backup = raw.5.clone();
+                    let decoded = decode(raw)?;
+                    tx.execute(
+                        "INSERT INTO legacy_backups(chat_id,payload) VALUES(?1,?2)",
+                        params![decoded.chat.chat_id, backup],
+                    )?;
+                    write_entries(&tx, &decoded.chat)?;
+                    let payload = encode(&RedactedChat(decoded.chat.clone()))?;
+                    tx.execute(
+                        "UPDATE chats SET payload=?1 WHERE chat_id=?2",
+                        params![payload, decoded.chat.chat_id],
+                    )?;
                 }
             }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -446,12 +645,16 @@ impl HistoryStore {
         if foreign_key_violation {
             return Err(HistoryError::Corrupt);
         }
+        validate_entries(&tx)?;
+        validate_compactions(&tx)?;
+        audit_rows(&tx, None)?;
         self.schema_cookie = tx.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
         tx.commit().map_err(commit_error)?;
         // Verify all bounded historical rows now, instead of silently skipping
         // a damaged record and telling the user their transcript is empty.
         self.list_locked(true)?;
         self.validate_all_audit()?;
+        validate_entries(&self.connection)?;
         Ok(())
     }
 
@@ -508,12 +711,16 @@ impl HistoryStore {
         let revision = allocate_revision(&tx)?;
         tx.execute("INSERT INTO chats(chat_id, task_id, revision, listed, updated_ms, payload) VALUES (?1,?2,?3,1,?4,?5)",
             params![prepared.0.chat_id, prepared.0.task_id, revision, now, payload])?;
+        write_entries(&tx, &prepared.0)?;
+        let total_messages = message_count(&tx, &prepared.0.chat_id)?;
         tx.commit().map_err(commit_error)?;
         Ok(StoredChat {
             revision,
             listed: true,
             updated_ms: now,
             chat: prepared.0.clone(),
+            message_count: total_messages,
+            next_before: None,
         })
     }
 
@@ -527,7 +734,29 @@ impl HistoryStore {
         let tx = self.connection.unchecked_transaction()?;
         check_schema_state(&tx, self.schema_cookie)?;
         let raw = tx.query_row("SELECT chat_id,task_id,revision,listed,updated_ms,payload FROM chats WHERE chat_id=?1", [chat_id], raw_chat).optional()?;
-        decode(raw.ok_or(HistoryError::NotFound)?)
+        let mut row = decode(raw.ok_or(HistoryError::NotFound)?)?;
+        load_page(&tx, &mut row, None, ARCHIVE_PAGE_MESSAGES)?;
+        Ok(row)
+    }
+
+    /// Reads a display-only bounded page, newest page by default. Cursor is an
+    /// exclusive stable sequence boundary; this never changes model memory.
+    pub fn page(
+        &self,
+        chat_id: &str,
+        expected_revision: i64,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<StoredChat> {
+        self.with_access(|store| {
+            store.guard()?;
+            require_id(chat_id)?;
+            let tx = store.connection.unchecked_transaction()?;
+            check_schema_state(&tx, store.schema_cookie)?;
+            let mut row = checked_target(&tx, chat_id, expected_revision)?;
+            load_page(&tx, &mut row, before, limit)?;
+            Ok(row)
+        })
     }
 
     /// Delisted chats still count toward the cap until explicitly forgotten.
@@ -544,7 +773,9 @@ impl HistoryStore {
             statement.query_map(params![include_delisted, MAX_CHATS as i64 + 1], raw_chat)?;
         let mut result = Vec::new();
         for row in rows {
-            result.push(decode(row?)?);
+            let mut row = decode(row?)?;
+            row.message_count = message_count(&tx, &row.chat.chat_id)?;
+            result.push(row);
         }
         if result.len() > MAX_CHATS {
             return Err(HistoryError::LimitReached);
@@ -588,12 +819,16 @@ impl HistoryStore {
             [&prepared.0.chat_id],
             |r| r.get(0),
         )?;
+        write_entries(&tx, &prepared.0)?;
+        let total_messages = message_count(&tx, &prepared.0.chat_id)?;
         tx.commit().map_err(commit_error)?;
         Ok(StoredChat {
             revision,
             listed,
             updated_ms: now,
             chat: prepared.0.clone(),
+            message_count: total_messages,
+            next_before: None,
         })
     }
 
@@ -718,6 +953,76 @@ impl HistoryStore {
         Ok(record)
     }
 
+    pub(crate) fn append_compaction(
+        &mut self,
+        chat_id: &str,
+        prepared: &RedactedCompaction,
+    ) -> Result<()> {
+        self.with_access_mut(|store| {
+            store.guard()?;
+            require_id(chat_id)?;
+            validate_compaction(&prepared.0)?;
+            let payload = serde_json::to_string(&VersionedCompaction {
+                version: 1,
+                record: prepared.0.clone(),
+            })
+            .map_err(|_| HistoryError::InvalidRecord)?;
+            if payload.len() > 256 * 1024 {
+                return Err(HistoryError::LimitReached);
+            }
+            let tx = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            check_schema_state(&tx, store.schema_cookie)?;
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM chats WHERE chat_id=?1)",
+                [chat_id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(HistoryError::NotFound);
+            }
+            let count: i64 = tx.query_row("SELECT count(*) FROM compactions", [], |r| r.get(0))?;
+            if count >= MAX_AUDIT_EVENTS as i64 {
+                return Err(HistoryError::LimitReached);
+            }
+            tx.execute(
+                "INSERT INTO compactions(event_id,chat_id,payload) VALUES(?1,?2,?3)",
+                params![prepared.0.event_id, chat_id, payload],
+            )?;
+            for (ordinal, source) in prepared.0.source_ids.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO compaction_sources(event_id,ordinal,source_id) VALUES(?1,?2,?3)",
+                    params![prepared.0.event_id, ordinal as i64, source],
+                )?;
+            }
+            tx.commit().map_err(commit_error)
+        })
+    }
+    /// Inert historical compaction facts only. This never restores a ledger.
+    pub fn compaction_page(
+        &self,
+        chat_id: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<CompactionArchivePage> {
+        self.with_access(|store| {
+            store.guard()?; require_id(chat_id)?;
+            if limit==0||limit>128||before.is_some_and(|n|n==0||n>i64::MAX as u64){return Err(HistoryError::InvalidRecord);}
+            let tx=store.connection.unchecked_transaction()?;check_schema_state(&tx,store.schema_cookie)?;
+            let mut statement=tx.prepare("SELECT rowid,payload FROM compactions WHERE chat_id=?1 AND rowid < ?2 ORDER BY rowid DESC LIMIT ?3")?;
+            let mut rows=statement.query(params![chat_id,before.unwrap_or(i64::MAX as u64) as i64,limit as i64])?;
+            let mut records=Vec::new();let mut bytes=0;let mut first=None;
+            while let Some(row)=rows.next()? {
+                let payload:String=row.get(1)?;
+                if !records.is_empty() && bytes+payload.len()>256*1024 {break;}
+                bytes+=payload.len();first=Some(row.get::<_,i64>(0)?);records.push(decode_compaction(&payload)?);
+            }
+            let next_before=if let Some(first)=first {let more:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM compactions WHERE chat_id=?1 AND rowid < ?2)",params![chat_id,first],|r|r.get(0))?;more.then_some(first as u64)}else{None};
+            records.reverse();Ok(CompactionArchivePage{records,next_before})
+        })
+    }
+
     pub fn read_audit(&self, chat_id: &str) -> Result<Vec<AuditRecord>> {
         self.with_access(|store| store.read_audit_locked(chat_id))
     }
@@ -735,6 +1040,151 @@ impl HistoryStore {
         check_schema_state(&tx, self.schema_cookie)?;
         audit_rows(&tx, chat_id)
     }
+}
+
+fn validate_compactions(connection: &Connection) -> Result<()> {
+    let count: i64 = connection.query_row("SELECT count(*) FROM compactions", [], |r| r.get(0))?;
+    if count > MAX_AUDIT_EVENTS as i64 {
+        return Err(HistoryError::LimitReached);
+    }
+    let mut statement = connection.prepare("SELECT event_id,payload FROM compactions")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let event_id: String = row.get(0)?;
+        let record = decode_compaction(&row.get::<_, String>(1)?)?;
+        if record.event_id != event_id {
+            return Err(HistoryError::Corrupt);
+        }
+        let mut sources = connection.prepare(
+            "SELECT ordinal,source_id FROM compaction_sources WHERE event_id=?1 ORDER BY ordinal",
+        )?;
+        let mut indexed = sources.query([&event_id])?;
+        let mut ordinal = 0;
+        while let Some(source) = indexed.next()? {
+            if source.get::<_, i64>(0)? != ordinal as i64
+                || record.source_ids.get(ordinal) != Some(&source.get::<_, String>(1)?)
+            {
+                return Err(HistoryError::Corrupt);
+            }
+            ordinal += 1;
+        }
+        if ordinal != record.source_ids.len() {
+            return Err(HistoryError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
+fn message_count(connection: &Connection, chat_id: &str) -> Result<usize> {
+    Ok(connection.query_row(
+        "SELECT count(*) FROM entries WHERE chat_id=?1",
+        [chat_id],
+        |r| r.get::<_, i64>(0),
+    )? as usize)
+}
+fn decode_entry(payload: &str, id: &str) -> Result<ArchivedMessage> {
+    let message: ArchivedMessage =
+        serde_json::from_str(payload).map_err(|_| HistoryError::Corrupt)?;
+    if message.id != id
+        || require_id(id).is_err()
+        || message.text.contains('\0')
+        || message.text.len() > text_limit(&message.role)
+    {
+        return Err(HistoryError::Corrupt);
+    }
+    Ok(message)
+}
+fn validate_entries(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("SELECT message_id,payload FROM entries")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        decode_entry(&row.get::<_, String>(1)?, &row.get::<_, String>(0)?)?;
+    }
+    Ok(())
+}
+fn write_entries(connection: &Connection, chat: &ArchivedChat) -> Result<()> {
+    let mut sequence: i64 = connection.query_row(
+        "SELECT coalesce(max(sequence),0) FROM entries WHERE chat_id=?1",
+        [&chat.chat_id],
+        |r| r.get(0),
+    )?;
+    for message in &chat.messages {
+        let payload = serde_json::to_string(message).map_err(|_| HistoryError::InvalidRecord)?;
+        let old: Option<String> = connection
+            .query_row(
+                "SELECT payload FROM entries WHERE chat_id=?1 AND message_id=?2",
+                params![chat.chat_id, message.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(old) = old {
+            let previous = decode_entry(&old, &message.id)?;
+            if previous.role != message.role {
+                return Err(HistoryError::Conflict);
+            }
+            // A streaming assistant keeps its stable ID. Captures can finish or
+            // refresh redaction, but omitting an ID never deletes its original.
+            if old != payload {
+                connection.execute(
+                    "UPDATE entries SET payload=?1 WHERE chat_id=?2 AND message_id=?3",
+                    params![payload, chat.chat_id, message.id],
+                )?;
+            }
+        } else {
+            sequence = sequence.checked_add(1).ok_or(HistoryError::LimitReached)?;
+            connection.execute(
+                "INSERT INTO entries(chat_id,sequence,message_id,payload) VALUES(?1,?2,?3,?4)",
+                params![chat.chat_id, sequence, message.id, payload],
+            )?;
+        }
+    }
+    Ok(())
+}
+fn load_page(
+    connection: &Connection,
+    row: &mut StoredChat,
+    before: Option<u64>,
+    limit: usize,
+) -> Result<()> {
+    if limit == 0
+        || limit > ARCHIVE_PAGE_MESSAGES
+        || before.is_some_and(|n| n == 0 || n > i64::MAX as u64)
+    {
+        return Err(HistoryError::InvalidRecord);
+    }
+    let mut statement = connection.prepare("SELECT sequence,message_id,payload FROM entries WHERE chat_id=?1 AND sequence < ?2 ORDER BY sequence DESC LIMIT ?3")?;
+    let mut rows = statement.query(params![
+        row.chat.chat_id,
+        before.unwrap_or(i64::MAX as u64) as i64,
+        limit as i64
+    ])?;
+    let mut messages = Vec::new();
+    let mut bytes = 0usize;
+    let mut first = None;
+    while let Some(entry) = rows.next()? {
+        let sequence: i64 = entry.get(0)?;
+        let message = decode_entry(&entry.get::<_, String>(2)?, &entry.get::<_, String>(1)?)?;
+        if !messages.is_empty() && bytes + message.text.len() > ARCHIVE_PAGE_BYTES {
+            break;
+        }
+        bytes += message.text.len();
+        messages.push(message);
+        first = Some(sequence);
+    }
+    messages.reverse();
+    row.chat.messages = messages;
+    row.message_count = message_count(connection, &row.chat.chat_id)?;
+    row.next_before = if let Some(first) = first {
+        let older: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries WHERE chat_id=?1 AND sequence < ?2)",
+            params![row.chat.chat_id, first],
+            |r| r.get(0),
+        )?;
+        older.then_some(first as u64)
+    } else {
+        None
+    };
+    Ok(())
 }
 
 fn audit_rows(connection: &Connection, chat_id: Option<&str>) -> Result<Vec<AuditRecord>> {
@@ -842,6 +1292,9 @@ fn check_files(directory: &PrivateDirectory) -> Result<()> {
     check_sidecars(directory)
 }
 fn verify_schema(connection: &Connection) -> Result<()> {
+    verify_schema_version(connection, true)
+}
+fn verify_schema_version(connection: &Connection, paged: bool) -> Result<()> {
     let mut statement =
         connection.prepare("SELECT type,name,sql FROM sqlite_schema ORDER BY name")?;
     let rows = statement.query_map([], |row| {
@@ -855,6 +1308,31 @@ fn verify_schema(connection: &Connection) -> Result<()> {
     for row in rows {
         let (kind, name, sql) = row?;
         match (kind.as_str(), name.as_str(), sql.as_deref()) {
+            ("table", "compactions", Some(COMPACTION_SCHEMA)) if paged => {
+                tables.insert("compactions");
+            }
+            ("table", "compaction_sources", Some(COMPACTION_SOURCE_SCHEMA)) if paged => {
+                tables.insert("compaction_sources");
+            }
+            (
+                "index",
+                "sqlite_autoindex_compactions_1" | "sqlite_autoindex_compaction_sources_1",
+                None,
+            ) if paged => {}
+
+            ("table", "entries", Some(ENTRY_SCHEMA)) if paged => {
+                tables.insert("entries");
+            }
+            ("table", "legacy_backups", Some(BACKUP_SCHEMA)) if paged => {
+                tables.insert("legacy_backups");
+            }
+            (
+                "index",
+                "sqlite_autoindex_entries_1"
+                | "sqlite_autoindex_entries_2"
+                | "sqlite_autoindex_legacy_backups_1",
+                None,
+            ) if paged => {}
             ("table", "chats", Some(CHAT_SCHEMA)) => {
                 tables.insert("chats");
             }
@@ -874,7 +1352,7 @@ fn verify_schema(connection: &Connection) -> Result<()> {
             _ => return Err(HistoryError::UnsupportedSchema),
         }
     }
-    if tables.len() != 3 {
+    if tables.len() != if paged { 7 } else { 3 } {
         return Err(HistoryError::Corrupt);
     }
     Ok(())
@@ -951,7 +1429,6 @@ fn validate_chat(chat: &ArchivedChat) -> Result<()> {
     if chat.title.trim().is_empty()
         || chat.title.len() > 256
         || chat.title.chars().any(char::is_control)
-        || chat.messages.len() > MAX_MESSAGES
     {
         return Err(HistoryError::InvalidRecord);
     }
@@ -969,14 +1446,21 @@ fn validate_chat(chat: &ArchivedChat) -> Result<()> {
             .checked_add(message.text.len())
             .ok_or(HistoryError::InvalidRecord)?;
     }
-    if total > MAX_TRANSCRIPT_BYTES {
+    if total > MAX_CAPTURE_BYTES {
         return Err(HistoryError::InvalidRecord);
     }
     Ok(())
 }
 fn encode(chat: &RedactedChat) -> Result<String> {
     validate_chat(&chat.0)?;
-    let payload = serde_json::to_string(&chat.0).map_err(|_| HistoryError::InvalidRecord)?;
+    let metadata = ArchivedChat {
+        source: chat.0.source.clone(),
+        chat_id: chat.0.chat_id.clone(),
+        task_id: chat.0.task_id.clone(),
+        title: chat.0.title.clone(),
+        messages: Vec::new(),
+    };
+    let payload = serde_json::to_string(&metadata).map_err(|_| HistoryError::InvalidRecord)?;
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(HistoryError::LimitReached);
     }
@@ -1013,6 +1497,8 @@ fn decode(
         revision,
         listed: listed == 1,
         updated_ms,
+        message_count: chat.messages.len(),
+        next_before: None,
         chat,
     })
 }

@@ -6,7 +6,10 @@
 //! covered. This is a text stream, not a terminal emulator or completion proof.
 use crate::ssh::{ApiError, SessionRef};
 use serde::Serialize;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, MutexGuard,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_OBSERVATION_BYTES: usize = 16 * 1024;
@@ -40,11 +43,22 @@ pub struct Observation {
 pub struct ObservationBuffer {
     state: Arc<Mutex<State>>,
     outputs: crate::action_output::OutputRegistry,
+    redaction_epoch: Arc<AtomicU64>,
 }
 
 impl ObservationBuffer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Monotonic invalidation fence shared by clones and detached snapshots.
+    /// Read before and after preparing a request or committing a summary.
+    pub fn redaction_revision(&self) -> u64 {
+        self.redaction_epoch.load(Ordering::SeqCst)
+    }
+
+    fn invalidate_redaction_revision(&self) {
+        self.redaction_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Start a fresh capture epoch for exactly this connection generation.
@@ -55,6 +69,7 @@ impl ObservationBuffer {
     pub fn begin(&self, session: SessionRef, known_secrets: Vec<String>) {
         let mut secrets = Zeroizing::new(known_secrets);
         let mut current = self.lock();
+        self.invalidate_redaction_revision();
         let same_stream = current.stream_session.as_ref() == Some(&session);
         // A later model/run must not unmask a prior run's known values in chat,
         // archives or a still-visible shared terminal. Deduplicate new inputs.
@@ -127,6 +142,7 @@ impl ObservationBuffer {
         {
             return Ok(());
         }
+        self.invalidate_redaction_revision();
         if !valid_secret_budget(
             state
                 .registered
@@ -270,6 +286,7 @@ impl ObservationBuffer {
         Self {
             state: Arc::new(Mutex::new(state)),
             outputs: self.outputs.clone(),
+            redaction_epoch: self.redaction_epoch.clone(),
         }
     }
 
@@ -338,6 +355,7 @@ impl ObservationBuffer {
     /// discarded. Registration limits stay fail-closed; no plaintext fallback.
     pub fn reset_capture_preserving_secrets(&self) {
         let mut current = self.lock();
+        self.invalidate_redaction_revision();
         let mut registered = std::mem::take(&mut current.registered);
         for secret in std::mem::take(&mut current.run_secrets) {
             if !registered
@@ -360,7 +378,9 @@ impl ObservationBuffer {
 
     /// Stop capture and discard all text, parser state, and known secrets.
     pub fn reset(&self) {
-        *self.lock() = State::default();
+        let mut state = self.lock();
+        self.invalidate_redaction_revision();
+        *state = State::default();
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -370,6 +390,7 @@ impl ObservationBuffer {
                 // A panic must not turn a partially updated filter into an
                 // unredacted observation source. The poisoned lock stays shut.
                 let mut state = poisoned.into_inner();
+                self.invalidate_redaction_revision();
                 *state = State {
                     blocked: true,
                     ..State::default()
@@ -793,6 +814,33 @@ mod tests {
             secrets.iter().map(|s| (*s).into()).collect(),
         );
         (buffer, session)
+    }
+
+    #[test]
+    fn redaction_revision_fences_late_rules_and_detached_snapshots() {
+        let buffer = ObservationBuffer::new();
+        let initial = buffer.redaction_revision();
+        buffer.add_known_secret("first-secret").unwrap();
+        assert!(buffer.redaction_revision() > initial);
+        let detached = buffer.detached_redactor();
+        let before = detached.redaction_revision();
+        buffer.add_known_secret("first-secret").unwrap();
+        buffer.add_known_secret("").unwrap();
+        assert_eq!(buffer.redaction_revision(), before);
+        buffer.add_known_secret("late-secret").unwrap();
+        assert!(detached.redaction_revision() > before);
+        assert_eq!(detached.redaction_revision(), buffer.redaction_revision());
+        let before = buffer.redaction_revision();
+        buffer.reset_capture_preserving_secrets();
+        assert!(buffer.redaction_revision() > before);
+        let before = buffer.redaction_revision();
+        buffer.reset();
+        assert!(buffer.redaction_revision() > before);
+        let before = buffer.redaction_revision();
+        assert!(buffer
+            .add_known_secret(&"x".repeat(MAX_SECRET_BYTES + 1))
+            .is_err());
+        assert!(buffer.redaction_revision() > before);
     }
 
     #[test]

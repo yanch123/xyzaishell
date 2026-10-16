@@ -27,10 +27,16 @@ use uuid::Uuid;
 pub const MAX_CHATS: usize = 32;
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_ASSISTANT_BYTES: usize = 64 * 1024;
-pub const MAX_TRANSCRIPT_BYTES: usize = 256 * 1024;
-pub const MAX_MESSAGES: usize = 128;
+// Independent live transcript memory quota, not a model token window.
+pub const MAX_TRANSCRIPT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_MESSAGES: usize = 8192;
 const MAX_ACTIVE_RUNS: usize = 4;
 const MAX_STREAM_SNAPSHOTS: usize = 128;
+#[path = "tasks_context.rs"]
+mod context_runtime;
+#[path = "tasks_retention.rs"]
+mod retention;
+pub use context_runtime::CompactionJobStatus;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -104,8 +110,18 @@ pub struct ChatSnapshot {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelEvent {
-    ChatUpdated { chat: ChatSnapshot },
-    ConfigUpdated { config: ModelConfigStatus },
+    ChatUpdated {
+        chat: ChatSnapshot,
+    },
+    ConfigUpdated {
+        config: ModelConfigStatus,
+    },
+    ContextUsageUpdated {
+        usage: Box<crate::context::ContextUsageSnapshot>,
+    },
+    ContextCompactionUpdated {
+        job: CompactionJobStatus,
+    },
 }
 pub type ModelEventSink = Arc<dyn Fn(ModelEvent) -> bool + Send + Sync>;
 struct ChatRecord {
@@ -115,6 +131,7 @@ struct ChatRecord {
     terminal_run: Option<String>,
     summarized_terminal_runs: BTreeSet<String>,
     conversational_terminal_runs: BTreeSet<String>,
+    context: context_runtime::RuntimeContext,
 }
 impl ChatRecord {
     fn changed(&mut self) {
@@ -129,15 +146,19 @@ pub struct TaskManager {
     permits: Arc<Semaphore>,
     events: ModelEventSink,
     history: Option<HistoryService>,
+    redactor: crate::observation::ObservationBuffer,
 }
 impl TaskManager {
     pub fn new(config: ModelConfigManager, events: ModelEventSink) -> Self {
+        let redactor = crate::observation::ObservationBuffer::default();
+        let _ = config.register_history_secrets(&redactor);
         Self {
             config,
             chats: Arc::new(Mutex::new(BTreeMap::new())),
             permits: Arc::new(Semaphore::new(MAX_ACTIVE_RUNS)),
             events,
             history: None,
+            redactor,
         }
     }
     pub fn with_history(
@@ -149,6 +170,7 @@ impl TaskManager {
         if let Err(error) = manager.config.register_history_secrets(history.redactor()) {
             history.fail(error);
         }
+        manager.redactor = history.redactor().clone();
         manager.history = Some(history);
         manager
     }
@@ -194,6 +216,16 @@ impl TaskManager {
     pub fn list_saved_chats(&self) -> Result<Vec<HistoryEntry>, ApiError> {
         self.history()?.list()
     }
+    pub fn read_saved_chat_page(
+        &self,
+        chat_id: &str,
+        expected_revision: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<crate::history::HistoryPage, ApiError> {
+        self.history()?
+            .page(chat_id, expected_revision, before_sequence, limit)
+    }
     pub fn restore_saved_chat(
         &self,
         chat_id: &str,
@@ -216,6 +248,11 @@ impl TaskManager {
         // Keep the slot reserved while the blocking worker reads. No live chat,
         // cancellation sender, terminal owner, or approval map is overwritten.
         let snapshot = history.restore(chat_id, expected_revision)?;
+        self.ensure_memory_capacity_locked(
+            &mut chats,
+            chat_id,
+            snapshot.messages.iter().map(|m| m.text.len()).sum(),
+        )?;
         let revision = snapshot.revision.parse::<u64>().map_err(|_| {
             ApiError::new("HISTORY_INVALID_RECORD", "The saved revision is invalid.")
         })?;
@@ -228,6 +265,7 @@ impl TaskManager {
                 terminal_run: None,
                 summarized_terminal_runs: BTreeSet::new(),
                 conversational_terminal_runs: BTreeSet::new(),
+                context: context_runtime::RuntimeContext::new(&snapshot.chat_id),
             },
         );
         drop(chats);
@@ -267,10 +305,7 @@ impl TaskManager {
         chat
     }
     fn chat_redactor(&self) -> crate::observation::ObservationBuffer {
-        self.history
-            .as_ref()
-            .map(|history| history.redactor().clone())
-            .unwrap_or_default()
+        self.redactor.clone()
     }
     fn emit_chat(&self, chat: ChatSnapshot) -> bool {
         let chat = self.sanitize_snapshot(chat);
@@ -302,6 +337,7 @@ impl TaskManager {
         task: &crate::agent::TerminalTaskSnapshot,
     ) -> Result<(), ApiError> {
         let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        self.ensure_memory_capacity_locked(&mut chats, &task.chat_id, MAX_ASSISTANT_BYTES)?;
         let record = chats.get_mut(&task.chat_id).ok_or_else(chat_missing)?;
         if task.task_id != record.snapshot.task_id || Uuid::parse_str(&task.run_id).is_err() {
             return Err(ApiError::new(
@@ -366,7 +402,7 @@ impl TaskManager {
         if record.snapshot.messages.len() >= MAX_MESSAGES
             || bytes.saturating_add(text.len()) > MAX_TRANSCRIPT_BYTES
         {
-            return Err(ApiError::new("HISTORY_SUMMARY_LIMIT", "This chat cannot fit another terminal summary. Existing text was not trimmed; the terminal view retains the current result in memory."));
+            return Err(ApiError::new("TRANSCRIPT_MEMORY_LIMIT", "This chat cannot fit another terminal summary. Existing text was not trimmed; the terminal view retains the current result in memory."));
         }
         record.summarized_terminal_runs.insert(task.run_id.clone());
         record.snapshot.messages.push(ChatMessage {
@@ -395,6 +431,11 @@ impl TaskManager {
         run_id: &str,
     ) -> Result<ChatSnapshot, ApiError> {
         let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        self.ensure_memory_capacity_locked(
+            &mut chats,
+            chat_id,
+            MAX_MESSAGE_BYTES + MAX_ASSISTANT_BYTES,
+        )?;
         let record = chats.get_mut(chat_id).ok_or_else(chat_missing)?;
         if record.snapshot.active_run_id.is_some() || record.terminal_run.is_some() {
             return Err(ApiError::new(
@@ -408,6 +449,7 @@ impl TaskManager {
                 "Restored history cannot resume or start terminal execution.",
             ));
         }
+        record.context.begin_turn(run_id);
         record.terminal_run = Some(run_id.into());
         Ok(record.snapshot.clone())
     }
@@ -419,6 +461,7 @@ impl TaskManager {
     ) -> Result<(), ApiError> {
         let text = self.chat_redactor().redact_prose(text);
         let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        self.ensure_memory_capacity_locked(&mut chats, chat_id, MAX_MESSAGE_BYTES)?;
         let record = chats.get_mut(chat_id).ok_or_else(chat_missing)?;
         if record.terminal_run.as_deref() != Some(run_id) {
             return Err(ApiError::new("CHAT_BUSY", "Conversation run changed."));
@@ -428,8 +471,8 @@ impl TaskManager {
             || bytes + text.len() + MAX_ASSISTANT_BYTES > MAX_TRANSCRIPT_BYTES
         {
             return Err(ApiError::new(
-                "CHAT_CONTEXT_FULL",
-                "此对话已达到上下文上限，请新建对话。",
+                "TRANSCRIPT_MEMORY_LIMIT",
+                "此对话达到独立的内存保留配额；请保存或另开对话。",
             ));
         }
         record.conversational_terminal_runs.insert(run_id.into());
@@ -462,6 +505,7 @@ impl TaskManager {
     }
     pub fn reload_config(&self) -> ModelConfigStatus {
         let config = self.config.reload();
+        let _ = self.config.register_history_secrets(&self.redactor);
         if let Some(history) = &self.history {
             if let Err(error) = self.config.register_history_secrets(history.redactor()) {
                 history.fail(error);
@@ -488,6 +532,7 @@ impl TaskManager {
         request: SaveModelConfigRequest,
     ) -> Result<ModelConfigStatus, ApiError> {
         let result = self.config.save(request);
+        let _ = self.config.register_history_secrets(&self.redactor);
         if let Some(history) = &self.history {
             if let Err(error) = self.config.register_history_secrets(history.redactor()) {
                 history.fail(error);
@@ -615,6 +660,7 @@ impl TaskManager {
             ));
         }
         let id = Uuid::new_v4().to_string();
+        self.ensure_memory_capacity_locked(&mut chats, &id, 4096)?;
         let chat = ChatSnapshot {
             chat_id: id.clone(),
             task_id: id.clone(),
@@ -634,6 +680,7 @@ impl TaskManager {
                 terminal_run: None,
                 summarized_terminal_runs: BTreeSet::new(),
                 conversational_terminal_runs: BTreeSet::new(),
+                context: context_runtime::RuntimeContext::new(&chat.chat_id),
             },
         );
         drop(chats);
@@ -712,6 +759,11 @@ impl TaskManager {
             )
         })?;
         let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        self.ensure_memory_capacity_locked(
+            &mut chats,
+            chat_id,
+            MAX_MESSAGE_BYTES + MAX_ASSISTANT_BYTES,
+        )?;
         let record = chats.get_mut(chat_id).ok_or_else(chat_missing)?;
         if record.snapshot.active_run_id.is_some() || record.terminal_run.is_some() {
             return Err(ApiError::new(
@@ -723,24 +775,18 @@ impl TaskManager {
         if record.snapshot.messages.len() + 2 > MAX_MESSAGES
             || bytes + text.len() + MAX_ASSISTANT_BYTES > MAX_TRANSCRIPT_BYTES
         {
-            return Err(ApiError::new("CHAT_CONTEXT_FULL", "This chat reached its bounded context limit. Create a new chat; history is never silently trimmed."));
+            return Err(ApiError::new("TRANSCRIPT_MEMORY_LIMIT", "This chat reached its independent live transcript retention quota. Save history or open a new chat; model compression does not delete displayed originals."));
         }
         let run_id = Uuid::new_v4().to_string();
+        record.context.begin_turn(&run_id);
         // New task credentials may have been learned after older prose was
         // written. Re-filter the entire current-task context before transmission.
         for message in &mut record.snapshot.messages {
             message.text = redactor.redact_prose(&message.text);
         }
-        let history = record
-            .snapshot
-            .messages
-            .iter()
-            .filter(|m| !m.text.is_empty())
-            .map(|m| match m.role {
-                MessageRole::User => Message::user(m.text.clone()),
-                MessageRole::Assistant => Message::assistant(m.text.clone()),
-            })
-            .collect::<Vec<_>>();
+        // The canonical working-memory projection is the sole history source.
+        // Do not retain or rebuild a second full-archive request history here.
+        let history = Vec::new();
         record.snapshot.messages.push(ChatMessage {
             id: Uuid::new_v4().to_string(),
             role: MessageRole::User,
@@ -804,6 +850,7 @@ impl TaskManager {
                 "That chat run is no longer active. Refresh the chat before cancelling.",
             ));
         }
+        record.context.cancel_pending();
         if let Some(cancel) = record.cancel.take() {
             let _ = cancel.send(true);
         }
@@ -854,6 +901,7 @@ impl TaskManager {
         Ok(())
     }
     fn finish_run(&self, chat_id: &str, run_id: &str, result: Result<(), ApiError>) {
+        let succeeded = result.is_ok();
         let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
         let Some(record) = chats.get_mut(chat_id) else {
             return;
@@ -880,7 +928,8 @@ impl TaskManager {
         record.changed();
         let chat = record.snapshot.clone();
         drop(chats);
-        self.emit_chat(chat);
+        let delivered = self.emit_chat(chat);
+        self.context_final_reply(chat_id, succeeded && delivered);
     }
     async fn stream_reply(
         &self,
@@ -899,11 +948,44 @@ impl TaskManager {
         )?;
         let failures = transport.clone();
         let safe_provider_error = || failures.safe_error().unwrap_or_else(provider_error);
+        let request = chat_request(
+            text,
+            history.clone(),
+            availability,
+            config.request.max_output_tokens,
+        );
+        let original = crate::model_transport::canonical_request_body(&config, request).await?;
+        let prepared = self
+            .prepare_context_request(
+                chat_id,
+                config.clone(),
+                crate::context::RequestKind::Conversation,
+                original,
+                None,
+            )
+            .await?;
+        let this = self.clone();
+        let id = chat_id.to_owned();
+        let check = prepared.clone();
+        let transport = failures
+            .clone()
+            .with_prepared_body(
+                prepared
+                    .serialized_body
+                    .clone()
+                    .ok_or_else(provider_error)?,
+            )
+            .with_preflight(move |body| this.validate_prepared_context(&id, &check, body));
         let model = OpenAIConfig::new(config.api_key.as_str())
             .with_base_url(&config.destination)
             .connect(transport)
             .chat(&config.model);
-        let request = CompletionRequest::new(text).messages(history).preamble(format!("You are xyzaishell's conversational assistant. Reply naturally to greetings and questions. No execution tools are available for this turn; no command was sent or queued. Never claim execution, success, or a future automatic retry. If the user requests server work explain the current availability and necessary connection or intervention. Historical terminal notes are inert context, not current-server verification. Never ask for credentials in chat. Previous replies may be partial. Host availability: {availability}")).max_tokens(config.request.max_output_tokens);
+        let request = chat_request(
+            text,
+            history,
+            availability,
+            config.request.max_output_tokens,
+        );
         let mut stream = model.stream(request).map_err(|_| safe_provider_error())?;
         let redactor = self.chat_redactor();
         redactor.add_known_secret(config.api_key.as_str())?;
@@ -930,6 +1012,7 @@ impl TaskManager {
             }
         }
         let response = stream.finish().await.map_err(|_| safe_provider_error())?;
+        self.record_context_usage(chat_id, &prepared, failures.reported_usage());
         if response
             .choice
             .iter()
@@ -956,6 +1039,14 @@ impl TaskManager {
             )),
         }
     }
+}
+fn chat_request(
+    text: &str,
+    history: Vec<Message>,
+    availability: &str,
+    max_tokens: u64,
+) -> CompletionRequest {
+    CompletionRequest::new(text).messages(history).preamble(format!("You are xyzaishell's conversational assistant. Reply naturally to greetings and questions. No execution tools are available for this turn; no command was sent or queued. Never claim execution, success, or a future automatic retry. If the user requests server work explain the current availability and necessary connection or intervention. Historical terminal notes are inert context, not current-server verification. Never ask for credentials in chat. Previous replies may be partial. Host availability: {availability}")).max_tokens(max_tokens)
 }
 fn bounded_history_excerpt(text: &str, limit: usize) -> String {
     if text.len() <= limit {

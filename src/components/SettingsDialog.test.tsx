@@ -40,7 +40,7 @@ describe('v0.1.3 saved model settings and capability tests', () => {
   });
   it('saves keep intent and expected file version without network or old-key roundtrip', async () => {
     const user = await ready(); await user.clear(screen.getByLabelText(/^模型名/)); await user.type(screen.getByLabelText(/^模型名/), 'next-model'); await user.click(button('保存'));
-    expect(mocks.save).toHaveBeenCalledExactlyOnceWith({ expected_file_revision: 'saved-file-1', base_url: modelConfig.base_url, model: 'next-model', key_update: { kind: 'keep' }, reuse_key_for_destination: null });
+    expect(mocks.save).toHaveBeenCalledExactlyOnceWith({ expected_file_revision: 'saved-file-1', base_url: modelConfig.base_url, model: 'next-model', context_window_tokens: null, key_update: { kind: 'keep' }, reuse_key_for_destination: null });
     expect(mocks.testSaved).not.toHaveBeenCalled(); expect(screen.getByText(/模型设置已保存。发送聊天前/)).toBeDefined();
   });
   it('requires explicit destination-bound reuse, or a newly entered key', async () => {
@@ -167,4 +167,15 @@ describe('v0.1.3 saved model settings and capability tests', () => {
     expect(screen.getByText(/结果仅对应此前已保存的版本，不代表当前草稿或新配置已通过/)).toBeDefined();
     expect(mocks.testSaved).toHaveBeenCalledOnce();
   });
+});
+
+it('keeps the default capacity implicit, saves an explicit override, and validates its input budget', async () => {
+  const user = await ready();
+  await user.click(screen.getByText('高级：模型容量'));
+  const field = screen.getByLabelText(/^上下文窗口/);
+  expect((field as HTMLInputElement).value).toBe('');
+  await user.type(field, '2048'); await user.click(button('保存')); expect(mocks.save).not.toHaveBeenCalled();
+  expect(screen.getByText(/请填写有效整数，并为输出/)).toBeDefined();
+  await user.clear(field); await user.type(field, '128000'); await user.click(button('保存'));
+  expect(mocks.save).toHaveBeenLastCalledWith(expect.objectContaining({ context_window_tokens: 128000 }));
 });

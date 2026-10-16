@@ -18,7 +18,7 @@ SPEC.loader.exec_module(native)
 
 class NativeVersionPhaseTests(unittest.TestCase):
     def test_seed_and_same_version_preservation(self):
-        for version in ("0.1.3", "0.1.4"):
+        for version in ("0.1.4", "0.2.0"):
             native.verify_phase_version("seed", version, "new-hash", None)
             expected = {"application_version": version, "application_sha256": "new-hash"}
             native.verify_phase_version("preserved", version, "new-hash", expected)
@@ -26,16 +26,16 @@ class NativeVersionPhaseTests(unittest.TestCase):
                 native.verify_phase_version("preserved", version, "other-hash", expected)
 
     def test_upgrade_requires_exact_old_version_and_replaced_executable(self):
-        expected = {"application_version": "0.1.3", "application_sha256": "old-hash"}
-        native.verify_phase_version("upgrade", "0.1.4", "new-hash", expected)
-        for version, digest, record in [("0.1.3", "new-hash", expected), ("0.1.4", "old-hash", expected),
-                ("0.1.5", "new-hash", expected), ("0.1.4", "new-hash", None),
-                ("0.1.4", "new-hash", {"application_version": "0.1.0", "application_sha256": "old-hash"})]:
+        expected = {"application_version": "0.1.4", "application_sha256": "old-hash"}
+        native.verify_phase_version("upgrade", "0.2.0", "new-hash", expected)
+        for version, digest, record in [("0.1.4", "new-hash", expected), ("0.2.0", "old-hash", expected),
+                ("0.1.5", "new-hash", expected), ("0.2.0", "new-hash", None),
+                ("0.2.0", "new-hash", {"application_version": "0.1.0", "application_sha256": "old-hash"})]:
             with self.assertRaises(ValueError):
                 native.verify_phase_version("upgrade", version, digest, record)
 
     def test_invalid_version_or_phase_rejected(self):
-        for phase, version in [("seed", "latest"), ("seed", "0.1.3\\nextra"), ("seed", "0.1.1"), ("seed", "0.1.5"), ("other", "0.1.3")]:
+        for phase, version in [("seed", "latest"), ("seed", "0.1.4\\nextra"), ("seed", "0.1.1"), ("seed", "0.1.5"), ("other", "0.1.4")]:
             with self.assertRaises(ValueError):
                 native.verify_phase_version(phase, version, "hash", None)
 
@@ -45,7 +45,7 @@ class NativeIdleSelectorTests(unittest.TestCase):
         driver = mock.Mock()
         driver.js.return_value = True
         native.wait_for_chat_idle(driver, native.BASE_VERSION)
-        self.assertIn("无生成中的聊天", driver.js.call_args.args[0])
+        self.assertIn("聊天消息", driver.js.call_args.args[0])
 
     def test_simplified_candidate_checks_composer_and_no_active_generation(self):
         driver = mock.Mock()
@@ -65,7 +65,7 @@ class NativeIdleSelectorTests(unittest.TestCase):
         driver.js.return_value = None
         with self.assertRaises(AssertionError):
             native.rendered_task_identity(driver, native.TARGET_VERSION)
-        driver.js.return_value = '任务 ID: released-task-id'
+        driver.js.return_value = 'released-task-id'
         self.assertEqual(native.rendered_task_identity(driver, native.BASE_VERSION), 'released-task-id')
 
 
@@ -90,7 +90,7 @@ class ProcessQueryTests(unittest.TestCase):
 
 class NativeDriverHelperTests(unittest.TestCase):
     def test_both_reviewed_versions_use_current_connection_and_log_controls(self):
-        for version in ("0.1.3", "0.1.4"):
+        for version in ("0.1.4", "0.2.0"):
             with self.subTest(version=version):
                 driver = mock.Mock()
                 driver.button.side_effect = lambda text: text
@@ -293,6 +293,9 @@ class NativeHelperTests(unittest.TestCase):
     def setUp(self):
         self.server = native.http.server.ThreadingHTTPServer(("127.0.0.1", 0), native.ModelFixture)
         self.server.requests, self.server.test_requests, self.server.invalid_requests = [], [], 0
+        self.server.compaction_requests = []
+        self.server.compaction_started, self.server.release_compaction = threading.Event(), threading.Event()
+        self.server.hold_compaction = False
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -341,6 +344,44 @@ class NativeHelperTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError):
             self.post(body)
 
+    def compaction_body(self, ids=None):
+        ids = ids or ["source-a", "source-b"]
+        return {"model": "native-fixture-model", "stream": True, "messages": [
+            {"role": "system", "content": "You summarize historical data, with no tools."},
+            {"role": "user", "content": json.dumps({"source_manifest": ids, "sources": [{"source_id": item, "text": "synthetic"} for item in ids]})}]}
+
+    def test_compaction_fixture_returns_exact_manifest_and_never_tools(self):
+        stream = self.post(self.compaction_body())
+        delta = json.loads(stream.split("\n\n")[0][6:])["choices"][0]["delta"]
+        summary = json.loads(delta["content"])
+        self.assertEqual(summary["coverage"]["source_ids"], ["source-a", "source-b"])
+        self.assertNotIn("tool_calls", delta)
+        self.assertEqual(len(self.server.compaction_requests), 1)
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(self.server.test_requests, [])
+
+    def test_compaction_fixture_rejects_duplicate_manifest_and_tool_capability(self):
+        for body in (self.compaction_body(["duplicate", "duplicate"]), dict(self.compaction_body(), tools=[{"type": "function"}])):
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post(body)
+        self.assertEqual(self.server.invalid_requests, 2)
+        self.assertEqual(self.server.compaction_requests, [])
+
+    def test_compaction_fixture_can_hold_response_until_native_cancel_observed(self):
+        self.server.hold_compaction = True
+        responses = []
+        worker = threading.Thread(target=lambda: responses.append(self.post(self.compaction_body())))
+        worker.start()
+        try:
+            self.assertTrue(self.server.compaction_started.wait(timeout=1))
+            self.assertEqual(responses, [])
+            self.server.release_compaction.set()
+            worker.join(timeout=2)
+            self.assertEqual(len(responses), 1)
+        finally:
+            self.server.release_compaction.set()
+            worker.join(timeout=2)
+
     def test_fixture_rejects_unexpected_auth(self):
         with self.assertRaises(urllib.error.HTTPError):
             self.post(token="wrong-synthetic-token")
@@ -367,41 +408,60 @@ class NativeHelperTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 native.stored_identity(root)
 
-    def test_upgrade_compares_old_history_rows_not_database_file_hash(self):
+    def test_durable_compaction_success_records_require_exact_source_index(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             with sqlite3.connect(root / "history.sqlite3") as connection:
-                connection.execute("CREATE TABLE chats (chat_id TEXT,task_id TEXT,revision INTEGER,listed INTEGER,updated_ms INTEGER,payload TEXT)")
-                connection.execute("INSERT INTO chats VALUES ('old-chat','old-task',3,1,12,'synthetic')")
-                connection.execute("PRAGMA user_version=1")
-            _, rows = native.history_rows(root)
+                connection.execute("CREATE TABLE compactions(event_id TEXT,payload TEXT)")
+                connection.execute("CREATE TABLE compaction_sources(event_id TEXT,ordinal INTEGER,source_id TEXT)")
+                for mode in ("quick", "llm"):
+                    record = {"event_id": mode, "mode": mode, "summary_text": "synthetic summary", "before_tokens": 900, "after_tokens": 500, "before_bytes": 3000, "after_bytes": 2000, "source_ids": ["source"]}
+                    connection.execute("INSERT INTO compactions VALUES (?,?)", (mode, json.dumps({"version": 1, "record": record})))
+                    connection.execute("INSERT INTO compaction_sources VALUES (?,0,'source')", (mode,))
+            native.verify_compaction_archive(root)
             with sqlite3.connect(root / "history.sqlite3") as connection:
-                connection.execute("PRAGMA user_version=2")
-                connection.execute("INSERT INTO chats VALUES ('new-empty-chat','new-task',4,1,13,'empty')")
+                connection.execute("UPDATE compaction_sources SET source_id='changed' WHERE event_id='llm'")
+            with self.assertRaisesRegex(AssertionError, "source index"):
+                native.verify_compaction_archive(root)
+
+    def migration_fixture(self, root):
+        original = {"chat_id": "old-chat", "task_id": "old-task", "title": "old", "messages": [{"id": "message-1", "role": "user", "text": "retained 中文", "state": "complete"}]}
+        payload = json.dumps(original)
+        metadata = json.dumps(dict(original, messages=[]))
+        row = ["old-chat", "old-task", 3, 1, 12, payload]
+        with sqlite3.connect(root / "history.sqlite3") as connection:
+            connection.execute("CREATE TABLE chats (chat_id TEXT,task_id TEXT,revision INTEGER,listed INTEGER,updated_ms INTEGER,payload TEXT)")
+            connection.execute("CREATE TABLE legacy_backups (chat_id TEXT,payload TEXT)")
+            connection.execute("CREATE TABLE entries (chat_id TEXT,sequence INTEGER,message_id TEXT,payload TEXT)")
+            connection.execute("INSERT INTO chats VALUES (?,?,?,?,?,?)", row[:5] + [metadata])
+            connection.execute("INSERT INTO legacy_backups VALUES (?,?)", (row[0], payload))
+            connection.execute("INSERT INTO entries VALUES (?,?,?,?)", (row[0], 1, "message-1", json.dumps(original["messages"][0])))
+            connection.execute("PRAGMA user_version=3")
+        return [row]
+
+    def test_upgrade_preserves_original_bytes_and_all_message_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            rows = self.migration_fixture(root)
             native.verify_history_upgrade(root, rows)
             with sqlite3.connect(root / "history.sqlite3") as connection:
-                connection.execute("UPDATE chats SET payload='changed' WHERE chat_id='old-chat'")
-            with self.assertRaisesRegex(AssertionError, "preexisting history row"):
+                connection.execute("UPDATE entries SET payload='{}'")
+            with self.assertRaisesRegex(AssertionError, "original message fields"):
                 native.verify_history_upgrade(root, rows)
 
-    def test_v013_history_upgrade_rejects_schema_change_missing_or_empty_rows(self):
+    def test_v014_history_upgrade_rejects_schema_change_missing_or_empty_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            with sqlite3.connect(root / "history.sqlite3") as connection:
-                connection.execute("CREATE TABLE chats (chat_id TEXT,task_id TEXT,revision INTEGER,listed INTEGER,updated_ms INTEGER,payload TEXT)")
-                connection.execute("INSERT INTO chats VALUES ('old-chat','old-task',3,1,12,'synthetic')")
-                connection.execute("PRAGMA user_version=2")
-            version, rows = native.history_rows(root)
-            self.assertEqual(version, 2)
+            rows = self.migration_fixture(root)
             native.verify_history_upgrade(root, rows)
             with self.assertRaisesRegex(AssertionError, "real baseline history"):
                 native.verify_history_upgrade(root, [])
             with sqlite3.connect(root / "history.sqlite3") as connection:
-                connection.execute("PRAGMA user_version=3")
+                connection.execute("PRAGMA user_version=2")
             with self.assertRaisesRegex(AssertionError, "history format marker"):
                 native.verify_history_upgrade(root, rows)
             with sqlite3.connect(root / "history.sqlite3") as connection:
-                connection.execute("PRAGMA user_version=2")
+                connection.execute("PRAGMA user_version=3")
                 connection.execute("DELETE FROM chats")
             with self.assertRaisesRegex(AssertionError, "preexisting history row"):
                 native.verify_history_upgrade(root, rows)
@@ -416,7 +476,7 @@ class NativeHelperTests(unittest.TestCase):
             profile.chmod(0o600)
             expected = {"profile_schema_version": 2, "profile_file_sha256": native.hashlib.sha256(original).hexdigest()}
             native.verify_current_profile_upgrade(root, expected)
-            with self.assertRaisesRegex(AssertionError, "real v0.1.3 profiles"):
+            with self.assertRaisesRegex(AssertionError, "real v0.1.4 profiles"):
                 native.verify_current_profile_upgrade(root, dict(expected, profile_schema_version=1))
             profile.chmod(0o644)
             with self.assertRaisesRegex(AssertionError, "owner-only"):

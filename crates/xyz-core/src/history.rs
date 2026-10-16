@@ -1,6 +1,8 @@
 //! Host-only optional archive coordinator. A bounded worker owns SQLite; capture
 //! queues contain only already-redacted text. Enabling is an explicit choice for
 //! this process, never inferred from existing files or a model response.
+use crate::persistence::RedactedCompaction;
+pub use crate::persistence::{CompactionArchivePage, CompactionArchiveRecord};
 use crate::{
     observation::ObservationBuffer,
     persistence::{HistoryError, HistoryPreference, HistoryStore, RedactedChat, StoredChat},
@@ -12,13 +14,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, SyncSender},
         Arc, Mutex,
     },
 };
 
 const QUEUE_CAPACITY: usize = 32;
+const QUEUE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Debug, Serialize)]
 pub struct HistoryStatus {
     pub enabled: bool,
@@ -38,6 +41,12 @@ pub struct HistoryEntry {
     pub updated_ms: i64,
     pub listed: bool,
 }
+#[derive(Clone, Debug, Serialize)]
+pub struct HistoryPage {
+    pub chat: ChatSnapshot,
+    pub total_messages: usize,
+    pub next_before: Option<u64>,
+}
 pub type HistoryEventSink = Arc<dyn Fn(HistoryStatus) + Send + Sync>;
 #[derive(Clone)]
 pub struct HistoryService {
@@ -51,6 +60,9 @@ struct Shared {
     manageable: AtomicBool,
     epoch: AtomicU64,
     status: Mutex<HistoryStatus>,
+    saved: Mutex<BTreeMap<String, u64>>,
+    cache_gaps: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    capture_bytes: Arc<AtomicUsize>,
     events: HistoryEventSink,
 }
 struct Capture {
@@ -58,6 +70,16 @@ struct Capture {
     live_revision: u64,
     prepared: RedactedChat,
     epoch: u64,
+    _budget: CaptureBudget,
+}
+struct CaptureBudget {
+    bytes: usize,
+    total: Arc<AtomicUsize>,
+}
+impl Drop for CaptureBudget {
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
 }
 struct Known {
     revision: i64,
@@ -66,6 +88,18 @@ struct Known {
 type Reply<T> = mpsc::Sender<Result<T, ApiError>>;
 enum Command {
     Capture(Capture),
+    Compaction {
+        chat_id: String,
+        prepared: RedactedCompaction,
+        epoch: u64,
+        _budget: CaptureBudget,
+    },
+    CompactionPage {
+        chat_id: String,
+        before: Option<u64>,
+        limit: usize,
+        reply: Reply<CompactionArchivePage>,
+    },
     Enable {
         enabled: bool,
         captures: Vec<Capture>,
@@ -73,6 +107,13 @@ enum Command {
         reply: Reply<HistoryStatus>,
     },
     List(Reply<Vec<HistoryEntry>>),
+    Page {
+        chat_id: String,
+        revision: i64,
+        before_sequence: Option<u64>,
+        limit: usize,
+        reply: Reply<HistoryPage>,
+    },
     Restore {
         chat_id: String,
         revision: i64,
@@ -144,6 +185,9 @@ impl HistoryService {
             manageable: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             status: Mutex::new(status),
+            saved: Mutex::new(BTreeMap::new()),
+            cache_gaps: Mutex::new(BTreeMap::new()),
+            capture_bytes: Arc::new(AtomicUsize::new(0)),
             events,
         });
         let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
@@ -177,6 +221,133 @@ impl HistoryService {
     pub fn status(&self) -> HistoryStatus {
         self.shared.status()
     }
+    /// Only confirmed archive writes qualify for RAM cache unloading.
+    pub fn saved_live_revision(&self, chat_id: &str) -> Option<u64> {
+        if !self.shared.manageable.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.shared
+            .saved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(chat_id)
+            .copied()
+    }
+    pub fn page(
+        &self,
+        chat_id: &str,
+        revision: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<HistoryPage, ApiError> {
+        let revision = revision_number(revision)?;
+        let (reply, receive) = mpsc::channel();
+        self.sender
+            .send(Command::Page {
+                chat_id: chat_id.into(),
+                revision,
+                before_sequence,
+                limit,
+                reply,
+            })
+            .map_err(|_| unavailable())?;
+        receive.recv().map_err(|_| unavailable())?
+    }
+    /// Host-only display cache metadata. No string/error from a model can
+    /// register a gap or gain permission to skip persisting an original.
+    pub(crate) fn register_cache_gaps_batch(
+        &self,
+        requests: &[(String, u64, Vec<String>, bool)],
+    ) -> Result<(), ApiError> {
+        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let status = self.status();
+        for (chat_id, revision, _, recoverable) in requests {
+            if *recoverable {
+                if self
+                    .saved_live_revision(chat_id)
+                    .is_none_or(|saved| saved < *revision)
+                {
+                    return Err(ApiError::new(
+                        "HISTORY_UNSAVED",
+                        "Original text has not been confirmed saved; its cache cannot be unloaded.",
+                    ));
+                }
+            } else if status.enabled || status.manageable || status.error.is_some() {
+                return Err(ApiError::new("HISTORY_UNSAVED", "Resolve the archive failure or explicitly turn off history before expiring unsaved original text."));
+            }
+        }
+        let mut gaps = self
+            .shared
+            .cache_gaps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (chat_id, _, ids, _) in requests {
+            gaps.entry(chat_id.clone())
+                .or_default()
+                .extend(ids.iter().cloned());
+        }
+        Ok(())
+    }
+    pub fn capture_compaction(&self, chat_id: &str, record: &CompactionArchiveRecord) {
+        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.shared.enabled.load(Ordering::SeqCst) {
+            return;
+        }
+        let prepared =
+            match RedactedCompaction::new(record, |text| self.redactor.redact_prose(text)) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.shared.fail(mapped(error));
+                    return;
+                }
+            };
+        let bytes = prepared.memory_bytes();
+        if self
+            .shared
+            .capture_bytes
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_add(bytes)
+                    .filter(|total| *total <= QUEUE_BYTES)
+            })
+            .is_err()
+        {
+            self.shared.fail(queue_full());
+            return;
+        }
+        let budget = CaptureBudget {
+            bytes,
+            total: self.shared.capture_bytes.clone(),
+        };
+        if self
+            .sender
+            .try_send(Command::Compaction {
+                chat_id: chat_id.into(),
+                prepared,
+                epoch: self.shared.epoch.load(Ordering::SeqCst),
+                _budget: budget,
+            })
+            .is_err()
+        {
+            self.shared.fail(queue_full());
+        }
+    }
+    pub fn compaction_page(
+        &self,
+        chat_id: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<CompactionArchivePage, ApiError> {
+        let (reply, receive) = mpsc::channel();
+        self.sender
+            .send(Command::CompactionPage {
+                chat_id: chat_id.into(),
+                before,
+                limit,
+                reply,
+            })
+            .map_err(|_| unavailable())?;
+        receive.recv().map_err(|_| unavailable())?
+    }
     pub(crate) fn redactor(&self) -> &ObservationBuffer {
         &self.redactor
     }
@@ -184,15 +355,72 @@ impl HistoryService {
         self.shared.fail(error);
     }
     fn prepare(&self, chat: &ChatSnapshot, epoch: u64) -> Result<Capture, ApiError> {
+        // Preflight before copying/redacting. Actual post-redaction owned memory
+        // is reserved below; the single preparing capture is independently
+        // bounded by RedactedChat and serialized by gate.
+        let estimate = chat
+            .messages
+            .iter()
+            .map(|m| {
+                m.text.len()
+                    + m.id.len()
+                    + std::mem::size_of::<crate::persistence::ArchivedMessage>()
+            })
+            .sum::<usize>()
+            + 2048;
+        if estimate.saturating_add(self.shared.capture_bytes.load(Ordering::SeqCst)) > QUEUE_BYTES {
+            return Err(queue_full());
+        }
+
         let live_revision = chat
             .revision
             .parse::<u64>()
             .ok()
             .filter(|n| *n > 0)
             .ok_or_else(|| mapped(HistoryError::InvalidRecord))?;
-        let prepared = RedactedChat::from_snapshot(chat, |text| self.redactor.redact_prose(text))
-            .map_err(mapped)?;
+        let gaps = self
+            .shared
+            .cache_gaps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let filtered;
+        let original = if let Some(ids) = gaps.get(&chat.chat_id) {
+            filtered = ChatSnapshot {
+                chat_id: chat.chat_id.clone(),
+                task_id: chat.task_id.clone(),
+                title: chat.title.clone(),
+                source: chat.source.clone(),
+                restored_read_only: chat.restored_read_only,
+                active_run_id: chat.active_run_id.clone(),
+                revision: chat.revision.clone(),
+                messages: chat
+                    .messages
+                    .iter()
+                    .filter(|message| !ids.contains(&message.id))
+                    .cloned()
+                    .collect(),
+            };
+            &filtered
+        } else {
+            chat
+        };
+        let prepared =
+            RedactedChat::from_snapshot(original, |text| self.redactor.redact_prose(text))
+                .map_err(mapped)?;
+        let bytes = prepared.retained_memory_bytes() + 256;
+        self.shared
+            .capture_bytes
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_add(bytes)
+                    .filter(|total| *total <= QUEUE_BYTES)
+            })
+            .map_err(|_| queue_full())?;
+        let budget = CaptureBudget {
+            bytes,
+            total: self.shared.capture_bytes.clone(),
+        };
         Ok(Capture {
+            _budget: budget,
             chat_id: chat.chat_id.clone(),
             live_revision,
             prepared,
@@ -235,7 +463,10 @@ impl HistoryService {
                 chats
                     .iter()
                     .map(|chat| self.prepare(chat, epoch))
-                    .collect::<Result<Vec<_>, _>>()?
+                    .collect::<Result<Vec<_>, _>>()
+                    .inspect_err(|error| {
+                        self.shared.fail(error.clone());
+                    })?
             } else {
                 Vec::new()
             };
@@ -299,6 +530,58 @@ impl HistoryService {
 impl Worker {
     fn handle(&mut self, command: Command) {
         match command {
+            Command::Compaction {
+                chat_id,
+                prepared,
+                epoch,
+                _budget,
+            } => {
+                if self.shared.enabled.load(Ordering::SeqCst)
+                    && epoch == self.shared.epoch.load(Ordering::SeqCst)
+                    && !self.forgotten.contains(&chat_id)
+                {
+                    let result = (|| {
+                        let prepared = prepared
+                            .redact_again(|text| self.redactor.redact_prose(text))
+                            .map_err(mapped)?;
+                        self.active()?
+                            .append_compaction(&chat_id, &prepared)
+                            .map_err(mapped)
+                    })();
+                    if let Err(error) = result {
+                        self.shared.fail(error);
+                    }
+                }
+            }
+            Command::CompactionPage {
+                chat_id,
+                before,
+                limit,
+                reply,
+            } => {
+                let result = self
+                    .active()
+                    .and_then(|store| {
+                        store
+                            .compaction_page(&chat_id, before, limit)
+                            .map_err(mapped)
+                    })
+                    .and_then(|mut page| {
+                        page.records = page
+                            .records
+                            .iter()
+                            .map(|record| {
+                                RedactedCompaction::new(record, |text| {
+                                    self.redactor.redact_prose(text)
+                                })
+                                .map(RedactedCompaction::into_record)
+                                .map_err(mapped)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(page)
+                    });
+                let _ = reply.send(result);
+            }
             Command::Capture(capture) => {
                 if self.shared.enabled.load(Ordering::SeqCst)
                     && capture.epoch == self.shared.epoch.load(Ordering::SeqCst)
@@ -329,6 +612,31 @@ impl Worker {
                             .map(|row| entry(row, &self.redactor))
                             .collect()
                     });
+                let _ = reply.send(result);
+            }
+            Command::Page {
+                chat_id,
+                revision,
+                before_sequence,
+                limit,
+                reply,
+            } => {
+                let result = (|| {
+                    let row = self
+                        .active()?
+                        .page(&chat_id, revision, before_sequence, limit)
+                        .map_err(mapped)?;
+                    if !row.listed {
+                        return Err(mapped(HistoryError::NotFound));
+                    }
+                    let mut chat = row.to_snapshot();
+                    redact_snapshot(&mut chat, &self.redactor);
+                    Ok(HistoryPage {
+                        chat,
+                        total_messages: row.message_count,
+                        next_before: row.next_before,
+                    })
+                })();
                 let _ = reply.send(result);
             }
             Command::Restore {
@@ -376,6 +684,16 @@ impl Worker {
                     }
                     self.active()?.forget(&chat_id, revision).map_err(mapped)?;
                     self.known.remove(&chat_id);
+                    self.shared
+                        .cache_gaps
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&chat_id);
+                    self.shared
+                        .saved
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&chat_id);
                     self.forgotten.insert(chat_id);
                     Ok(self.shared.status())
                 })();
@@ -471,6 +789,11 @@ impl Worker {
             None => store.create(&prepared),
         }
         .map_err(mapped)?;
+        self.shared
+            .saved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(capture.chat_id.clone(), capture.live_revision);
         self.known.insert(
             capture.chat_id,
             Known {
@@ -481,12 +804,22 @@ impl Worker {
         Ok(())
     }
 }
+fn redact_snapshot(chat: &mut ChatSnapshot, redactor: &ObservationBuffer) {
+    chat.title = redactor.redact_prose(&chat.title);
+    if let Some(source) = &mut chat.source {
+        source.host = redactor.redact_prose(&source.host);
+        source.username = redactor.redact_prose(&source.username);
+    }
+    for message in &mut chat.messages {
+        message.text = redactor.redact_prose(&message.text);
+    }
+}
 fn entry(row: StoredChat, redactor: &ObservationBuffer) -> HistoryEntry {
     HistoryEntry {
         chat_id: row.chat.chat_id,
         task_id: row.chat.task_id,
         title: redactor.redact_prose(&row.chat.title),
-        message_count: row.chat.messages.len(),
+        message_count: row.message_count,
         revision: row.revision.to_string(),
         updated_ms: row.updated_ms,
         listed: row.listed,
@@ -498,6 +831,9 @@ fn revision_number(value: &str) -> Result<i64, ApiError> {
         .ok()
         .filter(|n| *n > 0 && n.to_string() == value)
         .ok_or_else(|| mapped(HistoryError::InvalidRecord))
+}
+fn queue_full() -> ApiError {
+    ApiError::new("HISTORY_QUEUE_FULL", "History saving stopped because its bounded memory queue is full. Current unsaved text remains in memory; no older archive was deleted.")
 }
 fn unavailable() -> ApiError {
     ApiError::new(

@@ -53,19 +53,19 @@ jobs:
           PACKAGE_DIR: ${{ runner.temp }}/xyzaishell-package
         shell: pwsh
         run: .github/scripts/windows-native-install.ps1
-      - name: Download and verify the digest-pinned v0.1.3 upgrade baseline
+      - name: Download and verify the digest-pinned v0.1.4 upgrade baseline
         shell: bash
         env:
           BASELINE_PLATFORM: ${{ matrix.platform }}
           BASELINE_DIR: ${{ runner.temp }}/xyzaishell-upgrade-baseline
         run: python .github/scripts/upgrade_baseline.py download --platform "$BASELINE_PLATFORM" --directory "$BASELINE_DIR"
-      - name: Upgrade real v0.1.3 data to v0.1.4 using the candidate DEB in a separate fixture
+      - name: Upgrade real v0.1.4 data to v0.2.0 using the candidate DEB in a separate fixture
         if: runner.os == 'Linux'
         env:
           PACKAGE_DIR: ${{ runner.temp }}/xyzaishell-package
           UPGRADE_BASELINE_DIR: ${{ runner.temp }}/xyzaishell-upgrade-baseline
         run: bash .github/scripts/linux-native-install.sh
-      - name: Upgrade real v0.1.3 data to v0.1.4 using the candidate NSIS in a separate fixture
+      - name: Upgrade real v0.1.4 data to v0.2.0 using the candidate NSIS in a separate fixture
         if: runner.os == 'Windows'
         env:
           PACKAGE_DIR: ${{ runner.temp }}/xyzaishell-package

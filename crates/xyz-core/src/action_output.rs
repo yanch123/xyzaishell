@@ -59,6 +59,16 @@ impl Drop for Window {
     }
 }
 impl ActionOutputStore {
+    pub(crate) fn memory_bytes(&self) -> usize {
+        let s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::size_of::<Store>()
+            + s.windows.capacity() * std::mem::size_of::<Window>()
+            + s.windows
+                .iter()
+                .map(|w| w.id.capacity() + w.text.capacity())
+                .sum::<usize>()
+            + s.active.as_ref().map_or(0, String::capacity)
+    }
     pub fn start(&self, id: &str) {
         let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if !s.windows.iter().any(|w| w.id == id) {
@@ -106,6 +116,11 @@ impl ActionOutputStore {
             let before = w.text.len();
             trim(w, before.saturating_sub(total - RUN_LIMIT));
             total -= before - w.text.len();
+        }
+        if s.windows.iter().map(|w| w.text.capacity()).sum::<usize>() > RUN_LIMIT {
+            for window in &mut s.windows {
+                window.text.shrink_to_fit();
+            }
         }
     }
     /// New secrets invalidate older windows rather than changing established offsets.
@@ -178,6 +193,9 @@ fn trim(w: &mut Window, limit: usize) {
         w.earliest += n as u64;
         w.gap = true;
     }
+    if w.text.capacity() > limit {
+        w.text.shrink_to_fit();
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -213,6 +231,28 @@ mod tests {
         assert!(s.read("a", lost.earliest_offset + 1, 16).is_err());
         s.invalidate();
         assert!(s.read("a", p.next_offset, 16).unwrap().text.is_empty());
+    }
+    #[test]
+    fn run_limit_bounds_allocated_capacities_not_only_text_lengths() {
+        let store = ActionOutputStore::default();
+        for i in 0..20 {
+            let id = i.to_string();
+            store.start(&id);
+            for _ in 0..150 {
+                store.append(&"x".repeat(4096));
+            }
+            store.finish(&id);
+        }
+        let state = store.0.lock().unwrap();
+        assert!(
+            state
+                .windows
+                .iter()
+                .map(|w| w.text.capacity())
+                .sum::<usize>()
+                <= RUN_LIMIT
+        );
+        assert!(state.windows.iter().any(|w| w.gap));
     }
     #[test]
     fn run_limit_drops_completed_oldest_and_keeps_ids() {

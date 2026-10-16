@@ -1,0 +1,63 @@
+{
+  "reviewed_at": "2026-10-16",
+  "release_url": "https://github.com/yanch123/xyzaishell/releases/tag/v0.1.4",
+  "release_api_url": "https://api.github.com/repos/yanch123/xyzaishell/releases/415214180",
+  "release_id": 415214180,
+  "tag": "v0.1.4",
+  "source_commit": "0e29b1e5912f35e9eabd73ac073524af143cd622",
+  "baseline_version": "0.1.4",
+  "target_version": "0.2.0",
+  "workflow_run": "38937958608",
+  "workflow_attempt": "1",
+  "note": "Public release package and manifest bytes verified locally. Both application hashes independently extracted from these exact public packages without executing installed binaries. No earlier candidate or v0.1.3 identity reused.",
+  "platforms": {
+    "linux-x64": {
+      "assets": [
+        {
+          "name": "xyzaishell-0.1.4-linux-x64.deb",
+          "size": 12161974,
+          "sha256": "8546ae17e2aeca0889285af197954eb7201e1d87972e18ac47bd810b69d297d8",
+          "url": "https://github.com/yanch123/xyzaishell/releases/download/v0.1.4/xyzaishell-0.1.4-linux-x64.deb"
+        },
+        {
+          "name": "build-linux-x64.json",
+          "size": 1107,
+          "sha256": "ebc6fb6c6cc93b550d78a72d20129e5a7dd3507c530c93e4b5d866536f30e2a3",
+          "url": "https://github.com/yanch123/xyzaishell/releases/download/v0.1.4/build-linux-x64.json"
+        }
+      ],
+      "manifest_bytes_base64": "ewogICJzY2hlbWFfdmVyc2lvbiI6IDEsCiAgInNvdXJjZV9jb21taXQiOiAiMGUyOWIxZTU5MTJmMzVlOWVhYmQ3M2FjMDczNTI0YWYxNDNjZDYyMiIsCiAgInZlcnNpb24iOiAiMC4xLjQiLAogICJwbGF0Zm9ybSI6ICJsaW51eC14NjQiLAogICJidW5kbGUiOiAiZGViIiwKICAicGFja2FnZV9maWxlIjogInh5emFpc2hlbGwtMC4xLjQtbGludXgteDY0LmRlYiIsCiAgInBhY2thZ2Vfc2hhMjU2IjogIjg1NDZhZTE3ZTJhZWNhMDg4OTI4NWFmMTk3OTU0ZWI3MjAxZTFkODc5NzJlMThhYzQ3YmQ4MTBiNjlkMjk3ZDgiLAogICJsb2NrZmlsZXMiOiB7CiAgICAiQ2FyZ28ubG9jayI6ICJjODQ5YzJjYzhiYjI5N2NjZGEzMGUyNWUzZDk3ZmUyMjFhZDk0YjQ1NmYzMGVjMzAxNjAxYjVlODZmMzMxNmIyIiwKICAgICJwYWNrYWdlLWxvY2suanNvbiI6ICI5ZmZjYzk0N2FiZTI1MzBhYzU3ODAxODYxYmU0ZTJlYzg4ZmJkZWExZGZhZjlhZjUyZDAyNTUwNTVkZjRlYWEwIgogIH0sCiAgInJ1c3RjIjogInJ1c3RjIDEuOTkuMCAoYjk0MDA4NGQ3IDIwMjYtMDktMjgpXG5iaW5hcnk6IHJ1c3RjXG5jb21taXQtaGFzaDogYjk0MDA4NGQ3ZWI2YTI5OWViNGJmZWI4ZTM0OTAxYmMwNTFlN2FjNFxuY29tbWl0LWRhdGU6IDIwMjYtMDktMjhcbmhvc3Q6IHg4Nl82NC11bmtub3duLWxpbnV4LWdudVxucmVsZWFzZTogMS45OS4wXG5MTFZNIHZlcnNpb246IDIzLjEuMSIsCiAgImNhcmdvIjogImNhcmdvIDEuOTkuMCAoNWY5NGRmNDc4IDIwMjYtMDgtMjcpIiwKICAibm9kZSI6ICJ2MjIuMjMuMyIsCiAgInJ1bm5lcl9vcyI6ICJMaW51eCIsCiAgInJ1bm5lcl9pbWFnZSI6ICJ1YnVudHUyMiIsCiAgInJ1bm5lcl9pbWFnZV92ZXJzaW9uIjogIjIwMjYxMDEyLjMyMi4xIiwKICAid29ya2Zsb3dfcnVuIjogIjM4OTM3OTU4NjA4IiwKICAid29ya2Zsb3dfYXR0ZW1wdCI6ICIxIiwKICAic2lnbmluZyI6ICJObyBzaWduaW5nIGNyZWRlbnRpYWwgaXMgc3VwcGxpZWQgYnkgdGhpcyB3b3JrZmxvdy4iLAogICJhY2NlcHRhbmNlIjogIkJ1aWxkIGFuZCBhdXRvbWF0ZWQgY2hlY2tzIG9ubHk7IGludGVyYWN0aXZlIGRlc2t0b3AgYWNjZXB0YW5jZSBpcyBzZXBhcmF0ZS4iCn0K",
+      "independently_extracted_application_sha256": "0b8d6a20927b36f2c9a09015330fd16558e652ba98a19bee220c2863df756c5b",
+      "extraction": {
+        "tool": "dpkg-deb -x",
+        "package_sha256": "8546ae17e2aeca0889285af197954eb7201e1d87972e18ac47bd810b69d297d8",
+        "application_path": "usr/bin/xyzaishell",
+        "application_size": 37296288
+      }
+    },
+    "windows-x64": {
+      "assets": [
+        {
+          "name": "xyzaishell-0.1.4-windows-x64.exe",
+          "size": 6675716,
+          "sha256": "8761a106a6c40c34d3c34de1f8640ab77e0a5e12945d438b3812f12a2864756e",
+          "url": "https://github.com/yanch123/xyzaishell/releases/download/v0.1.4/xyzaishell-0.1.4-windows-x64.exe"
+        },
+        {
+          "name": "build-windows-x64.json",
+          "size": 1132,
+          "sha256": "0e217c42e655a57098df5e3313fe62ac92a8d15739caaff3844b1cfb9532326b",
+          "url": "https://github.com/yanch123/xyzaishell/releases/download/v0.1.4/build-windows-x64.json"
+        }
+      ],
+      "manifest_bytes_base64": "ew0KICAic2NoZW1hX3ZlcnNpb24iOiAxLA0KICAic291cmNlX2NvbW1pdCI6ICIwZTI5YjFlNTkxMmYzNWU5ZWFiZDczYWMwNzM1MjRhZjE0M2NkNjIyIiwNCiAgInZlcnNpb24iOiAiMC4xLjQiLA0KICAicGxhdGZvcm0iOiAid2luZG93cy14NjQiLA0KICAiYnVuZGxlIjogIm5zaXMiLA0KICAicGFja2FnZV9maWxlIjogInh5emFpc2hlbGwtMC4xLjQtd2luZG93cy14NjQuZXhlIiwNCiAgInBhY2thZ2Vfc2hhMjU2IjogIjg3NjFhMTA2YTZjNDBjMzRkM2MzNGRlMWY4NjQwYWI3N2UwYTVlMTI5NDVkNDM4YjM4MTJmMTJhMjg2NDc1NmUiLA0KICAibG9ja2ZpbGVzIjogew0KICAgICJDYXJnby5sb2NrIjogImM4NDljMmNjOGJiMjk3Y2NkYTMwZTI1ZTNkOTdmZTIyMWFkOTRiNDU2ZjMwZWMzMDE2MDFiNWU4NmYzMzE2YjIiLA0KICAgICJwYWNrYWdlLWxvY2suanNvbiI6ICI5ZmZjYzk0N2FiZTI1MzBhYzU3ODAxODYxYmU0ZTJlYzg4ZmJkZWExZGZhZjlhZjUyZDAyNTUwNTVkZjRlYWEwIg0KICB9LA0KICAicnVzdGMiOiAicnVzdGMgMS45OS4wIChiOTQwMDg0ZDcgMjAyNi0wOS0yOClcbmJpbmFyeTogcnVzdGNcbmNvbW1pdC1oYXNoOiBiOTQwMDg0ZDdlYjZhMjk5ZWI0YmZlYjhlMzQ5MDFiYzA1MWU3YWM0XG5jb21taXQtZGF0ZTogMjAyNi0wOS0yOFxuaG9zdDogeDg2XzY0LXBjLXdpbmRvd3MtbXN2Y1xucmVsZWFzZTogMS45OS4wXG5MTFZNIHZlcnNpb246IDIzLjEuMSIsDQogICJjYXJnbyI6ICJjYXJnbyAxLjk5LjAgKDVmOTRkZjQ3OCAyMDI2LTA4LTI3KSIsDQogICJub2RlIjogInYyMi4yMy4zIiwNCiAgInJ1bm5lcl9vcyI6ICJXaW5kb3dzIiwNCiAgInJ1bm5lcl9pbWFnZSI6ICJ3aW4yMiIsDQogICJydW5uZXJfaW1hZ2VfdmVyc2lvbiI6ICIyMDI2MTAxMi4zMzMuMSIsDQogICJ3b3JrZmxvd19ydW4iOiAiMzg5Mzc5NTg2MDgiLA0KICAid29ya2Zsb3dfYXR0ZW1wdCI6ICIxIiwNCiAgInNpZ25pbmciOiAiTm8gc2lnbmluZyBjcmVkZW50aWFsIGlzIHN1cHBsaWVkIGJ5IHRoaXMgd29ya2Zsb3cuIiwNCiAgImFjY2VwdGFuY2UiOiAiQnVpbGQgYW5kIGF1dG9tYXRlZCBjaGVja3Mgb25seTsgaW50ZXJhY3RpdmUgZGVza3RvcCBhY2NlcHRhbmNlIGlzIHNlcGFyYXRlLiINCn0NCg==",
+      "independently_extracted_application_sha256": "8575b363fc3a7cb06291a5cfc48714c2d1b9fba1e399e4b90036d30ae30fc3e7",
+      "extraction": {
+        "tool": "7-Zip 25.01 x",
+        "package_sha256": "8761a106a6c40c34d3c34de1f8640ab77e0a5e12945d438b3812f12a2864756e",
+        "application_path": "xyzaishell.exe",
+        "application_size": 25784320
+      }
+    }
+  }
+}

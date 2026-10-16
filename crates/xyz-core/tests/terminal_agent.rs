@@ -1240,7 +1240,61 @@ async fn context_retains_output_backed_findings_across_rounds_without_granting_c
         let (mut socket, _) = http.accept().await.unwrap();
         let third = terminal_prompt(&read_request(&mut socket).await);
         assert_eq!(third["task_context"]["findings"][0]["id"], "kernel");
-        assert!(third["task_context"]["evidence"][0]["output_excerpt"]
+        // v0.2.0 keeps settled command material once in the protected source
+        // array. Resolve the host-shaped anchor rather than treating its
+        // deliberately non-executable reference text as the original output.
+        let anchor = &third["task_context"]["evidence"][0];
+        assert_eq!(anchor["command_id"], first_id);
+        assert_eq!(anchor["command_completed"], true);
+        assert_eq!(anchor["exit_code"], 0);
+        assert_eq!(anchor["projection_compacted"], false);
+        assert_eq!(
+            third["task_context"]["findings"][0]["evidence_command_ids"][0],
+            first_id
+        );
+        let sources = third["working_memory_evidence_untrusted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| {
+                serde_json::from_str::<serde_json::Value>(source.as_str().unwrap()).unwrap()
+            })
+            .filter(|source| source["evidence"]["command_id"] == first_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources.len(),
+            1,
+            "cited evidence must have exactly one original source"
+        );
+        let source = &sources[0];
+        assert_eq!(source["scope"]["task_id"], third["task_context"]["task_id"]);
+        assert_eq!(source["scope"]["run_id"], third["task_context"]["run_id"]);
+        assert_eq!(
+            source["scope"]["session_id"],
+            third["task_context"]["session"]["session_id"]
+        );
+        assert_eq!(
+            source["scope"]["session_generation"]
+                .as_u64()
+                .unwrap()
+                .to_string(),
+            third["task_context"]["session"]["generation"]
+                .as_str()
+                .unwrap()
+        );
+        assert_eq!(source["evidence"]["command_text"], "uname -r");
+        assert_eq!(source["evidence"]["command_completed"], true);
+        assert_eq!(source["evidence"]["exit_code"], 0);
+        assert_eq!(source["evidence"]["untrusted"], true);
+        assert!(source["evidence"]["output_excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic-kernel-6.8"));
+        assert!(anchor["output_excerpt"]
+            .as_str()
+            .unwrap()
+            .contains(source["source_id"].as_str().unwrap()));
+        assert!(!anchor["output_excerpt"]
             .as_str()
             .unwrap()
             .contains("synthetic-kernel-6.8"));
@@ -2742,5 +2796,499 @@ async fn missing_receiver_ready_times_out_without_body_or_automatic_retry() {
         server.trace().input.len(),
         1,
         "receiver timeout must never replay either stage"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compacted_planning_requests_keep_transcript_and_never_replay_terminal_input() {
+    use xyz_core::{
+        agent::{ConversationScopeConsent, ConversationTurn},
+        context::{CompactionMode, CompactionState, RequestKind},
+    };
+    let server = LoopbackServer::start(receiver_behavior()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let chat = fixture.chats.create_chat("Planning memory").unwrap();
+    let status = fixture.config.status();
+    let scope = fixture
+        .agent
+        .confirm_conversation_scope(ConversationScopeConsent {
+            revision: status.revision.unwrap(),
+            destination: status.destination.unwrap(),
+            session: Some(fixture.session.clone()),
+        })
+        .unwrap();
+    let long_answer = format!(
+        "historical planning interpretation {}",
+        "untrusted prior assistant detail ".repeat(180)
+    );
+    for index in 0..5 {
+        if index == 4 {
+            let original = fixture.chats.get_chat(&chat.chat_id).unwrap();
+            let usage = fixture
+                .chats
+                .get_context_usage(&chat.chat_id, None, None)
+                .await
+                .unwrap();
+            assert_eq!(usage.request_kind, RequestKind::Planning);
+            fixture
+                .chats
+                .compact_context(
+                    &chat.chat_id,
+                    &usage.context_revision,
+                    CompactionMode::Quick,
+                    &uuid::Uuid::new_v4().to_string(),
+                )
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(WAIT, async {
+                loop {
+                    if let Some(job) = fixture.chats.get_context_compaction(&chat.chat_id).unwrap()
+                    {
+                        if matches!(
+                            job.state,
+                            CompactionState::Succeeded
+                                | CompactionState::Failed
+                                | CompactionState::NoEffect
+                        ) {
+                            break job;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                result.state,
+                CompactionState::Succeeded,
+                "{:?}",
+                result.error
+            );
+            assert_eq!(
+                serde_json::to_value(fixture.chats.get_chat(&chat.chat_id).unwrap().messages)
+                    .unwrap(),
+                serde_json::to_value(original.messages).unwrap()
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(75), http.accept())
+                    .await
+                    .is_err()
+            );
+        }
+        let turn = fixture
+            .agent
+            .submit_conversation_turn(
+                &chat.chat_id,
+                &format!("constraint {index}: do not execute any commands"),
+                scope.revision.as_deref().unwrap(),
+                scope.destination.as_deref().unwrap(),
+                Some(&fixture.session),
+            )
+            .unwrap();
+        let ConversationTurn::Terminal { task } = turn else {
+            panic!("ready scope must use planning");
+        };
+        let (mut socket, _) = tokio::time::timeout(WAIT, http.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let request = read_request(&mut socket).await;
+        let prompt = terminal_prompt(&request);
+        if index == 4 {
+            let history = prompt["conversation_history_untrusted"].as_array().unwrap();
+            assert!(history.iter().any(|m| m["text"]
+                .as_str()
+                .is_some_and(|s| s.contains("Historical working-memory summary"))));
+            // Exactly the latest two complete assistant turns remain verbatim;
+            // the earlier two are represented only by the inert summary.
+            assert_eq!(
+                history.iter().filter(|m| m["text"] == long_answer).count(),
+                2
+            );
+            for previous in 0..4 {
+                assert!(history.iter().any(|m| m["text"]
+                    .as_str()
+                    .is_some_and(|s| s.contains(&format!("constraint {previous}")))));
+            }
+        }
+        let body = chunk(
+            serde_json::json!({"role":"assistant","content":long_answer}),
+            serde_json::Value::Null,
+        ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+            + "data: [DONE]\n\n";
+        reply(&mut socket, &body).await;
+        let completed = phase(&fixture.agent, &task.task_id, "completed").await;
+        assert!(completed.action.is_none());
+        assert!(completed.actions.is_empty());
+    }
+    assert!(server.trace().input.is_empty());
+    assert_eq!(
+        fixture
+            .chats
+            .get_chat(&chat.chat_id)
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| m.text == long_answer)
+            .count(),
+        5
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seventeenth_completed_command_remains_citable_after_explicit_budget_renewal() {
+    let server = LoopbackServer::start(receiver_behavior()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let started = fixture.start();
+    let mut seventeenth = String::new();
+    for index in 0..17 {
+        if index == 16 {
+            let paused = phase(&fixture.agent, &started.task_id, "budget_paused").await;
+            assert_eq!(paused.round, 16);
+            fixture
+                .agent
+                .continue_task(ContinueTerminalTask {
+                    task_id: started.task_id.clone(),
+                    run_id: started.run_id.clone(),
+                    readiness_confirmed: true,
+                })
+                .unwrap();
+        }
+        let (mut socket, _) = tokio::time::timeout(WAIT, http.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        read_request(&mut socket).await;
+        reply(
+            &mut socket,
+            &tool_body("terminal_action", r#"{"command_text":"pwd"}"#, "tool_calls"),
+        )
+        .await;
+        let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
+        if index == 16 {
+            seventeenth = preview.action.as_ref().unwrap().action_id.clone();
+        }
+        ack(&fixture.agent, &preview);
+        fixture.receive_action(&server, &preview).await;
+        server
+            .send_output(format!("command-{index}-output\n").into_bytes())
+            .await;
+        let sequence = fixture.foreground_return(&server, "pwd", 0).await;
+        fixture.shell_ready(&server, sequence).await;
+    }
+    let (mut socket, _) = tokio::time::timeout(WAIT, http.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let prompt = terminal_prompt(&read_request(&mut socket).await);
+    let evidence = prompt["task_context"]["evidence"].as_array().unwrap();
+    assert!(
+        evidence
+            .iter()
+            .any(|e| e["command_id"] == seventeenth && e["command_completed"] == true),
+        "17th host evidence must remain available to cite"
+    );
+    let update = serde_json::json!({"summary":"Seventeenth foreground return observed; business outcome unverified.","findings":[{"id":"seventeenth","text":"The seventeenth output was observed.","evidence_command_ids":[seventeenth]}],"hypotheses":[],"remaining_steps":[]});
+    reply(
+        &mut socket,
+        &tool_body("task_context_update", &update.to_string(), "tool_calls"),
+    )
+    .await;
+    let (mut socket, _) = tokio::time::timeout(WAIT, http.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let prompt = terminal_prompt(&read_request(&mut socket).await);
+    assert_eq!(
+        prompt["task_context"]["findings"][0]["evidence_command_ids"][0],
+        seventeenth
+    );
+    let body = chunk(
+        serde_json::json!({"role":"assistant","content":"Inspection complete; business outcome unverified."}),
+        serde_json::Value::Null,
+    ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+        + "data: [DONE]\n\n";
+    reply(&mut socket, &body).await;
+    let done = phase(&fixture.agent, &started.task_id, "completed").await;
+    assert_eq!(done.actions.len(), 17);
+    assert_eq!(done.round, 19);
+    assert_eq!(
+        server.trace().input.len(),
+        34,
+        "citing evidence never repeats a command"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_compaction_reduces_single_run_command_evidence_without_replaying_actions() {
+    use xyz_core::context::{CompactionMode, CompactionState};
+    let server = LoopbackServer::start(receiver_behavior()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let started = fixture.start();
+    for index in 0..20 {
+        if index == 16 {
+            phase(&fixture.agent, &started.task_id, "budget_paused").await;
+            fixture
+                .agent
+                .continue_task(ContinueTerminalTask {
+                    task_id: started.task_id.clone(),
+                    run_id: started.run_id.clone(),
+                    readiness_confirmed: true,
+                })
+                .unwrap();
+        }
+        let (mut socket, _) = tokio::time::timeout(WAIT, http.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let request = read_request(&mut socket).await;
+        if index == 19 {
+            let usage = fixture
+                .chats
+                .get_context_usage(&started.chat_id, None, None)
+                .await
+                .unwrap();
+            let queued = fixture
+                .chats
+                .compact_context(
+                    &started.chat_id,
+                    &usage.context_revision,
+                    CompactionMode::Quick,
+                    &uuid::Uuid::new_v4().to_string(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(queued.state, CompactionState::WaitingSafePoint);
+            assert_eq!(
+                fixture.agent.get(&started.task_id).unwrap().phase,
+                "preparing"
+            );
+            assert!(
+                terminal_prompt(&request)["working_memory_evidence_untrusted"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty())
+            );
+        }
+        reply(
+            &mut socket,
+            &tool_body("terminal_action", r#"{"command_text":"pwd"}"#, "tool_calls"),
+        )
+        .await;
+        let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
+        ack(&fixture.agent, &preview);
+        fixture.receive_action(&server, &preview).await;
+        server
+            .send_output(
+                format!(
+                    "command-{index}: {}\n",
+                    "synthetic untrusted output detail ".repeat(20)
+                )
+                .into_bytes(),
+            )
+            .await;
+        let sequence = fixture.foreground_return(&server, "pwd", 0).await;
+        fixture.shell_ready(&server, sequence).await;
+    }
+    let (mut socket, _) = tokio::time::timeout(WAIT, http.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let request = read_request(&mut socket).await;
+    let prompt = terminal_prompt(&request);
+    let job = fixture
+        .chats
+        .get_context_compaction(&started.chat_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.state, CompactionState::Succeeded, "{:?}", job.error);
+    assert!(job.after_input_tokens < job.before_input_tokens);
+    assert!(job.after_request_bytes < job.before_request_bytes);
+    let evidence = prompt["task_context"]["evidence"].as_array().unwrap();
+    assert_eq!(evidence.len(), 20);
+    assert!(evidence.iter().all(|e| e["command_completed"] == true));
+    assert_eq!(
+        evidence
+            .iter()
+            .filter(|e| e["projection_compacted"] == true)
+            .count(),
+        19
+    );
+    assert!(prompt["working_memory_evidence_untrusted"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(prompt
+        .to_string()
+        .contains("Historical working-memory summary"));
+    assert!(evidence.last().unwrap()["output_excerpt"]
+        .as_str()
+        .unwrap()
+        .contains("command-19"));
+    let body = chunk(
+        serde_json::json!({"role":"assistant","content":"Foreground inspection finished; business outcome is unverified."}),
+        serde_json::Value::Null,
+    ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+        + "data: [DONE]\n\n";
+    reply(&mut socket, &body).await;
+    let done = phase(&fixture.agent, &started.task_id, "completed").await;
+    assert_eq!(done.actions.len(), 20);
+    assert_eq!(done.round, 21);
+    assert_eq!(server.trace().input.len(), 40);
+    let host_evidence = &done.task_context.as_ref().unwrap().evidence;
+    assert_eq!(host_evidence.len(), 20);
+    assert!(
+        host_evidence[0].output_excerpt.contains("command-0"),
+        "projection compaction must not rewrite host evidence"
+    );
+}
+
+async fn finish_without_command(
+    http: &TcpListener,
+    fixture: &Fixture,
+    task_id: &str,
+) -> TerminalTaskSnapshot {
+    let (mut socket, _) = tokio::time::timeout(WAIT, http.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    read_request(&mut socket).await;
+    let body = chunk(
+        serde_json::json!({"role":"assistant","content":"No further commands are needed."}),
+        serde_json::Value::Null,
+    ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+        + "data: [DONE]\n\n";
+    reply(&mut socket, &body).await;
+    phase(&fixture.agent, task_id, "completed").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiny_completed_terminal_record_allows_a_new_task_in_another_chat() {
+    let server = LoopbackServer::start(receiver_behavior()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let first = fixture.start();
+    let completed = finish_without_command(&http, &fixture, &first.task_id).await;
+    let second = fixture.start();
+    assert_ne!(second.chat_id, first.chat_id);
+    finish_without_command(&http, &fixture, &second.task_id).await;
+    assert_eq!(
+        serde_json::to_value(fixture.agent.get(&first.task_id).unwrap()).unwrap(),
+        serde_json::to_value(completed).unwrap()
+    );
+    assert!(server.trace().input.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_completed_terminal_pool_rejects_other_chat_without_mutation_but_allows_same_chat_replacement(
+) {
+    use xyz_core::agent::ReadActionOutput;
+    let server = LoopbackServer::start(receiver_behavior()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let started = fixture.start();
+    let mut first_action = String::new();
+    const OUTPUT_BYTES: usize = 900 * 1024;
+    for index in 0..4 {
+        let (mut socket, _) = tokio::time::timeout(WAIT, http.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        read_request(&mut socket).await;
+        reply(
+            &mut socket,
+            &tool_body("terminal_action", r#"{"command_text":"pwd"}"#, "tool_calls"),
+        )
+        .await;
+        let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
+        let action_id = preview.action.as_ref().unwrap().action_id.clone();
+        if index == 0 {
+            first_action = action_id.clone();
+        }
+        ack(&fixture.agent, &preview);
+        fixture.receive_action(&server, &preview).await;
+        let observed = fixture.output_bytes.load(Ordering::SeqCst);
+        server.send_output(vec![b'z'; OUTPUT_BYTES]).await;
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if fixture.output_bytes.load(Ordering::SeqCst) >= observed + OUTPUT_BYTES {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Prove the fixture exercised actual retained output, not just counters.
+        let page = fixture
+            .agent
+            .read_action_output(ReadActionOutput {
+                task_id: started.task_id.clone(),
+                run_id: started.run_id.clone(),
+                action_id,
+                offset: (OUTPUT_BYTES - 16_384) as u64,
+                max_bytes: 16_384,
+            })
+            .unwrap();
+        assert_eq!(page.text.len(), 16_384);
+        assert!(page.text.bytes().all(|b| b == b'z'));
+        let sequence = fixture.foreground_return(&server, "pwd", 0).await;
+        fixture.shell_ready(&server, sequence).await;
+    }
+    let completed = finish_without_command(&http, &fixture, &started.task_id).await;
+    assert_eq!(completed.actions.len(), 4);
+    let read = ReadActionOutput {
+        task_id: started.task_id.clone(),
+        run_id: started.run_id.clone(),
+        action_id: first_action,
+        offset: 0,
+        max_bytes: 16_384,
+    };
+    let before_output = fixture.agent.read_action_output(read.clone()).unwrap();
+    assert_eq!(before_output.text.len(), 16_384);
+    let other = fixture
+        .chats
+        .create_chat("Memory admission rejection")
+        .unwrap();
+    let error = fixture
+        .agent
+        .start(fixture.request(&other.chat_id))
+        .unwrap_err();
+    assert_eq!(error.code, "TERMINAL_MEMORY_LIMIT");
+    assert_eq!(
+        serde_json::to_value(fixture.agent.get(&started.task_id).unwrap()).unwrap(),
+        serde_json::to_value(&completed).unwrap()
+    );
+    assert_eq!(
+        fixture.agent.read_action_output(read).unwrap(),
+        before_output
+    );
+    assert!(fixture
+        .chats
+        .get_chat(&other.chat_id)
+        .unwrap()
+        .active_run_id
+        .is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), http.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(server.trace().input.len(), 8);
+    // A failed admission released its temporary owner/chat reservation. Replacing
+    // the old same-chat record is the explicit supported bounded-memory path.
+    let replacement = fixture
+        .agent
+        .start(fixture.request(&started.chat_id))
+        .unwrap();
+    assert_ne!(replacement.run_id, started.run_id);
+    assert_eq!(replacement.chat_id, started.chat_id);
+    finish_without_command(&http, &fixture, &replacement.task_id).await;
+    assert_eq!(
+        server.trace().input.len(),
+        8,
+        "memory admission must never replay old commands"
     );
 }

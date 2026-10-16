@@ -70,10 +70,10 @@ if $upgrade; then
   baseline=$(cd "$repo" && python3 .github/scripts/upgrade_baseline.py verify \
     --platform linux-x64 --directory "$UPGRADE_BASELINE_DIR")
   sudo apt-get install --no-install-recommends -y "$baseline"
-  [[ $(dpkg-query -W -f='${Version}' "$package_name") == 0.1.3 ]]
+  [[ $(dpkg-query -W -f='${Version}' "$package_name") == 0.1.4 ]]
   (cd "$repo" && python3 .github/scripts/upgrade_baseline.py verify \
     --platform linux-x64 --directory "$UPGRADE_BASELINE_DIR" --application /usr/bin/xyzaishell)
-  run_ui seed baseline-v0.1.3-install-and-restart 0.1.3
+  run_ui seed baseline-v0.1.4-install-and-restart 0.1.4
   fingerprint > "$fixture/before-upgrade.sha256"
 fi
 # No uninstall or data reset between the old application and this installation.
@@ -91,7 +91,7 @@ done
 ldd /usr/bin/xyzaishell | tee "$evidence/linkage.txt"
 ! grep -q 'not found' "$evidence/linkage.txt"
 if $upgrade; then
-  run_ui upgrade upgraded-v0.1.4 "$candidate_version"
+  run_ui upgrade upgraded-v0.2.0 "$candidate_version"
 else
   run_ui seed first-install-and-restart "$candidate_version"
   fingerprint > "$fixture/before-reinstall.sha256"
@@ -108,7 +108,7 @@ else
 fi
 fingerprint > "$fixture/final.sha256"
 if $upgrade; then
-  printf '%s\n' 'PASS: pinned v0.1.3 installed and seeded through real UI; direct v0.1.4 upgrade retained private profile/model bytes, history rows, text and stable IDs.' > "$evidence/result.txt"
+  printf '%s\n' 'PASS: pinned v0.1.4 installed and seeded through real UI; direct v0.2.0 upgrade retained private profile/model bytes, exact legacy backups, migrated archive messages and stable IDs.' > "$evidence/result.txt"
 else
 printf '%s\n' \
   'PASS: actual DEB installed; real native DOM/IPC profile/chat persistence and consent verified.' \
