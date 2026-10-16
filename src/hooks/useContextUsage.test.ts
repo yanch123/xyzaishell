@@ -38,6 +38,81 @@ it('does not duplicate concurrent manual compactions and reads recover uncertain
   await waitFor(() => expect(result.current.snapshot).not.toBeNull());
   await act(async () => { await Promise.all([result.current.compact('llm'), result.current.compact('quick')]); });
   expect(mocks.compact).toHaveBeenCalledTimes(1); expect(result.current.uncertain).toBe(true);
-  mocks.job.mockResolvedValue(compactionJob({ state: 'succeeded', revision: '4' })); await act(async () => result.current.refresh());
+  mocks.job.mockResolvedValue(compactionJob({ job_id: mocks.compact.mock.calls[0][3], state: 'succeeded', revision: '4' })); await act(async () => result.current.refresh());
   expect(result.current.job?.state).toBe('succeeded'); expect(result.current.uncertain).toBe(false); expect(mocks.compact).toHaveBeenCalledTimes(1);
+});
+it('blocks a click immediately after chat revision changes until a matching read completes', async () => {
+  const { result, rerender } = renderHook(({ revision }) => useContextUsage('chat-a', revision, '1', '', true), { initialProps: { revision: '1' } });
+  await waitFor(() => expect(result.current.fresh).toBe(true));
+  let resolve!: (usage: ContextUsageSnapshot) => void;
+  mocks.usage.mockImplementation(() => new Promise(done => { resolve = done; }));
+  rerender({ revision: '2' });
+  expect(result.current.fresh).toBe(false);
+  await act(async () => result.current.compact('llm'));
+  expect(mocks.compact).not.toHaveBeenCalled();
+  await waitFor(() => expect(resolve).toBeDefined());
+  // A later chat revision invalidates the in-flight read as well.
+  rerender({ revision: '3' });
+  await act(async () => resolve(contextUsage({ context_revision: '2' })));
+  expect(result.current.fresh).toBe(false);
+  mocks.usage.mockResolvedValue(contextUsage({ context_revision: '3' }));
+  await act(async () => result.current.refresh());
+  expect(result.current.fresh).toBe(true);
+  mocks.compact.mockResolvedValue(compactionJob());
+  await act(async () => result.current.compact('llm'));
+  expect(mocks.compact).toHaveBeenCalledWith('chat-a', '3', 'llm', expect.any(String));
+});
+it('keeps a known stale-action failure visible after polling succeeds, without automatically retrying', async () => {
+  mocks.job.mockResolvedValue(compactionJob({ state: 'succeeded', revision: '5' }));
+  mocks.compact.mockRejectedValue({ code: 'CONTEXT_STALE', retry: 'after_user_action', safe_message: '上下文已变化，请重新核对后重试。' });
+  const { result } = renderHook(() => useContextUsage('chat-a', '1', '1', '', true));
+  await waitFor(() => expect(result.current.fresh).toBe(true));
+  await act(async () => result.current.compact('llm'));
+  await act(async () => result.current.refresh());
+  expect(result.current.operationError).toBe('上下文已变化，请重新核对后重试。');
+  expect(result.current.uncertain).toBe(false);
+  expect(mocks.compact).toHaveBeenCalledTimes(1);
+});
+it('an unrelated old successful job cannot unlock a lost compaction response', async () => {
+  mocks.job.mockResolvedValue(compactionJob({ job_id: 'old-quick', state: 'succeeded', revision: '5' }));
+  mocks.compact.mockRejectedValue(new Error('lost response'));
+  const { result } = renderHook(() => useContextUsage('chat-a', '1', '1', '', true));
+  await waitFor(() => expect(result.current.fresh).toBe(true));
+  await act(async () => result.current.compact('llm'));
+  await act(async () => result.current.refresh());
+  expect(result.current.uncertain).toBe(true); expect(result.current.operationError).not.toBeNull();
+  await act(async () => result.current.compact('llm'));
+  expect(mocks.compact).toHaveBeenCalledTimes(1);
+  mocks.job.mockResolvedValue(compactionJob({ job_id: mocks.compact.mock.calls[0][3], state: 'succeeded', revision: '6' }));
+  await act(async () => result.current.refresh());
+  expect(result.current.uncertain).toBe(false); expect(result.current.operationError).toBeNull();
+});
+it('allows manual queuing during an active turn once its current snapshot is fresh', async () => {
+  mocks.usage.mockResolvedValue(contextUsage({ turn_phase: 'active_turn' }));
+  mocks.compact.mockResolvedValue(compactionJob({ state: 'waiting_safe_point' }));
+  const { result } = renderHook(() => useContextUsage('chat-a', '12', '1', '', true));
+  await waitFor(() => expect(result.current.fresh).toBe(true));
+  await act(async () => result.current.compact('llm'));
+  expect(mocks.compact).toHaveBeenCalledTimes(1); expect(result.current.job?.state).toBe('waiting_safe_point');
+});
+it('treats a typed memory quota rejection as definitive, keeping its error until explicit retry', async () => {
+  mocks.compact.mockRejectedValueOnce({ code: 'CONTEXT_MEMORY_LIMIT', safe_message: '上下文内存不足，请先减少其他会话。', retry: 'after_user_action' }).mockResolvedValueOnce(compactionJob());
+  const { result } = renderHook(() => useContextUsage('chat-a', '1', '1', '', true));
+  await waitFor(() => expect(result.current.fresh).toBe(true));
+  await act(async () => result.current.compact('llm'));
+  await act(async () => result.current.refresh());
+  expect(result.current.uncertain).toBe(false);
+  expect(result.current.operationError).toBe('上下文内存不足，请先减少其他会话。');
+  expect(result.current.fresh).toBe(true); expect(mocks.compact).toHaveBeenCalledTimes(1);
+  await act(async () => result.current.compact('llm'));
+  expect(mocks.compact).toHaveBeenCalledTimes(2); expect(result.current.operationError).toBeNull();
+});
+it('an incomplete error-shaped object is still an unknown submission outcome', async () => {
+  mocks.compact.mockRejectedValue({ code: 'CONTEXT_MEMORY_LIMIT', safe_message: 'Incomplete transport object' });
+  const { result } = renderHook(() => useContextUsage('chat-a', '1', '1', '', true));
+  await waitFor(() => expect(result.current.fresh).toBe(true));
+  await act(async () => result.current.compact('llm'));
+  await act(async () => result.current.refresh());
+  expect(result.current.uncertain).toBe(true);
+  await act(async () => result.current.compact('llm')); expect(mocks.compact).toHaveBeenCalledTimes(1);
 });

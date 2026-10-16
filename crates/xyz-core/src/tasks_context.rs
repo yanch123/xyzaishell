@@ -928,6 +928,102 @@ impl TaskManager {
         chat_id: &str,
         pending_request: bool,
     ) -> Result<(), ApiError> {
+        // Keep a ticket for errors before the inner checkpoint installs a job.
+        // Matching the entire fence and event revision prevents an old spawned
+        // checkpoint from failing a newer request, cancellation, or turn.
+        let ticket = {
+            let chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+            chats.get(chat_id).and_then(|record| {
+                let context = &record.context;
+                let pending = context.pending.clone().or_else(|| {
+                    let config = context.config.as_ref()?;
+                    if !config.request.context_auto_compact {
+                        return None;
+                    }
+                    let reason = context
+                        .prepared
+                        .as_ref()?
+                        .automatic_trigger(pending_request)?;
+                    Some(PendingCompaction {
+                        id: Uuid::new_v4().to_string(),
+                        mode: config.request.context_auto_mode,
+                        reason,
+                    })
+                })?;
+                Some((
+                    context.ledger.fence.clone(),
+                    context.event_revision,
+                    pending,
+                ))
+            })
+        };
+        let result = self
+            .context_checkpoint_inner(chat_id, pending_request)
+            .await;
+        if let (Err(error), Some((fence, event_revision, pending))) = (&result, ticket) {
+            self.fail_checkpoint_setup(chat_id, &fence, event_revision, &pending, error.clone());
+        }
+        result
+    }
+    fn fail_checkpoint_setup(
+        &self,
+        chat_id: &str,
+        fence: &ContextFence,
+        event_revision: u64,
+        pending: &PendingCompaction,
+        error: ApiError,
+    ) {
+        let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(record) = chats.get_mut(chat_id) else {
+            return;
+        };
+        let context = &mut record.context;
+        if &context.ledger.fence != fence
+            || context.event_revision != event_revision
+            || context.ledger.active_job.is_some()
+        {
+            return;
+        }
+        if pending.reason == TriggerReason::Manual
+            && context.pending.as_ref().map(|p| p.id.as_str()) != Some(pending.id.as_str())
+        {
+            return;
+        }
+        if pending.reason != TriggerReason::Manual && context.pending.is_some() {
+            return;
+        }
+        context.pending = None;
+        context.event_revision += 1;
+        let status = CompactionJobStatus {
+            job_id: pending.id.clone(),
+            chat_id: chat_id.into(),
+            revision: context.event_revision.to_string(),
+            context_revision: fence.context_revision.to_string(),
+            mode: pending.mode,
+            reason: pending.reason,
+            state: CompactionState::Failed,
+            before_input_tokens: context
+                .prepared
+                .as_ref()
+                .and_then(|p| p.usage.budget.decision_input_tokens),
+            after_input_tokens: None,
+            before_request_bytes: context
+                .prepared
+                .as_ref()
+                .and_then(|p| p.usage.byte_guards.first().map(|b| b.measured_bytes)),
+            after_request_bytes: None,
+            error: Some(error),
+        };
+        context.status = Some(status.clone());
+        context.receipts.insert(pending.id.clone(), status.clone());
+        drop(chats);
+        (self.events)(ModelEvent::ContextCompactionUpdated { job: status });
+    }
+    async fn context_checkpoint_inner(
+        &self,
+        chat_id: &str,
+        pending_request: bool,
+    ) -> Result<(), ApiError> {
         let setup = {
             let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
             let existing = &chats.get(chat_id).ok_or_else(chat_missing)?.context;

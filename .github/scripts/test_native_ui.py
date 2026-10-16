@@ -40,6 +40,27 @@ class NativeVersionPhaseTests(unittest.TestCase):
                 native.verify_phase_version(phase, version, "hash", None)
 
 
+class NativeFixtureOutputReserveTests(unittest.TestCase):
+    def test_fresh_candidate_has_room_for_compaction_schema_and_coverage(self):
+        self.assertEqual(native.fixture_output_reserve(native.TARGET_VERSION), 4096)
+        self.assertEqual(native.fixture_output_reserve(native.BASE_VERSION), 128)
+
+    def test_upgrade_and_restarts_preserve_seed_reserve(self):
+        for reserve in (128, 4096):
+            expected = {"max_output_tokens": reserve}
+            self.assertEqual(native.fixture_output_reserve(native.TARGET_VERSION, expected), reserve)
+        self.assertEqual(native.fixture_output_reserve(native.TARGET_VERSION, {}), 128)
+
+
+class NativeCompactionDiagnosticsTests(unittest.TestCase):
+    def test_provider_timeout_reports_actual_rendered_state(self):
+        driver = mock.Mock()
+        driver.js.return_value = {"mode": "llm", "alerts": ["reserve too small"], "status": ["压缩未完成"]}
+        with mock.patch.object(native, "wait_for", side_effect=AssertionError("timeout")):
+            with self.assertRaisesRegex(AssertionError, "reserve too small"):
+                native.wait_for_compaction_provider(driver, mock.Mock())
+
+
 class NativeSettingsVisibilityTests(unittest.TestCase):
     def test_exact_named_basic_fields_and_closed_advanced_sections_required(self):
         driver = mock.Mock()

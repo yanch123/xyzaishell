@@ -42,7 +42,7 @@ it('unknown capacity never becomes zero percent and over-budget is not clamped',
 it('does not retry unknown compaction outcome or silently select quick after LLM failure', async () => {
   mocks.compact.mockRejectedValue(new Error('IPC disconnected')); setup(); await waitFor(() => expect(mocks.usage).toHaveBeenCalled());
   fireEvent.click(screen.getByRole('button', { name: /查看上下文/ })); fireEvent.click(screen.getByRole('button', { name: '立即压缩' })); await screen.findByText(/操作结果尚未确认/);
-  expect(screen.getByRole('button', { name: '立即压缩' }).hasAttribute('disabled')).toBe(true); expect(mocks.compact).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole('button', { name: '重试压缩' }).hasAttribute('disabled')).toBe(true); expect(mocks.compact).toHaveBeenCalledTimes(1);
 });
 it('saves automatic quick independently without manufacturing a capacity override', async () => {
   setup(); fireEvent.click(screen.getByRole('button', { name: /查看上下文/ }));
@@ -50,4 +50,17 @@ it('saves automatic quick independently without manufacturing a capacity overrid
   await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
   expect(save).toHaveBeenCalledWith(expect.objectContaining({ context_auto_compact: true, context_auto_mode: 'quick', key_update: { kind: 'keep' } }));
   expect(save.mock.calls[0][0]).not.toHaveProperty('context_window_tokens'); expect(mocks.compact).not.toHaveBeenCalled();
+});
+it('does not show a previous quick success as the result of a rejected LLM attempt', async () => {
+  mocks.job.mockResolvedValue(compactionJob({ job_id: 'old-quick', mode: 'quick', state: 'succeeded', revision: '5' }));
+  mocks.compact.mockRejectedValue({ code: 'CONTEXT_STALE', retry: 'after_user_action', safe_message: '上下文已变化，请重新核对后重试。' });
+  setup(); await waitFor(() => expect(mocks.usage).toHaveBeenCalled());
+  fireEvent.click(screen.getByRole('button', { name: /查看上下文/ }));
+  await screen.findByText('上下文已整理');
+  fireEvent.click(screen.getByRole('button', { name: '立即压缩' }));
+  await screen.findByText('上下文已变化，请重新核对后重试。');
+  await waitFor(() => expect(mocks.usage.mock.calls.length).toBeGreaterThan(1));
+  expect(screen.queryByText('上下文已整理')).toBeNull();
+  expect(screen.getByRole('button', { name: '重试压缩' })).toBeDefined();
+  expect(mocks.compact).toHaveBeenCalledTimes(1);
 });

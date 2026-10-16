@@ -36,6 +36,14 @@ PROFILE = "Native fixture profile 中文"
 TOKEN = "synthetic-native-fixture-token"
 
 
+def fixture_output_reserve(version, expected=None):
+    # Fresh candidate compaction needs room for schema + source coverage. Upgrade
+    # must retain the released fixture's exact model settings, including 128.
+    if expected is not None:
+        return expected.get("max_output_tokens", 128)
+    return 4096 if version == TARGET_VERSION else 128
+
+
 def wait_for(read, timeout=30):
     until = time.monotonic() + timeout
     last = None
@@ -478,7 +486,7 @@ def verify_context_controls(driver, server):
     driver.click(panel + "//summary[normalize-space(.)='详情']")
     assert driver.js("return document.querySelector('.context-popover').textContent.includes('256K = 256000 tokens')")
     assert driver.js("return document.querySelector('.context-popover').textContent.includes('保守估算')")
-    assert driver.js("return !document.querySelector('.context-popover').textContent.includes('50%')")
+    assert driver.js("return !/(?:目标|压缩到|压到|降至|降到)\\s*50%|50%\\s*(?:目标|固定)/.test(document.querySelector('.context-popover').textContent)")
     assert driver.js("return document.querySelector('select[aria-label=\"本次压缩方式\"]').value === 'llm'")
     driver.screenshot("native-context-default-budget-and-sources")
     driver.click("//select[@aria-label='本次压缩方式']/option[@value='quick']")
@@ -490,15 +498,53 @@ def verify_context_controls(driver, server):
     driver.click(driver.button("关闭上下文"))
 
 
+def context_control_state(driver):
+    return driver.js("""
+      const panel = document.querySelector('.context-popover');
+      return {
+        mode: panel?.querySelector('select[aria-label="本次压缩方式"]')?.value,
+        total: panel?.querySelector('.context-total')?.textContent,
+        status: [...(panel?.querySelectorAll('[role=status]') ?? [])].map(e=>e.textContent.trim()),
+        alerts: [...(panel?.querySelectorAll('[role=alert]') ?? [])].map(e=>e.textContent.trim()),
+        actionEnabled: [...(panel?.querySelectorAll('button') ?? [])].some(e=>e.textContent.trim()==='立即压缩' && !e.disabled),
+        details: panel?.querySelector('details')?.textContent
+      };
+    """)
+
+
+def wait_for_compaction_provider(driver, server):
+    try:
+        wait_for(lambda: server.compaction_started.is_set())
+    except AssertionError as error:
+        raise AssertionError("LLM provider request did not start; native UI state: "
+                             + json.dumps(context_control_state(driver), ensure_ascii=False)) from error
+
+
 def verify_llm_compaction_and_cancel(driver, server):
     driver.click("//button[starts-with(@aria-label,'可用输入预算占用')]")
     driver.click("//select[@aria-label='本次压缩方式']/option[@value='llm']")
+    # Selection and completed-turn estimate refresh must settle before clicking.
+    # Observe only rendered state; never inject IPC or repeat an ambiguous click.
+    previous = None
+    def settled():
+        nonlocal previous
+        state = context_control_state(driver)
+        ready = (state["mode"] == "llm" and state["actionEnabled"]
+                 and not state["alerts"] and not any("更新" in value for value in state["status"]))
+        same = state == previous
+        previous = state
+        if not (ready and same):
+            time.sleep(0.25)
+            return False
+        return True
+    wait_for(settled)
+    driver.screenshot("native-llm-compaction-ready-before-request")
     server.hold_compaction = True
     server.release_compaction.clear()
     server.compaction_started.clear()
     before = len(server.compaction_requests)
     driver.click(driver.button("立即压缩"))
-    wait_for(lambda: server.compaction_started.is_set())
+    wait_for_compaction_provider(driver, server)
     wait_for(lambda: driver.find(driver.button("取消压缩")))
     driver.screenshot("native-llm-compaction-real-http-in-progress")
     driver.click(driver.button("取消压缩"))
@@ -805,6 +851,7 @@ def main():
     args.evidence.mkdir(parents=True, exist_ok=True)
     state_file = root / "expected.json"
     expected = json.loads(state_file.read_text()) if args.phase != "seed" else None
+    max_output_tokens = fixture_output_reserve(args.application_version, expected)
     application_hash = hashlib.sha256(args.application.read_bytes()).hexdigest()
     verify_phase_version(args.phase, args.application_version, application_hash, expected)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", expected["port"] if expected else 0), ModelFixture)
@@ -828,7 +875,7 @@ tool_calling = "required"
 connect_timeout_seconds = 5
 request_timeout_seconds = 30
 stream_idle_timeout_seconds = 10
-max_output_tokens = 128
+max_output_tokens = {max_output_tokens}
 [transport]
 allow_loopback_http = true
 '''
@@ -878,7 +925,7 @@ allow_loopback_http = true
             assert actual == identity, "Restoration changed the stored task/chat identity"
             model_text = (config / "model.toml").read_text(encoding="utf-8")
             for advanced in ("connect_timeout_seconds = 5", "request_timeout_seconds = 30",
-                             "stream_idle_timeout_seconds = 10", "max_output_tokens = 128",
+                             "stream_idle_timeout_seconds = 10", f"max_output_tokens = {max_output_tokens}",
                              "allow_loopback_http = true"):
                 assert advanced in model_text, "Saving model settings lost an advanced fixture option"
             server.requests.clear()
@@ -897,7 +944,7 @@ allow_loopback_http = true
             verify_private_file(config / "model.toml", expected["model_file_sha256"], "Model settings")
         if expected is None or args.phase == "upgrade":
             state_file.write_text(json.dumps({"port": server.server_port, "identity": identity, "profile_id": profile_id,
-                "application_version": args.application_version, "application_sha256": application_hash, "message_count": message_count,
+                "application_version": args.application_version, "application_sha256": application_hash, "message_count": message_count, "max_output_tokens": max_output_tokens,
                 "history_version": history_version, "history_rows": preserved_rows,
                 "profile_schema_version": profile_version,
                 "profile_file_sha256": hashlib.sha256((config / "connections.toml").read_bytes()).hexdigest(),

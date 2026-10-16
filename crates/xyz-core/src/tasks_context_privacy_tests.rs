@@ -211,3 +211,154 @@ async fn existing_structured_evidence_is_leaf_redacted_after_late_registration()
         )
         .unwrap();
 }
+
+#[tokio::test]
+async fn admitted_compaction_quota_failure_becomes_terminal_receipt_and_event() {
+    let fixture = Fixture::new();
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_events = events.clone();
+    let mut manager = fixture.manager.clone();
+    manager.events = Arc::new(move |event| {
+        captured_events.lock().unwrap().push(event);
+        true
+    });
+    let chat = manager.create_chat("Quota checkpoint").unwrap();
+    let usage = manager
+        .get_context_usage(&chat.chat_id, None, None)
+        .await
+        .unwrap();
+    let request = Uuid::new_v4().to_string();
+    {
+        let mut chats = manager.chats.lock().unwrap();
+        let context = &mut chats.get_mut(&chat.chat_id).unwrap().context;
+        context.authorized_revision = Some(context.ledger.fence.config_revision);
+    }
+    let queued = manager
+        .compact_context(
+            &chat.chat_id,
+            &usage.context_revision,
+            CompactionMode::Llm,
+            &request,
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.state, CompactionState::WaitingSafePoint);
+    let before = {
+        let mut chats = manager.chats.lock().unwrap();
+        let record = chats.get_mut(&chat.chat_id).unwrap();
+        // Deterministically consume quota after queue admission but before the
+        // spawned checkpoint runs. No source text or prepared projection changes.
+        record.snapshot.title.reserve(6 * 1024 * 1024);
+        record
+            .context
+            .prepared
+            .as_ref()
+            .unwrap()
+            .serialized_body
+            .clone()
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let job = manager
+                .get_context_compaction(&chat.chat_id)
+                .unwrap()
+                .unwrap();
+            if job.state == CompactionState::Failed {
+                assert_eq!(job.error.unwrap().code, "CONTEXT_MEMORY_LIMIT");
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let chats = manager.chats.lock().unwrap();
+    let context = &chats[&chat.chat_id].context;
+    assert!(context.pending.is_none());
+    assert!(context.ledger.active_job.is_none());
+    assert_eq!(context.prepared.as_ref().unwrap().serialized_body, before);
+    assert_eq!(context.receipts[&request].state, CompactionState::Failed);
+    assert!(context.last_compaction_usage.is_none());
+    assert!(events.lock().unwrap().iter().any(|event|matches!(event,ModelEvent::ContextCompactionUpdated{job} if job.job_id==request && job.state==CompactionState::Failed)));
+}
+
+#[test]
+fn obsolete_checkpoint_error_cannot_replace_a_new_request() {
+    let fixture = Fixture::new();
+    let manager = &fixture.manager;
+    let chat = manager.create_chat("Checkpoint fence").unwrap();
+    let (fence, revision, old) = {
+        let mut chats = manager.chats.lock().unwrap();
+        let context = &mut chats.get_mut(&chat.chat_id).unwrap().context;
+        let old = PendingCompaction {
+            id: "old".into(),
+            mode: CompactionMode::Quick,
+            reason: TriggerReason::Manual,
+        };
+        context.pending = Some(PendingCompaction {
+            id: "new".into(),
+            ..old.clone()
+        });
+        (context.ledger.fence.clone(), context.event_revision, old)
+    };
+    manager.fail_checkpoint_setup(
+        &chat.chat_id,
+        &fence,
+        revision,
+        &old,
+        ApiError::new("CONTEXT_MEMORY_LIMIT", "quota"),
+    );
+    let chats = manager.chats.lock().unwrap();
+    let context = &chats[&chat.chat_id].context;
+    assert_eq!(context.pending.as_ref().unwrap().id, "new");
+    assert!(context.status.is_none());
+}
+
+#[tokio::test]
+async fn automatic_after_turn_quota_error_is_visible_without_mutating_projection() {
+    let fixture = Fixture::new();
+    let manager = &fixture.manager;
+    let chat = manager.create_chat("Automatic quota").unwrap();
+    manager
+        .get_context_usage(&chat.chat_id, None, None)
+        .await
+        .unwrap();
+    let before = {
+        let mut chats = manager.chats.lock().unwrap();
+        let record = chats.get_mut(&chat.chat_id).unwrap();
+        record.snapshot.title.reserve(6 * 1024 * 1024);
+        let context = &mut record.context;
+        let config = context.config.as_ref().unwrap();
+        let mut request = config.request.clone();
+        request.context_auto_compact = true;
+        context.config = Some(Arc::new(ModelSnapshot {
+            destination: config.destination.clone(),
+            model: config.model.clone(),
+            api_key: config.api_key.clone(),
+            request,
+        }));
+        context.ledger.fence.turn_phase = TurnPhase::EndOfTurn;
+        let prepared = context.prepared.as_mut().unwrap();
+        prepared.usage.turn_phase = TurnPhase::EndOfTurn;
+        prepared.usage.budget.decision_input_tokens = Some(85);
+        prepared.usage.budget.input_budget_tokens = Some(100);
+        prepared.serialized_body.clone()
+    };
+    assert_eq!(
+        manager
+            .context_checkpoint(&chat.chat_id, false)
+            .await
+            .unwrap_err()
+            .code,
+        "CONTEXT_MEMORY_LIMIT"
+    );
+    let chats = manager.chats.lock().unwrap();
+    let context = &chats[&chat.chat_id].context;
+    let status = context.status.as_ref().unwrap();
+    assert_eq!(status.state, CompactionState::Failed);
+    assert_eq!(status.reason, TriggerReason::TokenPressure);
+    assert_eq!(status.error.as_ref().unwrap().code, "CONTEXT_MEMORY_LIMIT");
+    assert_eq!(context.prepared.as_ref().unwrap().serialized_body, before);
+    assert!(context.pending.is_none());
+    assert!(context.ledger.active_job.is_none());
+}

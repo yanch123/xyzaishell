@@ -64,7 +64,7 @@ test('synthetic context: default capacity, honest source, categories and phase t
   await panel.getByText('详情', { exact: true }).click();
   await expect(panel).toContainText('256K = 256000 tokens，是产品默认配置');
   await expect(panel).toContainText('未知 · 未收到供应商用量');
-  await expect(panel).not.toContainText('50%');
+  await expect(panel).not.toContainText(/(?:目标|压缩到|压到|降至|降到)\s*50%|50%\s*(?:目标|固定)/);
   await page.evaluate(() => (window as unknown as { __CONTEXT_UPDATE__: (active: boolean) => void }).__CONTEXT_UPDATE__(true));
   await expect(panel).toContainText('当前任务中 95%');
   const rect = await panel.boundingBox();
