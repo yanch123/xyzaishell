@@ -45,6 +45,9 @@ pub struct Behavior {
     pub accept_pty: bool,
     pub accept_exec: bool,
     pub accept_shell: bool,
+    /// Model the current-shell receiver turning PTY echo off for its one body.
+    /// Input is still recorded exactly; manual input and kickoff keep echoing.
+    pub quiet_receiver: bool,
 }
 
 impl Default for Behavior {
@@ -53,6 +56,7 @@ impl Default for Behavior {
             accept_pty: true,
             accept_exec: true,
             accept_shell: true,
+            quiet_receiver: false,
         }
     }
 }
@@ -64,6 +68,7 @@ struct FixtureHandler {
     behavior: Behavior,
     is_connection: bool,
     allowed_public_key: Option<PublicKey>,
+    receiver_quiet: bool,
 }
 
 impl server::Server for FixtureHandler {
@@ -198,7 +203,22 @@ impl server::Handler for FixtureHandler {
     ) -> Result<(), Self::Error> {
         self.trace
             .send_modify(|t| t.input.push((channel, data.to_vec())));
+        if self.receiver_quiet {
+            if let Some(end) = data.iter().position(|byte| *byte == b'\n') {
+                self.receiver_quiet = false;
+                if end + 1 < data.len() {
+                    session.data(channel, data[end + 1..].to_vec())?;
+                }
+            }
+            return Ok(());
+        }
         session.data(channel, data.to_vec())?;
+        if self.behavior.quiet_receiver
+            && data.starts_with(b"if __xyz_receive ")
+            && data.ends_with(b"\r")
+        {
+            self.receiver_quiet = true;
+        }
         Ok(())
     }
 
@@ -283,6 +303,7 @@ impl LoopbackServer {
             behavior,
             is_connection: false,
             allowed_public_key,
+            receiver_quiet: false,
         };
         let (ready_tx, ready_rx) = oneshot::channel();
         let task = tokio::spawn(async move {

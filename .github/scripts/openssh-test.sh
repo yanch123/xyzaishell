@@ -30,7 +30,7 @@ done
 as_root=()
 if [[ "$mode" == --disposable-user ]]; then
   [[ ${CI:-} == true ]] || { echo '--disposable-user requires CI=true on a disposable runner.' >&2; exit 1; }
-  for command in useradd userdel install getent pkill pgrep runuser cmp; do
+  for command in useradd userdel install getent pkill pgrep runuser cmp locale; do
     command -v "$command" >/dev/null || { echo "Missing prerequisite: $command" >&2; exit 1; }
   done
   if [[ $EUID -ne 0 ]]; then
@@ -148,6 +148,10 @@ if [[ "$mode" == --disposable-user ]]; then
   # Configure only the account created by this fixture, before SSH startup.
   # Production preparation must preserve these settings and definitions.
   cat > "$fixture/bashrc" <<'BASHRC'
+# sshd does not inherit the runner's locale. In the C locale, native Bash 4.2
+# readline interprets UTF-8 input bytes as meta keys instead of inserting them.
+# The Unicode-input acceptance case requires a verified UTF-8 fixture locale.
+export LC_ALL=C.UTF-8
 stty -echo
 HISTCONTROL=ignoreboth
 HISTIGNORE=
@@ -171,6 +175,15 @@ BASHRC
   }
   [[ "$account_version" == "$fixture_bash_version" ]] || {
     echo "Disposable account runtime mismatch: $account_version" >&2
+    exit 1
+  }
+  account_charmap=$("${as_root[@]}" runuser -u "$username" -- "$fixture_bash" \
+    --noprofile --norc -c 'export LC_ALL=C.UTF-8; locale charmap') || {
+    echo 'Disposable account cannot use the fixture UTF-8 locale.' >&2
+    exit 1
+  }
+  [[ "$account_charmap" == UTF-8 ]] || {
+    echo "Disposable account needs UTF-8 for Unicode input, got $account_charmap" >&2
     exit 1
   }
   # Some minimal images omit this package-owned privilege-separation directory.

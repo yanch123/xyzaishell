@@ -6,7 +6,6 @@ use crate::{
     shell_log_protocol::{bootstrap_command, startup_command, ProtocolParser, WireEvent},
     ssh::{ApiError, SessionRef, SessionSnapshot, SessionState},
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,6 +23,8 @@ pub enum IntegrationPhase {
     Installing,
     AwaitingReady,
     Ready,
+    AwaitingReceiver,
+    Receiving,
     AwaitingBegin,
     Running,
     Unknown,
@@ -163,7 +164,7 @@ fn unsupported_shell(reason: &str) -> ApiError {
         ),
         "missing_tools" => (
             "SHELL_UNSUPPORTED_MISSING_TOOLS",
-            "Shell 找不到命令状态识别所需的 base64。未安装软件或修改 PATH，可继续使用手动终端。",
+            "Shell 找不到命令接收所需的 base64、stty 或 sha256sum。未安装软件或修改 PATH，可继续使用手动终端。",
         ),
         _ => (
             "SHELL_UNSUPPORTED",
@@ -192,9 +193,9 @@ pub fn correlated_command(action_id: &str, command: &str) -> Result<String, ApiE
     }
     Ok(format!("{command} # xyz-action:{action_id}"))
 }
-/// Original bytes are encoded as an inert Bash ANSI-C literal. The approved
-/// action and its exact transport stay separate; no parsing/reprinting occurs.
-pub const MAX_ACTION_TRANSPORT_BYTES: usize = 64 * 1024;
+/// A bounded top-level kickoff; original command bytes travel separately in
+/// the same immutable permit's suffix-safe, quiet receiver frame.
+pub const MAX_ACTION_TRANSPORT_BYTES: usize = 128 * 1024;
 pub fn action_envelope(
     session: &SessionRef,
     action_id: &str,
@@ -226,13 +227,8 @@ pub fn action_envelope(
         .sequence
         .checked_add(1)
         .ok_or_else(|| error("SHELL_SEQUENCE_LIMIT", "Shell 序号已耗尽，请重新连接。"))?;
-    let encoded = command
-        .as_bytes()
-        .iter()
-        .map(|b| format!("\\x{b:02x}"))
-        .collect::<String>();
     let digest = format!("{:x}", Sha256::digest(command.as_bytes()));
-    let transport = format!("if [[ ${{__xyz_nonce-}} == '{}' && ${{__xyz_seq-}} == {} && ${{__xyz_failed-1}} == 0 ]]; then __xyz_payload=$'{}'; if __xyz_action_begin '{}' '{}' '{}' '{}' {} '{}' '{}' \"$(builtin trap -p)\"; then builtin eval -- \"$__xyz_payload\"; __xyz_code=$?; __xyz_action_end \"$__xyz_code\"; fi; else __xyz_gap; fi # xyz-action:{}", expected.shell_id, expected.sequence, encoded, expected.shell_id, session.session_id, session.generation, action_id, sequence, digest, STANDARD.encode(command), action_id);
+    let transport = format!("if __xyz_receive '{}' '{}' '{}' {} '{}' \"$(builtin trap -p)\"; then builtin eval -- \"$__xyz_payload\"; __xyz_action_end \"$?\"; fi # xyz-action:{}", session.session_id, session.generation, action_id, sequence, digest, action_id);
     if transport.len() + 1 > MAX_ACTION_TRANSPORT_BYTES {
         return Err(error(
             "SHELL_ACTION_INVALID",
@@ -240,6 +236,39 @@ pub fn action_envelope(
         ));
     }
     Ok(transport)
+}
+/// Quiet body: every suffix is a Bash comment/blank, never executable text.
+pub fn action_wire_frame(
+    session: &SessionRef,
+    action_id: &str,
+    command: &str,
+    expected: &ReadyBinding,
+) -> Result<Vec<u8>, ApiError> {
+    action_envelope(session, action_id, command, expected)?;
+    let digest = format!("{:x}", Sha256::digest(command.as_bytes()));
+    let record = format!(
+        "v1|{}|{}|{}|{}|{}|{}|{}|{}",
+        expected.shell_id,
+        session.session_id,
+        session.generation,
+        action_id,
+        expected.sequence + 1,
+        digest,
+        command.len(),
+        command
+    );
+    let mut wire = Vec::with_capacity(record.len() * 8 + 2);
+    wire.push(b'#');
+    for byte in record.bytes() {
+        for bit in (0..8).rev() {
+            wire.push(if byte & (1 << bit) != 0 { b'#' } else { b' ' });
+        }
+    }
+    wire.push(b'\n');
+    if wire.len() > MAX_ACTION_TRANSPORT_BYTES {
+        return Err(error("SHELL_ACTION_INVALID", "命令接收帧超过上限。"));
+    }
+    Ok(wire)
 }
 impl Default for ShellIntegrationService {
     fn default() -> Self {
@@ -452,7 +481,7 @@ impl ShellIntegrationService {
         c.pending = Some(binding.clone());
         c.status.active_action_id = Some(action_id.into());
         c.status.completed = None;
-        c.status.phase = IntegrationPhase::AwaitingBegin;
+        c.status.phase = IntegrationPhase::AwaitingReceiver;
         self.publish(&mut c);
         Ok(binding)
     }
@@ -465,7 +494,7 @@ impl ShellIntegrationService {
     ) -> Result<(), ApiError> {
         let c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if c.status.session.as_ref() != Some(session)
-            || c.status.phase != IntegrationPhase::AwaitingBegin
+            || c.status.phase != IntegrationPhase::AwaitingReceiver
             || c.status.shell_id.as_deref() != Some(binding.shell_id.as_str())
             || !c.pending.as_ref().is_some_and(|p| {
                 p.action_id == binding.action_id
@@ -483,13 +512,34 @@ impl ShellIntegrationService {
         }
         Ok(())
     }
+    pub fn receiver_ready(&self, session: &SessionRef, action_id: &str) -> bool {
+        let c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        c.status.session.as_ref() == Some(session)
+            && c.status.phase == IntegrationPhase::Receiving
+            && c.pending.as_ref().is_some_and(|p| p.action_id == action_id)
+    }
+    pub fn consume_receiver(&self, session: &SessionRef, action_id: &str) -> Result<(), ApiError> {
+        let mut c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if c.status.session.as_ref() != Some(session)
+            || c.status.phase != IntegrationPhase::Receiving
+            || !c.pending.as_ref().is_some_and(|p| p.action_id == action_id)
+        {
+            return Err(error(
+                "SHELL_RECEIVER_STALE",
+                "命令接收状态已失效，未继续发送。",
+            ));
+        }
+        c.status.phase = IntegrationPhase::AwaitingBegin;
+        self.publish(&mut c);
+        Ok(())
+    }
     pub fn dispatch_failed(&self, session: &SessionRef, action_id: &str, cause: &str) {
         let mut c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if c.status.session.as_ref() == Some(session)
             && c.status.active_action_id.as_deref() == Some(action_id)
         {
             if cause == "not_sent"
-                && c.status.phase == IntegrationPhase::AwaitingBegin
+                && c.status.phase == IntegrationPhase::AwaitingReceiver
                 && c.active_sequence.is_none()
                 && c.pending.as_ref().is_some_and(|p| p.action_id == action_id)
             {
@@ -627,6 +677,11 @@ impl ShellIntegrationService {
             return;
         }
         match event {
+            WireEvent::ReceiverReady { sequence, session_id, generation, action_id, digest } => {
+                let matches = c.pending.as_ref().is_some_and(|p| p.sequence == *sequence && p.action_id == *action_id && p.payload_digest == *digest) && c.status.session.as_ref().is_some_and(|s| s.session_id == *session_id && s.generation == *generation);
+                if !c.hello || c.status.phase != AwaitingReceiver || !matches { self.unknown(c, "SHELL_RECEIVER_MISMATCH", "命令接收握手不匹配，自动输入已停止。"); return; }
+                c.status.phase = Receiving; self.publish(c);
+            }
             WireEvent::ActionBegin { sequence, session_id, generation, action_id, digest, command, .. } => {
                 let matches = c.pending.as_ref().is_some_and(|p| p.sequence == *sequence && p.action_id == *action_id && p.payload_digest == *digest && p.command == *command)
                     && c.status.session.as_ref().is_some_and(|s| s.session_id == *session_id && s.generation == *generation);

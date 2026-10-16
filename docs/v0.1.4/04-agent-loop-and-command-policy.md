@@ -190,7 +190,9 @@ type CommandResult = {
 
 ### 5.1 状态机
 
-`planning → evaluating → awaiting_display → awaiting_approval? → dispatching → awaiting_begin → running → awaiting_ready → observing → planning/finished`。
+`planning → evaluating → awaiting_display → awaiting_approval? → dispatching → awaiting_receiver → receiving → awaiting_begin → running → awaiting_ready → observing → planning/finished`。
+
+接收握手与无回显续写由宿主自动处理，界面只显示简短的发送进度，不增加操作模式或配置项。两段传输共同绑定同一批准，具体约束见 [08 安静命令传输](08-quiet-command-transport.md)。
 
 独立阻塞／终止状态：`waiting_user_input`、`manual_control`、`cancelled_before_dispatch`、`agent_stopped_remote_active`、`outcome_unknown`、`unsupported`、`disconnected`。这些是拟定的类型化状态，不应继续靠任意字符串拼接 UI 状态。
 

@@ -12,6 +12,13 @@ const LEGACY_SCRIPT: &str = include_str!("shell_log_bootstrap_legacy.bash");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WireEvent {
+    ReceiverReady {
+        sequence: u64,
+        session_id: String,
+        generation: String,
+        action_id: String,
+        digest: String,
+    },
     ActionBegin {
         sequence: u64,
         remote_time_s: u64,
@@ -334,6 +341,28 @@ fn parse_valid_frame(nonce: &str, frame: &[u8]) -> Option<WireEvent> {
                 })
             }
         }
+        "M" if fields.len() == 8 && fields[0] == "3" => {
+            if fields[4..7].iter().any(|s| {
+                s.is_empty()
+                    || s.len() > 128
+                    || !s
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            }) || fields[7].len() != 64
+                || !fields[7]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return None;
+            }
+            Some(WireEvent::ReceiverReady {
+                sequence: sequence(fields[3])?,
+                session_id: fields[4].into(),
+                generation: fields[5].into(),
+                action_id: fields[6].into(),
+                digest: fields[7].into(),
+            })
+        }
         "X" if fields.len() == 3 => Some(WireEvent::Closed),
         "U" if fields.len() == 4
             && fields[3].len() <= 64
@@ -410,6 +439,7 @@ fn parse_valid_frame(nonce: &str, frame: &[u8]) -> Option<WireEvent> {
                     | "legacy_unobserved_command"
                     | "legacy_history_fidelity"
                     | "legacy_async_command"
+                    | "receiver_failed"
             ) =>
         {
             Some(WireEvent::Gap {

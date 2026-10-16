@@ -173,6 +173,18 @@ impl Terminal {
         self.write(session, &format!("{}\n", binding.transport_command))
             .await;
         self.until(|t| {
+            t.manager
+                .shell_integration()
+                .receiver_ready(session, &action_id)
+        })
+        .await;
+        integration.consume_receiver(session, &action_id).unwrap();
+        let wire =
+            xyz_core::shell_integration::action_wire_frame(session, &action_id, command, &ready)
+                .unwrap();
+        self.write(session, std::str::from_utf8(&wire).unwrap())
+            .await;
+        self.until(|t| {
             t.manager.shell_integration().status().phase == IntegrationPhase::Ready
                 && t.rows(session)
                     .iter()
@@ -295,11 +307,23 @@ async fn legacy_prompt_only_contract(t: &mut Terminal, first: &SessionRef) {
     let third = t.connect().await;
     let integration = t.manager.shell_integration();
     let ready = integration.ready_snapshot(&third).unwrap();
+    let action_id = Uuid::new_v4().to_string();
     let binding = integration
-        .prepare_dispatch(&third, &Uuid::new_v4().to_string(), "sleep 30", &ready)
+        .prepare_dispatch(&third, &action_id, "sleep 30", &ready)
         .unwrap();
     t.write(&third, &format!("{}\n", binding.transport_command))
         .await;
+    t.until(|t| {
+        t.manager
+            .shell_integration()
+            .receiver_ready(&third, &action_id)
+    })
+    .await;
+    integration.consume_receiver(&third, &action_id).unwrap();
+    let wire =
+        xyz_core::shell_integration::action_wire_frame(&third, &action_id, "sleep 30", &ready)
+            .unwrap();
+    t.write(&third, std::str::from_utf8(&wire).unwrap()).await;
     t.until(|t| t.rows(&third).iter().any(|r| r.command == "sleep 30"))
         .await;
     t.disconnect(&third).await;

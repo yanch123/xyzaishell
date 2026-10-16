@@ -25,6 +25,10 @@ pub const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 const INPUT_QUEUE_FRAMES: usize = 16;
 const OUTPUT_WINDOW_BYTES: usize = 256 * 1024;
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+// The remote receiver waits longer, so a late/absent M marker cannot release a
+// body after the receiver could have returned to the interactive shell.
+const RECEIVER_TIMEOUT: Duration = Duration::from_secs(5);
+const RECEIVER_AUTHORITY_POLL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiError {
@@ -39,6 +43,12 @@ impl ApiError {
             safe_message: message.into(),
             retry: "after_user_action".into(),
         }
+    }
+    fn receiver_unknown() -> Self {
+        Self::new(
+            "DELIVERY_UNKNOWN",
+            "Shell 命令接收过程未完成或无法确认，这不代表原命令已执行。自动输入已停止，请检查终端输出并重新连接；不会自动重发。",
+        )
     }
     fn unknown() -> Self {
         Self::new(
@@ -945,10 +955,38 @@ impl SessionManager {
                         }
                         transport_seq += 1;
                         let write = tokio::time::timeout(NETWORK_TIMEOUT, channel.data(&permit.bytes[..])).await;
-                        let success = matches!(write, Ok(Ok(())));
-                        let receipt = if success { Ok(WriteReceipt { transport_seq: transport_seq.to_string(), delivery: "write_accepted".into(), remote_outcome: "unknown".into() }) } else { Err(ApiError::unknown()) };
-                        let _ = reply.send(receipt);
-                        if !success { return Err(ApiError::unknown()); }
+                        if !matches!(write, Ok(Ok(()))) {
+                            let _ = reply.send(Err(ApiError::unknown()));
+                            return Err(ApiError::unknown());
+                        }
+                        if let Some(wire) = &permit.wire {
+                            // The small kickoff contains no command body. Keep
+                            // consuming the same PTY output until its exact M
+                            // marker proves that the bounded, quiet receiver is
+                            // waiting. Do not dequeue human/AI input in between.
+                            let deadline = tokio::time::Instant::now() + RECEIVER_TIMEOUT;
+                            let receiving = self.wait_receiver_ready(
+                                session_ref, &mut channel, output_seq, &permit, deadline,
+                            ).await;
+                            let released = receiving.and_then(|_| self.release_receiver_body(session_ref, &permit, deadline));
+                            if released.is_err() {
+                                // Kickoff delivery is already uncertain. Close
+                                // rather than letting later input enter a stale
+                                // receiver; neither stage is ever retried.
+                                let _ = reply.send(Err(ApiError::receiver_unknown()));
+                                return Err(ApiError::receiver_unknown());
+                            }
+                            let write = tokio::time::timeout_at(deadline, channel.data(&wire[..])).await;
+                            if !matches!(write, Ok(Ok(()))) {
+                                let _ = reply.send(Err(ApiError::receiver_unknown()));
+                                return Err(ApiError::receiver_unknown());
+                            }
+                        }
+                        let _ = reply.send(Ok(WriteReceipt {
+                            transport_seq: transport_seq.to_string(),
+                            delivery: "write_accepted".into(),
+                            remote_outcome: "unknown".into(),
+                        }));
                     }
                     Some(Command::Resize(size)) => {
                         tokio::time::timeout(NETWORK_TIMEOUT, channel.window_change(size.cols, size.rows, 0, 0)).await.map_err(|_| ApiError::new("SSH_RESIZE_FAILED", "Terminal resize timed out."))?.map_err(|_| ApiError::new("SSH_RESIZE_FAILED", "The terminal resize could not be sent."))?;
@@ -966,6 +1004,60 @@ impl SessionManager {
         )
         .await;
         Ok(())
+    }
+    fn release_receiver_body(
+        &self,
+        session: &SessionRef,
+        permit: &crate::execution::DispatchPermit,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ApiError> {
+        let state = self.lock();
+        require_connected(&state, session)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApiError::receiver_unknown());
+        }
+        permit.begin_receiver_body(session, || {
+            self.inner
+                .shell_integration
+                .consume_receiver(session, permit.action_id())
+        })
+    }
+    async fn wait_receiver_ready(
+        &self,
+        session: &SessionRef,
+        channel: &mut russh::Channel<client::Msg>,
+        seq: &mut u64,
+        permit: &crate::execution::DispatchPermit,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ApiError> {
+        // The enclosing timeout also bounds output backpressure while an M
+        // marker is arriving. A cancelled owner must not wait for more output.
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                permit.validate_receiver_body(session)?;
+                require_connected(&self.lock(), session)?;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ApiError::receiver_unknown());
+                }
+                if self
+                    .inner
+                    .shell_integration
+                    .receiver_ready(session, permit.action_id())
+                {
+                    return Ok(());
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(RECEIVER_AUTHORITY_POLL) => {},
+                    message = channel.wait() => {
+                        if !self.handle_channel_message(session, message, seq).await? {
+                            return Err(ApiError::receiver_unknown());
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| ApiError::receiver_unknown())?
     }
     async fn wait_exec_success(
         &self,
@@ -1630,6 +1722,148 @@ mod tests {
             "SSH_KEY_FAILED"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    struct ReceiverFixture {
+        manager: SessionManager,
+        owner: crate::execution::Owner,
+        gate: crate::execution::ExecutionGate,
+        permit: crate::execution::DispatchPermit,
+        binding: crate::shell_integration::DispatchBinding,
+    }
+    impl ReceiverFixture {
+        fn new() -> Self {
+            let (manager, session, _receiver) = connected();
+            let integration = manager.shell_integration();
+            integration.prepare_startup(&session).unwrap();
+            let nonce = integration.status().shell_id.unwrap();
+            integration.ingest(&session, format!("\x1b]777;xyzlog;2;{nonce};H;5.2.37(1)-release\x07\x1b]777;xyzlog;2;{nonce};R;0;123;\x07").as_bytes());
+            let ready = integration.ready_snapshot(&session).unwrap();
+            let owner = crate::execution::Owner {
+                task_id: "receiver-task".into(),
+                run_id: "receiver-run".into(),
+                session,
+            };
+            let gate = crate::execution::ExecutionGate::default();
+            gate.acquire(owner.clone(), true).unwrap();
+            let action = gate.prepare(&owner, "pwd", &ready).unwrap();
+            gate.acknowledge(&owner, &action.action_id, &action.display_revision)
+                .unwrap();
+            let binding = integration
+                .prepare_dispatch(
+                    &owner.session,
+                    &action.action_id,
+                    &action.command_text,
+                    &ready,
+                )
+                .unwrap();
+            let mut permit = gate.queue(&owner).unwrap();
+            let session = owner.session.clone();
+            let validator = integration.clone();
+            let expected = binding.clone();
+            permit.on_validate = Some(Arc::new(move || {
+                validator.validate_dispatch(&session, &expected)
+            }));
+            permit.begin(&owner.session).unwrap();
+            Self {
+                manager,
+                owner,
+                gate,
+                permit,
+                binding,
+            }
+        }
+        fn marker(&self, action_id: &str) {
+            let session = &self.owner.session;
+            let binding = &self.binding;
+            self.manager.shell_integration().ingest(
+                session,
+                format!(
+                    "\x1b]777;xyzlog;3;{};M;{};{};{};{};{}\x07",
+                    binding.shell_id,
+                    binding.sequence,
+                    session.session_id,
+                    session.generation,
+                    action_id,
+                    binding.payload_digest
+                )
+                .as_bytes(),
+            );
+        }
+        fn release(&self) -> Result<(), ApiError> {
+            self.manager.release_receiver_body(
+                &self.owner.session,
+                &self.permit,
+                tokio::time::Instant::now() + RECEIVER_TIMEOUT,
+            )
+        }
+    }
+    #[test]
+    fn ai_body_release_requires_exact_receiver_marker_and_is_single_use() {
+        let fixture = ReceiverFixture::new();
+        assert!(fixture.release().is_err());
+        fixture.marker(fixture.permit.action_id());
+        fixture.release().unwrap();
+        assert_eq!(
+            fixture.manager.shell_integration().status().phase,
+            crate::shell_integration::IntegrationPhase::AwaitingBegin
+        );
+        assert!(fixture.release().is_err());
+        assert!(fixture
+            .manager
+            .shell_integration()
+            .status()
+            .completed
+            .is_none());
+    }
+    #[test]
+    fn ai_body_release_rejects_wrong_receiver_action() {
+        let fixture = ReceiverFixture::new();
+        fixture.marker("wrong-action");
+        assert!(fixture.release().is_err());
+        assert!(fixture
+            .manager
+            .shell_integration()
+            .status()
+            .completed
+            .is_none());
+    }
+    #[test]
+    fn ai_body_release_rechecks_cancellation_after_marker() {
+        let fixture = ReceiverFixture::new();
+        fixture.marker(fixture.permit.action_id());
+        assert!(fixture.gate.cancel(&fixture.owner));
+        assert!(fixture.release().is_err());
+        assert_eq!(
+            fixture.manager.shell_integration().status().phase,
+            crate::shell_integration::IntegrationPhase::Receiving
+        );
+    }
+    #[test]
+    fn ai_body_release_rechecks_deadline_and_physical_session() {
+        let fixture = ReceiverFixture::new();
+        fixture.marker(fixture.permit.action_id());
+        assert!(fixture
+            .manager
+            .release_receiver_body(
+                &fixture.owner.session,
+                &fixture.permit,
+                tokio::time::Instant::now() - Duration::from_millis(1)
+            )
+            .is_err());
+        fixture
+            .manager
+            .lock()
+            .live
+            .as_mut()
+            .unwrap()
+            .session
+            .generation = "2".into();
+        assert!(fixture.release().is_err());
+        assert_eq!(
+            fixture.manager.shell_integration().status().phase,
+            crate::shell_integration::IntegrationPhase::Receiving
+        );
     }
 
     #[tokio::test]

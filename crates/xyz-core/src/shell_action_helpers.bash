@@ -1,6 +1,6 @@
   __xyz_controls_ok() {
    builtin local name kind
-   for name in local return builtin command eval printf trap history shopt declare compgen unset pwd base64 read type if then else fi '[['; do
+   for name in local return builtin command eval printf trap history shopt declare compgen unset pwd base64 stty sha256sum read type if then else fi '[['; do
     kind=$(builtin type -t "$name")
     [[ $kind != alias && $kind != function ]] || builtin return 1
    done
@@ -17,7 +17,7 @@
    h=$(HISTTIMEFORMAT= builtin history 1; builtin printf x)
    h=${h%x}; h=${h%$'\n'}
    if [[ $h =~ ^[\ ]*[0-9]+[\ *][\ ] ]]; then h=${h:${#BASH_REMATCH[0]}}; else builtin return 1; fi
-   [[ $h == 'if [[ ${__xyz_nonce-} == '* ]]
+   [[ $h == 'if __xyz_receive '* ]]
   }
   __xyz_manual_step() { if __xyz_is_envelope; then builtin printf 0; else builtin printf 1; fi; }
   __xyz_action_begin() {
@@ -42,4 +42,47 @@
    __xyz_ai_active=0; __xyz_ended=$__xyz_seq
    __xyz_last_history=$(HISTTIMEFORMAT= builtin history 1; builtin printf x)
    builtin return "$code"
+  }
+  __xyz_restore_tty() {
+   if [[ -n ${__xyz_tty_saved-} ]]; then
+    command stty "$__xyz_tty_saved" < /dev/tty || builtin return 1
+    __xyz_tty_saved=
+   fi
+  }
+  __xyz_receive() {
+   builtin local frame record hex= bit byte i j value header rest actual code LC_ALL=C
+   if [[ $__xyz_failed != 0 || $__xyz_ai_active != 0 || $4 != "$((__xyz_seq+1))" ]] || ! __xyz_intact "$6"; then __xyz_gap; builtin return 1; fi
+   __xyz_receiving=1
+   __xyz_tty_saved=$(command stty -g < /dev/tty) || { __xyz_gap receiver_failed; builtin return 1; }
+   [[ -n $__xyz_tty_saved ]] || { __xyz_gap receiver_failed; builtin return 1; }
+   if ! command stty -echo -icanon min 1 time 0 < /dev/tty; then __xyz_restore_tty; __xyz_gap receiver_failed; builtin return 1; fi
+   builtin printf '\033]777;xyzlog;3;%s;M;%s;%s;%s;%s;%s\007' "$__xyz_nonce" "$4" "$1" "$2" "$3" "$5"
+   IFS= builtin read -r -s -t 15 -n 131072 frame
+   code=$?
+   __xyz_restore_tty || { __xyz_gap receiver_failed; builtin return 1; }
+   if (( code != 0 || ${#frame} < 9 || ${#frame} >= 131072 )) || [[ ${frame:0:1} != '#' || $frame == *[!\ #]* ]]; then __xyz_gap receiver_failed; builtin return 1; fi
+   frame=${frame:1}
+   if (( ${#frame} % 8 != 0 )); then __xyz_gap receiver_failed; builtin return 1; fi
+   # Every possible late/truncated suffix contains only spaces and comment
+   # characters. Decode without eval or command interpolation.
+   j=${#frame}
+   for ((i=0; i<j; i+=8)); do
+    bit=${frame:i:8}; bit=${bit//#/1}; bit=${bit// /0}
+    value=$((2#$bit))
+    if (( value < 32 || value == 127 )); then __xyz_gap receiver_failed; builtin return 1; fi
+    builtin printf -v byte '\\x%02x' "$value"
+    hex+=$byte
+   done
+   builtin printf -v record '%b' "$hex"
+   header="v1|$__xyz_nonce|$1|$2|$3|$4|$5|"
+   [[ $record == "$header"* ]] || { __xyz_gap receiver_failed; builtin return 1; }
+   rest=${record#"$header"}
+   [[ $rest == *'|'* ]] || { __xyz_gap receiver_failed; builtin return 1; }
+   header=${rest%%|*}; __xyz_payload=${rest#*|}
+   if [[ $header != "${#__xyz_payload}" ]] || (( ${#__xyz_payload} == 0 || ${#__xyz_payload} > 8192 )); then __xyz_gap receiver_failed; builtin return 1; fi
+   actual=$(builtin printf '%s' "$__xyz_payload" | command sha256sum) || { __xyz_gap receiver_failed; builtin return 1; }
+   [[ ${actual%% *} == "$5" ]] || { __xyz_gap receiver_failed; builtin return 1; }
+   __xyz_action_begin "$__xyz_nonce" "$1" "$2" "$3" "$4" "$5" "$(__xyz_b64 "$__xyz_payload")" "$6" || builtin return 1
+   __xyz_receiving=0
+   builtin printf '[AI] %s\n' "$__xyz_payload"
   }

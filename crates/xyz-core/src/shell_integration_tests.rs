@@ -52,7 +52,20 @@ impl Fixture {
         self.event("H;5.2.37(1)-release");
         self.event("R;0;123;");
     }
+    fn receiver(&self, sequence: u64, binding: &DispatchBinding) {
+        self.action_event(&format!(
+            "M;{sequence};{};{};{};{}",
+            self.session().session_id,
+            self.session().generation,
+            binding.action_id,
+            binding.payload_digest
+        ));
+        self.service
+            .consume_receiver(self.session(), &binding.action_id)
+            .unwrap();
+    }
     fn action_begin(&self, sequence: u64, binding: &DispatchBinding) {
+        self.receiver(sequence, binding);
         self.action_event(&format!(
             "A;{sequence};123;{};{};{};{};L3RtcA==;{}",
             self.session().session_id,
@@ -521,6 +534,7 @@ fn explicit_action_identity_and_payload_must_match_before_begin() {
             .service
             .prepare_dispatch(f.session(), "action-one", "pwd", &ready)
             .unwrap();
+        f.receiver(1, &binding);
         let mut parts = vec![
             "A".to_owned(),
             "1".into(),
@@ -578,7 +592,12 @@ fn action_transport_encodes_original_bytes_and_has_explicit_bounds() {
     let transport = action_envelope(f.session(), "max-action", &command, &ready).unwrap();
     assert!(transport.len() <= MAX_ACTION_TRANSPORT_BYTES);
     assert!(!transport.contains('\n'));
-    assert!(transport.contains("__xyz_payload=$'\\x78\\x78"));
+    assert!(transport.contains("if __xyz_receive "));
+    let wire = action_wire_frame(f.session(), "max-action", &command, &ready).unwrap();
+    assert!(wire.len() <= MAX_ACTION_TRANSPORT_BYTES);
+    assert!(wire[..wire.len() - 1]
+        .iter()
+        .all(|b| matches!(b, b'#' | b' ')));
     assert!(action_envelope(f.session(), "oversize", &(command + "x"), &ready).is_err());
     for command in ["pwd\nwhoami", "pwd\0", "pwd\r"] {
         assert!(action_envelope(f.session(), "invalid", command, &ready).is_err());
@@ -764,4 +783,73 @@ fn legacy_manual_gap_does_not_disable_later_original_ai_logging() {
         log.status().state,
         crate::shell_log_types::CaptureState::Recording
     );
+}
+
+#[test]
+fn receiver_marker_is_exact_and_single_use_and_never_a_command_completion() {
+    let f = Fixture::new();
+    f.ready();
+    let ready = f.service.ready_snapshot(f.session()).unwrap();
+    let binding = f
+        .service
+        .prepare_dispatch(f.session(), "receiver-owner", "pwd", &ready)
+        .unwrap();
+    assert!(!f.service.receiver_ready(f.session(), &binding.action_id));
+    assert!(f
+        .service
+        .consume_receiver(f.session(), &binding.action_id)
+        .is_err());
+    let marker = format!(
+        "M;1;{};{};{};{}",
+        f.session().session_id,
+        f.session().generation,
+        binding.action_id,
+        binding.payload_digest
+    );
+    f.action_event(&marker);
+    assert!(f.service.receiver_ready(f.session(), &binding.action_id));
+    assert!(f.service.status().completed.is_none());
+    assert!(f
+        .service
+        .consume_receiver(f.session(), "foreign-action")
+        .is_err());
+    f.service
+        .consume_receiver(f.session(), &binding.action_id)
+        .unwrap();
+    assert!(!f.service.receiver_ready(f.session(), &binding.action_id));
+    assert!(f
+        .service
+        .consume_receiver(f.session(), &binding.action_id)
+        .is_err());
+    f.action_event(&marker);
+    assert_eq!(f.service.status().phase, IntegrationPhase::Unknown);
+}
+
+#[test]
+fn receiver_marker_wrong_identity_cannot_release_payload() {
+    for field in [1, 2, 3, 4, 5] {
+        let f = Fixture::new();
+        f.ready();
+        let ready = f.service.ready_snapshot(f.session()).unwrap();
+        let binding = f
+            .service
+            .prepare_dispatch(f.session(), "receiver-owner", "pwd", &ready)
+            .unwrap();
+        let mut parts = [
+            "M".to_owned(),
+            "1".into(),
+            f.session().session_id.clone(),
+            f.session().generation.clone(),
+            binding.action_id.clone(),
+            binding.payload_digest.clone(),
+        ];
+        parts[field] = match field {
+            1 => "2".into(),
+            5 => "f".repeat(64),
+            _ => "wrong".into(),
+        };
+        f.action_event(&parts.join(";"));
+        assert!(!f.service.receiver_ready(f.session(), &binding.action_id));
+        assert_eq!(f.service.status().phase, IntegrationPhase::Unknown);
+    }
 }

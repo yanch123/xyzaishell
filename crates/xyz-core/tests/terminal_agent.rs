@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -33,6 +33,13 @@ use xyz_core::{
     },
     tasks::TaskManager,
 };
+fn receiver_behavior() -> Behavior {
+    Behavior {
+        quiet_receiver: true,
+        ..Behavior::default()
+    }
+}
+type OutputHook = Arc<dyn Fn(&[u8]) + Send + Sync>;
 struct Fixture {
     directory: PathBuf,
     config: ModelConfigManager,
@@ -43,6 +50,7 @@ struct Fixture {
     auto_ack: Arc<AtomicBool>,
     output_seq: Arc<AtomicU64>,
     output_bytes: Arc<AtomicUsize>,
+    output_hook: Arc<Mutex<Option<OutputHook>>>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -61,7 +69,17 @@ impl Fixture {
         let config = ModelConfigManager::from_path(Ok(path));
         let chats = TaskManager::new(config.clone(), Arc::new(|_| true));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let ssh = SessionManager::new(Arc::new(move |e| tx.send(e).is_ok()));
+        let output_hook: Arc<Mutex<Option<OutputHook>>> = Arc::new(Mutex::new(None));
+        let hook = output_hook.clone();
+        let ssh = SessionManager::new(Arc::new(move |e| {
+            if let SshEvent::Output { data_base64, .. } = &e {
+                let callback = hook.lock().unwrap().clone();
+                if let Some(callback) = callback {
+                    callback(&STANDARD.decode(data_base64).unwrap());
+                }
+            }
+            tx.send(e).is_ok()
+        }));
         let s = ssh.clone();
         let auto_ack = Arc::new(AtomicBool::new(true));
         let output_seq = Arc::new(AtomicU64::new(0));
@@ -149,24 +167,152 @@ impl Fixture {
             auto_ack,
             output_seq,
             output_bytes,
+            output_hook,
         }
     }
     fn metadata(&self, body: &str) -> Vec<u8> {
         let nonce = self.ssh.shell_integration().status().shell_id.unwrap();
         format!("\x1b]777;xyzlog;2;{nonce};{body}\x07").into_bytes()
     }
-    fn expected_envelope(&self, action_id: &str, command: &str) -> Vec<u8> {
+    fn ready_binding(&self) -> xyz_core::shell_integration::ReadyBinding {
         let status = self.ssh.shell_integration().status();
-        let ready = xyz_core::shell_integration::ReadyBinding {
+        xyz_core::shell_integration::ReadyBinding {
             shell_id: status.shell_id.unwrap(),
             sequence: status.sequence,
             revision: status.revision,
             shadowed_commands: status.shadowed_commands,
-        };
-        let transport =
-            xyz_core::shell_integration::action_envelope(&self.session, action_id, command, &ready)
-                .unwrap();
+        }
+    }
+    fn expected_envelope(&self, action_id: &str, command: &str) -> Vec<u8> {
+        let transport = xyz_core::shell_integration::action_envelope(
+            &self.session,
+            action_id,
+            command,
+            &self.ready_binding(),
+        )
+        .unwrap();
         format!("{transport}\r").into_bytes()
+    }
+    fn expected_wire(&self, action_id: &str, command: &str) -> Vec<u8> {
+        xyz_core::shell_integration::action_wire_frame(
+            &self.session,
+            action_id,
+            command,
+            &self.ready_binding(),
+        )
+        .unwrap()
+    }
+    fn receiver_marker(&self, action_id: &str, command: &str) -> Vec<u8> {
+        let ready = self.ready_binding();
+        let digest = format!("{:x}", Sha256::digest(command.as_bytes()));
+        format!(
+            "\x1b]777;xyzlog;3;{};M;{};{};{};{action_id};{digest}\x07",
+            ready.shell_id,
+            ready.sequence + 1,
+            self.session.session_id,
+            self.session.generation,
+        )
+        .into_bytes()
+    }
+    async fn wait_for_kickoff(
+        &self,
+        server: &LoopbackServer,
+        preview: &TerminalTaskSnapshot,
+    ) -> usize {
+        let action = preview.action.as_ref().unwrap();
+        let kickoff = self.expected_envelope(&action.action_id, &action.command_text);
+        let trace = server
+            .wait_for("short receiver kickoff", |trace| {
+                trace.input.iter().any(|(_, bytes)| bytes == &kickoff)
+            })
+            .await;
+        let index = trace
+            .input
+            .iter()
+            .position(|(_, bytes)| bytes == &kickoff)
+            .unwrap();
+        assert_eq!(
+            trace.input.len(),
+            index + 1,
+            "no command body may precede receiver-ready"
+        );
+        let status = self.ssh.shell_integration().status();
+        assert_eq!(
+            status.phase,
+            xyz_core::shell_integration::IntegrationPhase::AwaitingReceiver
+        );
+        assert_eq!(
+            status.active_action_id.as_deref(),
+            Some(action.action_id.as_str())
+        );
+        let task = self.agent.get(&preview.task_id).unwrap();
+        assert_eq!(task.phase, "dispatching");
+        assert_eq!(task.remote_outcome, "unknown");
+        assert!(!task.terminal_ready);
+        assert!(!task.action.as_ref().unwrap().command_completed);
+        index
+    }
+    async fn receive_action(
+        &self,
+        server: &LoopbackServer,
+        preview: &TerminalTaskSnapshot,
+    ) -> TerminalTaskSnapshot {
+        let action = preview.action.as_ref().unwrap();
+        let index = self.wait_for_kickoff(server, preview).await;
+        let wire = self.expected_wire(&action.action_id, &action.command_text);
+        server
+            .send_output(self.receiver_marker(&action.action_id, &action.command_text))
+            .await;
+        let trace = server
+            .wait_for("single receiver body", |trace| {
+                trace.input.len() >= index + 2
+            })
+            .await;
+        assert_eq!(
+            trace.input.len(),
+            index + 2,
+            "the receiver body is single-use"
+        );
+        assert_eq!(trace.input[index + 1].1, wire);
+        let decoded = decode_receiver_wire(&trace.input[index + 1].1);
+        let ready = self.ready_binding();
+        assert_eq!(
+            decoded,
+            format!(
+                "v1|{}|{}|{}|{}|{}|{:x}|{}|{}",
+                ready.shell_id,
+                self.session.session_id,
+                self.session.generation,
+                action.action_id,
+                ready.sequence + 1,
+                Sha256::digest(action.command_text.as_bytes()),
+                action.command_text.len(),
+                action.command_text,
+            )
+        );
+        assert_eq!(
+            trace.input[index].0,
+            trace.input[index + 1].0,
+            "both stages use the same visible PTY"
+        );
+        assert_eq!(
+            self.ssh.shell_integration().status().phase,
+            xyz_core::shell_integration::IntegrationPhase::AwaitingBegin
+        );
+        phase(&self.agent, &preview.task_id, "awaiting_completion").await
+    }
+    fn action_records(&self, action_id: &str, command: &str) -> Vec<u8> {
+        let ready = self.ready_binding();
+        let sequence = ready.sequence + 1;
+        let digest = format!("{:x}", Sha256::digest(command.as_bytes()));
+        let identity = format!(
+            "{};{};{action_id};{digest}",
+            self.session.session_id, self.session.generation
+        );
+        format!(
+            "\x1b]777;xyzlog;3;{};A;{sequence};123;{identity};{};{}\x07\x1b]777;xyzlog;3;{};Z;{sequence};124;{identity};0\x07\x1b]777;xyzlog;2;{};R;{sequence};125;\x07",
+            ready.shell_id, STANDARD.encode("/tmp"), STANDARD.encode(command), ready.shell_id, ready.shell_id,
+        ).into_bytes()
     }
     async fn foreground_return(&self, server: &LoopbackServer, command: &str, code: u8) -> u64 {
         let status = self.ssh.shell_integration().status();
@@ -218,6 +364,34 @@ impl Fixture {
         let c = self.chats.create_chat("Terminal test").unwrap();
         self.agent.start(self.request(&c.chat_id)).unwrap()
     }
+}
+fn decode_receiver_wire(wire: &[u8]) -> String {
+    assert_eq!(wire.first(), Some(&b'#'));
+    assert_eq!(wire.last(), Some(&b'\n'));
+    let bits = &wire[1..wire.len() - 1];
+    let (bytes, remainder) = bits.as_chunks::<8>();
+    assert!(remainder.is_empty());
+    assert!(bits.iter().all(|byte| matches!(byte, b'#' | b' ')));
+    String::from_utf8(
+        bytes
+            .iter()
+            .map(|byte| {
+                byte.iter()
+                    .fold(0, |value, bit| (value << 1) | u8::from(*bit == b'#'))
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+fn expected_transport_digest(kickoff: &[u8], wire: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"xyz-action-transport-v2\0");
+    digest.update((kickoff.len() as u64).to_be_bytes());
+    digest.update(kickoff);
+    digest.update([1]);
+    digest.update((wire.len() as u64).to_be_bytes());
+    digest.update(wire);
+    format!("{:x}", digest.finalize())
 }
 async fn listener() -> (TcpListener, String) {
     let s = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -298,7 +472,7 @@ fn ack(agent: &AgentManager, t: &TerminalTaskSnapshot) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_model_command_waits_for_finished_stream_and_visible_preview_then_same_pty() {
-    let ssh_server = LoopbackServer::start(Behavior::default()).await;
+    let ssh_server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let f = Fixture::new(&ssh_server, &base).await;
     // Historical manual input predates terminal-context consent; do not upload it.
@@ -342,12 +516,12 @@ async fn real_model_command_waits_for_finished_stream_and_visible_preview_then_s
     assert_eq!(prepared.action.as_ref().unwrap().command_text, "pwd");
     assert!(!prepared.action.as_ref().unwrap().displayed);
     ack(&f.agent, &prepared);
-    let sent = phase(&f.agent, &t.task_id, "awaiting_completion").await;
+    let sent = f.receive_action(&ssh_server, &prepared).await;
     assert_eq!(sent.remote_outcome, "unknown");
     assert!(!sent.terminal_ready);
     assert_eq!(sent.action.unwrap().delivery, "write_accepted");
     let trace = ssh_server
-        .wait_for("AI input", |t| t.input.len() == 2)
+        .wait_for("AI input", |t| t.input.len() == 3)
         .await;
     assert_eq!(
         trace.input[1].1,
@@ -390,15 +564,15 @@ async fn real_model_command_waits_for_finished_stream_and_visible_preview_then_s
     assert_eq!(resolved.remote_outcome, "unknown");
     assert_eq!(resolved.phase, "cancelled");
     assert_eq!(
-        trace.input.len(),
-        2,
+        ssh_server.trace().input.len(),
+        3,
         "cancel/readiness must never inject Ctrl+C or Enter"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destructive_command_requires_exact_single_use_approval_and_same_chat_is_reserved() {
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let f = Fixture::new(&server, &base).await;
     tokio::spawn(async move {
@@ -448,9 +622,9 @@ async fn destructive_command_requires_exact_single_use_approval_and_same_chat_is
     assert!(server.trace().input.is_empty());
     f.agent.decide(request()).unwrap();
     assert!(f.agent.decide(request()).is_err());
-    phase(&f.agent, &t.task_id, "awaiting_completion").await;
+    f.receive_action(&server, &t).await;
     let trace = server
-        .wait_for("approved command", |t| !t.input.is_empty())
+        .wait_for("approved command", |t| t.input.len() == 2)
         .await;
     assert_eq!(
         trace.input[0].1,
@@ -470,7 +644,7 @@ async fn malformed_and_unknown_model_calls_never_prepare_or_write() {
         ("send_user_input", r#"{"command_text":"pwd"}"#, "tool_calls"),
         ("terminal_action", r#"{"command_text":"pwd"}"#, "length"),
     ] {
-        let server = LoopbackServer::start(Behavior::default()).await;
+        let server = LoopbackServer::start(receiver_behavior()).await;
         let (http, base) = listener().await;
         let f = Fixture::new(&server, &base).await;
         tokio::spawn(async move {
@@ -488,7 +662,7 @@ async fn malformed_and_unknown_model_calls_never_prepare_or_write() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_ai_cancellation_is_revalidated_after_real_ssh_backpressure() {
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let f = Fixture::new(&server, &base).await;
     tokio::spawn(async move {
@@ -546,11 +720,11 @@ async fn queued_ai_cancellation_is_revalidated_after_real_ssh_backpressure() {
     f.ssh
         .ack_output(&f.session, &f.output_seq.load(Ordering::SeqCst).to_string())
         .unwrap();
-    phase(&f.agent, &second.task_id, "awaiting_completion").await;
+    f.receive_action(&server, &second).await;
     let trace = server
-        .wait_for("second queued action", |t| !t.input.is_empty())
+        .wait_for("second queued action", |t| t.input.len() == 2)
         .await;
-    assert_eq!(trace.input.len(), 1);
+    assert_eq!(trace.input.len(), 2);
     assert_eq!(
         trace.input[0].1,
         f.expected_envelope(&second.action.as_ref().unwrap().action_id, "id")
@@ -571,7 +745,7 @@ async fn queued_ai_cancellation_is_revalidated_after_real_ssh_backpressure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn independent_ready_automatically_continues_with_sanitized_observation() {
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let f = Fixture::new(&server, &base).await;
     let responder = tokio::spawn(async move {
@@ -595,7 +769,7 @@ async fn independent_ready_automatically_continues_with_sanitized_observation() 
     let t = f.start();
     let p = phase(&f.agent, &t.task_id, "awaiting_display").await;
     ack(&f.agent, &p);
-    phase(&f.agent, &t.task_id, "awaiting_completion").await;
+    f.receive_action(&server, &p).await;
     let before = f.output_bytes.load(Ordering::SeqCst);
     let output = format!(
         "\x1b]52;c;HIDDEN-CLIPBOARD\x07visible {} synthetic-model-credential \x1b[31mred\x1b[0m\n",
@@ -610,8 +784,18 @@ async fn independent_ready_automatically_continues_with_sanitized_observation() 
     .await
     .unwrap();
     let sequence = f.foreground_return(&server, "pwd", 0).await;
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    let returned = f.agent.get(&t.task_id).unwrap();
+    let returned = tokio::time::timeout(WAIT, async {
+        loop {
+            let returned = f.agent.get(&t.task_id).unwrap();
+            assert_eq!(returned.phase, "awaiting_completion");
+            if returned.action.as_ref().unwrap().command_completed {
+                break returned;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(returned.phase, "awaiting_completion");
     assert!(returned.action.as_ref().unwrap().command_completed);
     assert!(!returned.terminal_ready);
@@ -631,12 +815,12 @@ async fn independent_ready_automatically_continues_with_sanitized_observation() 
     assert!(body.contains("visible"));
     assert!(body.contains("command_completed"));
     assert!(!body.contains("xyzlog"));
-    assert_eq!(server.trace().input.len(), 1);
+    assert_eq!(server.trace().input.len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconnect_during_model_response_keeps_old_run_secret_redactor() {
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let f = Fixture::new(&server, &base).await;
     let (received_tx, received_rx) = oneshot::channel();
@@ -704,7 +888,7 @@ async fn task_secret_file_value_only_reaches_approved_visible_pty_and_never_mode
         storage::task_credentials::SecretFieldRequest,
         task_secrets::TaskSecrets,
     };
-    let ssh_server = LoopbackServer::start(Behavior::default()).await;
+    let ssh_server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let mut f = Fixture::new(&ssh_server, &base).await;
     let secrets = Arc::new(TaskSecrets::open(&f.directory.join("task-storage")).unwrap());
@@ -809,7 +993,7 @@ async fn edited_secret_after_preview_fails_not_sent_and_releases_the_task() {
         storage::task_credentials::SecretFieldRequest,
         task_secrets::TaskSecrets,
     };
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let mut f = Fixture::new(&server, &base).await;
     let secrets = Arc::new(TaskSecrets::open(&f.directory.join("task-storage")).unwrap());
@@ -896,7 +1080,7 @@ async fn edited_secret_after_preview_fails_not_sent_and_releases_the_task() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multiple_normal_steps_continue_automatically_but_dangerous_step_needs_one_exact_approval()
 {
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let fixture = Fixture::new(&server, &base).await;
     let requests = Arc::new(AtomicUsize::new(0));
@@ -937,7 +1121,7 @@ async fn multiple_normal_steps_continue_automatically_but_dangerous_step_needs_o
         ack(&fixture.agent, &preview);
         if index == 2 {
             let waiting = phase(&fixture.agent, &started.task_id, "waiting_approval").await;
-            assert_eq!(server.trace().input.len(), 2);
+            assert_eq!(server.trace().input.len(), 4);
             assert_eq!(waiting.action.as_ref().unwrap().risk, "dangerous");
             let action = waiting.action.as_ref().unwrap();
             let request = || DecideTerminalAction {
@@ -953,7 +1137,7 @@ async fn multiple_normal_steps_continue_automatically_but_dangerous_step_needs_o
             assert_eq!(preview.action.as_ref().unwrap().risk, "normal");
             assert!(preview.action.as_ref().unwrap().approval_id.is_none());
         }
-        phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+        fixture.receive_action(&server, &preview).await;
         let sequence = fixture.foreground_return(&server, command, 0).await;
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert_eq!(
@@ -975,7 +1159,7 @@ async fn multiple_normal_steps_continue_automatically_but_dangerous_step_needs_o
         .all(|action| action.command_completed && action.exit_code == Some(0)));
     assert_eq!(done.remote_outcome, "foreground_returned");
     assert!(!done.owner);
-    assert_eq!(server.trace().input.len(), 3);
+    assert_eq!(server.trace().input.len(), 6);
     assert_eq!(server.trace().channels.len(), 1);
     assert_eq!(server.trace().exec_requests, 1);
     let request = responder.await.unwrap();
@@ -1001,7 +1185,7 @@ fn terminal_prompt(request: &str) -> serde_json::Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_retains_output_backed_findings_across_rounds_without_granting_completion() {
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let fixture = Fixture::new(&server, &base).await;
     let (updated_tx, updated_rx) = oneshot::channel();
@@ -1111,7 +1295,7 @@ async fn context_retains_output_backed_findings_across_rounds_without_granting_c
         let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
         assert_eq!(preview.action.as_ref().unwrap().command_text, command);
         ack(&fixture.agent, &preview);
-        phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+        fixture.receive_action(&server, &preview).await;
         server.send_output(output.as_bytes().to_vec()).await;
         let sequence = fixture.foreground_return(&server, command, 0).await;
         fixture.shell_ready(&server, sequence).await;
@@ -1128,7 +1312,7 @@ async fn context_retains_output_backed_findings_across_rounds_without_granting_c
     assert!(planning.owner && planning.action.is_none());
     assert_eq!(
         server.trace().input.len(),
-        2,
+        4,
         "context tools cannot write terminal bytes"
     );
     finish_tx.send(()).unwrap();
@@ -1171,7 +1355,7 @@ async fn context_retains_output_backed_findings_across_rounds_without_granting_c
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_context_with_fabricated_evidence_cannot_prepare_even_an_ordinary_command() {
     for tool_name in ["terminal_action", "task_context_update"] {
-        let server = LoopbackServer::start(Behavior::default()).await;
+        let server = LoopbackServer::start(receiver_behavior()).await;
         let (http, base) = listener().await;
         let fixture = Fixture::new(&server, &base).await;
         let responder = tokio::spawn(async move {
@@ -1202,7 +1386,7 @@ async fn model_context_with_fabricated_evidence_cannot_prepare_even_an_ordinary_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_or_stale_end_and_disconnect_pause_without_resending_or_another_model_round() {
     for disconnect in [false, true] {
-        let server = LoopbackServer::start(Behavior::default()).await;
+        let server = LoopbackServer::start(receiver_behavior()).await;
         let (http, base) = listener().await;
         let fixture = Fixture::new(&server, &base).await;
         let requests = Arc::new(AtomicUsize::new(0));
@@ -1226,7 +1410,7 @@ async fn missing_or_stale_end_and_disconnect_pause_without_resending_or_another_
         let started = fixture.start();
         let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
         ack(&fixture.agent, &preview);
-        phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+        fixture.receive_action(&server, &preview).await;
         if disconnect {
             fixture.ssh.disconnect(&fixture.session).unwrap();
         } else {
@@ -1244,14 +1428,14 @@ async fn missing_or_stale_end_and_disconnect_pause_without_resending_or_another_
         assert!(paused.error.is_some());
         responder.await.unwrap();
         assert_eq!(requests.load(Ordering::SeqCst), 1);
-        assert_eq!(server.trace().input.len(), 1);
+        assert_eq!(server.trace().input.len(), 2);
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn planning_round_cap_is_explicit_and_preserves_final_command_output_without_retry() {
     for final_command in [false, true] {
-        let server = LoopbackServer::start(Behavior::default()).await;
+        let server = LoopbackServer::start(receiver_behavior()).await;
         let (http, base) = listener().await;
         let fixture = Fixture::new(&server, &base).await;
         let requests = Arc::new(AtomicUsize::new(0));
@@ -1288,7 +1472,7 @@ async fn planning_round_cap_is_explicit_and_preserves_final_command_output_witho
             let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
             assert_eq!(preview.round, 16);
             ack(&fixture.agent, &preview);
-            phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+            fixture.receive_action(&server, &preview).await;
             server
                 .send_output(b"unique-final-round-output\n".to_vec())
                 .await;
@@ -1372,7 +1556,7 @@ async fn planning_round_cap_is_explicit_and_preserves_final_command_output_witho
         assert!(request.contains("Still planning; success is unverified."));
         assert_eq!(
             server.trace().input.len(),
-            usize::from(final_command),
+            2 * usize::from(final_command),
             "continue must not replay completed actions"
         );
     }
@@ -1381,7 +1565,7 @@ async fn planning_round_cap_is_explicit_and_preserves_final_command_output_witho
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_ready_greeting_and_followup_keep_conversation_without_terminal_input() {
     use xyz_core::agent::{ConversationScopeConsent, ConversationTurn};
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let fixture = Fixture::new(&server, &base).await;
     let chat = fixture.chats.create_chat("Unified conversation").unwrap();
@@ -1472,7 +1656,7 @@ async fn unified_ready_greeting_and_followup_keep_conversation_without_terminal_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_unready_session_answers_as_chat_without_tools_or_queued_input() {
     use xyz_core::agent::{ConversationScopeConsent, ConversationTurn};
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let fixture = Fixture::new(&server, &base).await;
     // A foreground interactive startup/read has no verified ready boundary.
@@ -1618,7 +1802,7 @@ async fn unified_scope_reuses_same_target_only_with_fresh_session_and_blocks_oth
         );
         session
     }
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let fixture = Fixture::new(&server, &base).await;
     let chat = fixture
@@ -1704,7 +1888,7 @@ async fn unified_scope_reuses_same_target_only_with_fresh_session_and_blocks_oth
     phase(&fixture.agent, &task.task_id, "completed").await;
     assert!(server.trace().input.is_empty());
 
-    let other = LoopbackServer::start(Behavior::default()).await;
+    let other = LoopbackServer::start(receiver_behavior()).await;
     let other_session = reconnect(&fixture, &other).await;
     assert_eq!(
         fixture
@@ -1750,7 +1934,7 @@ async fn unified_scope_reuses_same_target_only_with_fresh_session_and_blocks_oth
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_other_chat_can_talk_while_ready_owner_waits_for_approval_without_replay() {
     use xyz_core::agent::{ConversationScopeConsent, ConversationTurn};
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let fixture = Fixture::new(&server, &base).await;
     let first = fixture.chats.create_chat("Terminal owner").unwrap();
@@ -1899,7 +2083,7 @@ async fn unknown_program_and_ast_write_require_exact_single_use_envelope_approva
         "/opt/xyz-fixture/check-health --summary",
         "printf '%s' synthetic > /tmp/xyz-fixture-output",
     ] {
-        let server = LoopbackServer::start(Behavior::default()).await;
+        let server = LoopbackServer::start(receiver_behavior()).await;
         let (http, base) = listener().await;
         let fixture = Fixture::new(&server, &base).await;
         tokio::spawn(async move {
@@ -1936,11 +2120,11 @@ async fn unknown_program_and_ast_write_require_exact_single_use_envelope_approva
         };
         fixture.agent.decide(approve()).unwrap();
         assert!(fixture.agent.decide(approve()).is_err());
-        phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+        fixture.receive_action(&server, &preview).await;
         let trace = server
-            .wait_for("approved original payload", |trace| !trace.input.is_empty())
+            .wait_for("approved original payload", |trace| trace.input.len() == 2)
             .await;
-        assert_eq!(trace.input.len(), 1);
+        assert_eq!(trace.input.len(), 2);
         assert_eq!(trace.channels.len(), 1);
         assert_eq!(trace.exec_requests, 1);
         assert_eq!(trace.input[0].0, trace.channels[0]);
@@ -1950,7 +2134,7 @@ async fn unknown_program_and_ast_write_require_exact_single_use_envelope_approva
         );
         assert_eq!(
             action.digest,
-            format!("{:x}", Sha256::digest(&trace.input[0].1))
+            expected_transport_digest(&trace.input[0].1, &trace.input[1].1)
         );
         assert_eq!(
             fixture.agent.get(&started.task_id).unwrap().remote_outcome,
@@ -1961,7 +2145,7 @@ async fn unknown_program_and_ast_write_require_exact_single_use_envelope_approva
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_begin_end_with_matching_text_cannot_complete_explicit_ai_action() {
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let fixture = Fixture::new(&server, &base).await;
     let responder = tokio::spawn(async move {
@@ -1981,7 +2165,7 @@ async fn manual_begin_end_with_matching_text_cannot_complete_explicit_ai_action(
     let started = fixture.start();
     let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
     ack(&fixture.agent, &preview);
-    phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+    fixture.receive_action(&server, &preview).await;
     server
         .send_output(fixture.metadata(&format!(
             "B;1;123;{};{}",
@@ -1995,14 +2179,14 @@ async fn manual_begin_end_with_matching_text_cannot_complete_explicit_ai_action(
     assert!(!stopped.action.as_ref().unwrap().command_completed);
     assert_eq!(stopped.remote_outcome, "unknown");
     assert!(!stopped.terminal_ready);
-    assert_eq!(server.trace().input.len(), 1);
+    assert_eq!(server.trace().input.len(), 2);
     responder.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_output_reads_consume_planning_rounds_without_replaying_ssh() {
     for foreign_scope in [false, true] {
-        let server = LoopbackServer::start(Behavior::default()).await;
+        let server = LoopbackServer::start(receiver_behavior()).await;
         let (http, base) = listener().await;
         let fixture = Fixture::new(&server, &base).await;
         let (args_tx, args_rx) = oneshot::channel::<serde_json::Value>();
@@ -2048,7 +2232,7 @@ async fn model_output_reads_consume_planning_rounds_without_replaying_ssh() {
         let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
         let action_id = preview.action.as_ref().unwrap().action_id.clone();
         ack(&fixture.agent, &preview);
-        phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+        fixture.receive_action(&server, &preview).await;
         server
             .send_output(b"OUTPUT_PAGE_UNIQUE_EVIDENCE\n".to_vec())
             .await;
@@ -2066,7 +2250,7 @@ async fn model_output_reads_consume_planning_rounds_without_replaying_ssh() {
         .await;
         assert_eq!(
             server.trace().input.len(),
-            1,
+            2,
             "reading retained output must never execute another SSH command"
         );
         if let Some(request) = responder.await.unwrap() {
@@ -2083,7 +2267,7 @@ async fn model_output_reads_consume_planning_rounds_without_replaying_ssh() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_budget_renewal_cannot_reset_the_total_response_cap() {
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let fixture = Fixture::new(&server, &base).await;
     let requests = Arc::new(AtomicUsize::new(0));
@@ -2144,7 +2328,7 @@ async fn explicit_budget_renewal_cannot_reset_the_total_response_cap() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replaced_terminal_submission_returns_current_chat_without_replaying_old_run() {
     use xyz_core::agent::{ConversationScopeConsent, ConversationTurn};
-    let server = LoopbackServer::start(Behavior::default()).await;
+    let server = LoopbackServer::start(receiver_behavior()).await;
     let (http, base) = listener().await;
     let fixture = Fixture::new(&server, &base).await;
     let chat = fixture.chats.create_chat("Submission replacement").unwrap();
@@ -2221,4 +2405,342 @@ async fn replaced_terminal_submission_returns_current_chat_without_replaying_old
     );
     assert!(server.trace().input.is_empty());
     assert_eq!(server.trace().exec_requests, 1);
+}
+
+async fn prepare_receiver_action(
+    fixture: &Fixture,
+    http: TcpListener,
+) -> (TerminalTaskSnapshot, tokio::task::JoinHandle<()>) {
+    let responder = tokio::spawn(async move {
+        let (mut socket, _) = http.accept().await.unwrap();
+        read_request(&mut socket).await;
+        reply(
+            &mut socket,
+            &tool_body("terminal_action", r#"{"command_text":"pwd"}"#, "tool_calls"),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), http.accept())
+                .await
+                .is_err(),
+            "unverified receiver lifecycle must not launch another model round"
+        );
+    });
+    let started = fixture.start();
+    let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
+    ack(&fixture.agent, &preview);
+    (preview, responder)
+}
+
+async fn wait_for_dispatch_closed(fixture: &Fixture) {
+    tokio::time::timeout(WAIT, async {
+        while !matches!(
+            fixture.ssh.snapshot().state,
+            SessionState::Disconnected | SessionState::Error
+        ) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+fn assert_unknown_without_completion(
+    fixture: &Fixture,
+    preview: &TerminalTaskSnapshot,
+    phase: &str,
+) {
+    let task = fixture.agent.get(&preview.task_id).unwrap();
+    assert_eq!(task.phase, phase);
+    assert_eq!(task.remote_outcome, "unknown");
+    assert!(!task.terminal_ready);
+    assert!(!task.action.as_ref().unwrap().command_completed);
+    assert!(task.actions.is_empty());
+    assert!(task
+        .task_context
+        .as_ref()
+        .unwrap()
+        .confirmed_facts
+        .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_receiver_nonce_cannot_release_body_before_exact_ready_marker() {
+    let server = LoopbackServer::start(receiver_behavior()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let (preview, responder) = prepare_receiver_action(&fixture, http).await;
+    fixture.wait_for_kickoff(&server, &preview).await;
+    let action = preview.action.as_ref().unwrap();
+    let nonce = fixture.ready_binding().shell_id;
+    let wrong_nonce = if nonce == "00000000000000000000000000000000" {
+        "11111111111111111111111111111111"
+    } else {
+        "00000000000000000000000000000000"
+    };
+    let foreign = String::from_utf8(fixture.receiver_marker(&action.action_id, "pwd"))
+        .unwrap()
+        .replace(&nonce, wrong_nonce)
+        .into_bytes();
+    let observed = Arc::new(AtomicBool::new(false));
+    let signal = observed.clone();
+    let expected = foreign.clone();
+    *fixture.output_hook.lock().unwrap() = Some(Arc::new(move |bytes| {
+        if bytes
+            .windows(expected.len())
+            .any(|window| window == expected)
+        {
+            signal.store(true, Ordering::SeqCst);
+        }
+    }));
+    server.send_output(foreign).await;
+    tokio::time::timeout(WAIT, async {
+        while !observed.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(server.trace().input.len(), 1);
+    assert_unknown_without_completion(&fixture, &preview, "dispatching");
+    fixture.receive_action(&server, &preview).await;
+    assert_eq!(server.trace().input.len(), 2);
+    fixture
+        .agent
+        .cancel(TaskRunRequest {
+            task_id: preview.task_id.clone(),
+            run_id: preview.run_id.clone(),
+        })
+        .unwrap();
+    assert_unknown_without_completion(&fixture, &preview, "cancelled");
+    responder.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mismatched_receiver_identity_cannot_release_body_or_recover_with_late_completion() {
+    for field in ["sequence", "session", "generation", "action", "digest"] {
+        let server = LoopbackServer::start(receiver_behavior()).await;
+        let (http, base) = listener().await;
+        let fixture = Fixture::new(&server, &base).await;
+        let (preview, responder) = prepare_receiver_action(&fixture, http).await;
+        fixture.wait_for_kickoff(&server, &preview).await;
+        let action = preview.action.as_ref().unwrap();
+        let ready = fixture.ready_binding();
+        let sequence = if field == "sequence" {
+            ready.sequence + 2
+        } else {
+            ready.sequence + 1
+        };
+        let session = if field == "session" {
+            "foreign-session"
+        } else {
+            &fixture.session.session_id
+        };
+        let generation = if field == "generation" {
+            "foreign-generation"
+        } else {
+            &fixture.session.generation
+        };
+        let action_id = if field == "action" {
+            "foreign-action"
+        } else {
+            &action.action_id
+        };
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(if field == "digest" { "id" } else { "pwd" }.as_bytes())
+        );
+        let mut frames = format!(
+            "\x1b]777;xyzlog;3;{};M;{sequence};{session};{generation};{action_id};{digest}\x07",
+            ready.shell_id
+        )
+        .into_bytes();
+        frames.extend(fixture.receiver_marker(&action.action_id, "pwd"));
+        frames.extend(fixture.action_records(&action.action_id, "pwd"));
+        server.send_output(frames).await;
+        let paused = phase(&fixture.agent, &preview.task_id, "needs_user").await;
+        assert_eq!(
+            paused.action.as_ref().unwrap().delivery,
+            "unknown",
+            "{field}"
+        );
+        assert_unknown_without_completion(&fixture, &preview, "needs_user");
+        wait_for_dispatch_closed(&fixture).await;
+        assert_eq!(
+            server.trace().input.len(),
+            1,
+            "{field} mismatch released the body"
+        );
+        assert_eq!(
+            server.trace().input[0].1,
+            fixture.expected_envelope(&action.action_id, "pwd")
+        );
+        responder.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_receiver_ready_never_replays_body_or_grants_foreground_completion() {
+    for body_already_sent in [false, true] {
+        let server = LoopbackServer::start(receiver_behavior()).await;
+        let (http, base) = listener().await;
+        let fixture = Fixture::new(&server, &base).await;
+        let (preview, responder) = prepare_receiver_action(&fixture, http).await;
+        if body_already_sent {
+            fixture.receive_action(&server, &preview).await;
+        } else {
+            fixture.wait_for_kickoff(&server, &preview).await;
+        }
+        let action = preview.action.as_ref().unwrap();
+        let mut frames = fixture.receiver_marker(&action.action_id, "pwd");
+        frames.extend(fixture.receiver_marker(&action.action_id, "pwd"));
+        frames.extend(fixture.action_records(&action.action_id, "pwd"));
+        server.send_output(frames).await;
+        let paused = phase(&fixture.agent, &preview.task_id, "needs_user").await;
+        assert!(paused.error.is_some());
+        assert_unknown_without_completion(&fixture, &preview, "needs_user");
+        let writes = if body_already_sent { 2 } else { 1 };
+        assert_eq!(server.trace().input.len(), writes);
+        if body_already_sent {
+            assert_eq!(
+                server.trace().input[1].1,
+                fixture.expected_wire(&action.action_id, "pwd")
+            );
+        } else {
+            wait_for_dispatch_closed(&fixture).await;
+        }
+        responder.await.unwrap();
+        assert_eq!(
+            server.trace().input.len(),
+            writes,
+            "duplicate M released or replayed the command body"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_before_receiver_ready_never_sends_body_or_replays_late_markers() {
+    let server = LoopbackServer::start(receiver_behavior()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let (preview, responder) = prepare_receiver_action(&fixture, http).await;
+    fixture.wait_for_kickoff(&server, &preview).await;
+    let action = preview.action.as_ref().unwrap();
+    let mut late = fixture.receiver_marker(&action.action_id, "pwd");
+    late.extend(fixture.action_records(&action.action_id, "pwd"));
+    fixture
+        .agent
+        .cancel(TaskRunRequest {
+            task_id: preview.task_id.clone(),
+            run_id: preview.run_id.clone(),
+        })
+        .unwrap();
+    // The exact late handshake is visible to the integration while the actor's
+    // authority is already cancelled. Neither it nor forged completion can revive it.
+    fixture
+        .ssh
+        .shell_integration()
+        .ingest(&fixture.session, &late);
+    wait_for_dispatch_closed(&fixture).await;
+    assert_unknown_without_completion(&fixture, &preview, "cancelled");
+    assert_eq!(server.trace().input.len(), 1);
+    assert_eq!(
+        server.trace().input[0].1,
+        fixture.expected_envelope(&action.action_id, "pwd")
+    );
+    responder.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_after_matched_receiver_ready_is_revalidated_before_body_write() {
+    let server = LoopbackServer::start(receiver_behavior()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let (preview, responder) = prepare_receiver_action(&fixture, http).await;
+    fixture.wait_for_kickoff(&server, &preview).await;
+    let action = preview.action.as_ref().unwrap();
+    let marker = fixture.receiver_marker(&action.action_id, "pwd");
+    let seen = Arc::new(AtomicBool::new(false));
+    let cancelled = seen.clone();
+    let integration = fixture.ssh.shell_integration();
+    let agent = fixture.agent.clone();
+    let request = TaskRunRequest {
+        task_id: preview.task_id.clone(),
+        run_id: preview.run_id.clone(),
+    };
+    let expected = marker.clone();
+    *fixture.output_hook.lock().unwrap() = Some(Arc::new(move |bytes| {
+        if bytes
+            .windows(expected.len())
+            .any(|window| window == expected)
+        {
+            // This callback is synchronous after M ingestion and before the
+            // sole writer can consume its authority or write the body.
+            assert_eq!(
+                integration.status().phase,
+                xyz_core::shell_integration::IntegrationPhase::Receiving
+            );
+            let stopped = agent
+                .cancel(TaskRunRequest {
+                    task_id: request.task_id.clone(),
+                    run_id: request.run_id.clone(),
+                })
+                .unwrap();
+            assert_eq!(stopped.phase, "cancelled");
+            cancelled.store(true, Ordering::SeqCst);
+        }
+    }));
+    server.send_output(marker).await;
+    wait_for_dispatch_closed(&fixture).await;
+    assert!(
+        seen.load(Ordering::SeqCst),
+        "cancellation must occur after a verified M"
+    );
+    assert_unknown_without_completion(&fixture, &preview, "cancelled");
+    assert_eq!(
+        server.trace().input.len(),
+        1,
+        "cancelled receiver still released command bytes"
+    );
+    let mut late = fixture.receiver_marker(&action.action_id, "pwd");
+    late.extend(fixture.action_records(&action.action_id, "pwd"));
+    fixture
+        .ssh
+        .shell_integration()
+        .ingest(&fixture.session, &late);
+    assert_unknown_without_completion(&fixture, &preview, "cancelled");
+    assert_eq!(
+        server.trace().input.len(),
+        1,
+        "late M must never replay cancelled body"
+    );
+    responder.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_receiver_ready_times_out_without_body_or_automatic_retry() {
+    let server = LoopbackServer::start(receiver_behavior()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let (preview, responder) = prepare_receiver_action(&fixture, http).await;
+    fixture.wait_for_kickoff(&server, &preview).await;
+    let paused = phase(&fixture.agent, &preview.task_id, "needs_user").await;
+    assert_eq!(paused.action.as_ref().unwrap().delivery, "unknown");
+    assert_unknown_without_completion(&fixture, &preview, "needs_user");
+    wait_for_dispatch_closed(&fixture).await;
+    assert_eq!(server.trace().input.len(), 1);
+    let action = preview.action.as_ref().unwrap();
+    let mut late = fixture.receiver_marker(&action.action_id, "pwd");
+    late.extend(fixture.action_records(&action.action_id, "pwd"));
+    fixture
+        .ssh
+        .shell_integration()
+        .ingest(&fixture.session, &late);
+    assert_unknown_without_completion(&fixture, &preview, "needs_user");
+    responder.await.unwrap();
+    assert_eq!(
+        server.trace().input.len(),
+        1,
+        "receiver timeout must never replay either stage"
+    );
 }

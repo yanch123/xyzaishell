@@ -3,7 +3,7 @@ import type { IntegrationPhase } from '../lib/integrationBridge';
 import { sameSession } from '../lib/types';
 import type { SessionSnapshot } from '../lib/types';
 import { NonModalPanel } from './NonModalPanel';
-export const INTEGRATION_LABELS: Record<IntegrationPhase, string> = { unintegrated: '仅手动 · 尚无 Shell 就绪证据', installing: '自动准备中', awaiting_ready: '自动准备 · 等待 Shell 就绪', ready: '可执行 · Shell 已就绪', awaiting_begin: '等待命令开始', running: '前台命令运行中', unknown: '仅手动 · 状态未知，需核对', unsupported: '仅手动 · 当前环境不受支持', disconnected: '命令识别已断开' };
+export const INTEGRATION_LABELS: Record<IntegrationPhase, string> = { unintegrated: '仅手动 · 尚无 Shell 就绪证据', installing: '自动准备中', awaiting_ready: '自动准备 · 等待 Shell 就绪', ready: '可执行 · Shell 已就绪', awaiting_receiver: '正在准备发送命令', receiving: '正在发送命令', awaiting_begin: '等待命令开始', running: '前台命令运行中', unknown: '仅手动 · 状态未知，需核对', unsupported: '仅手动 · 当前环境不受支持', disconnected: '命令识别已断开' };
 export function IntegrationPanel({ integration, snapshot, onClose }: { integration: ShellIntegrationController; snapshot: SessionSnapshot; onClose: () => void }) {
   const phase = integration.status?.phase;
   return <NonModalPanel title="命令状态识别" eyebrow="仅在本次连接生效 · 手动终端始终可用" onClose={onClose} className="help-panel">

@@ -188,6 +188,17 @@ describe('log startup requires independent command recognition', () => {
     expect((screen.getByRole('button',{name:'启动终端日志'}) as HTMLButtonElement).disabled).toBe(true);
     expect(shellLogBridge.start).not.toHaveBeenCalled();
   });
+  it.each(['awaiting_receiver', 'receiving'] as const)('does not start a competing log command during %s', async phase => {
+    const view = render(<ShellLogDialog native snapshot={snapshot} integration={{ ...integration, phase }} onClose={vi.fn()} />);
+    await screen.findByText(/请等待自动准备完成/);
+    expect((screen.getByRole('checkbox') as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '启动终端日志' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: '启动终端日志' }));
+    expect(shellLogBridge.start).not.toHaveBeenCalled();
+    view.rerender(<ShellLogDialog native snapshot={snapshot} integration={integration} onClose={vi.fn()} />);
+    expect((screen.getByRole('checkbox') as HTMLInputElement).disabled).toBe(false);
+    expect(shellLogBridge.start).not.toHaveBeenCalled();
+  });
   it('a native readiness preflight rejection clears consent without latching an uncertain write or retrying', async () => {
     vi.mocked(shellLogBridge.start).mockRejectedValue({code:'SHELL_NOT_READY',safe_message:'Terminal is no longer ready.'});
     open();await consent();fireEvent.click(screen.getByRole('button',{name:'启动终端日志'}));

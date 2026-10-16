@@ -15,6 +15,7 @@
 5. [使用指南](05-user-guide.md)
 6. [执行封装与 Bash 兼容](06-execution-framing-and-compatibility.md)
 7. [上下文与恢复](07-context-and-recovery.md)
+8. [安静命令传输](08-quiet-command-transport.md)
 
 一个进程一条 SSH／一个可见 PTY、多聊天共享单 AI 写入者、无文件传输、无本机 Shell、无 Skills 的范围不变。主 README 继续只写使用方法。旧版指南保留原版本语义。
 

@@ -1,7 +1,10 @@
 //! Synthetic fixture generator for tests/shell_log_pty.py, not an SSH executor.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("--envelope") {
+    if matches!(
+        args.get(1).map(String::as_str),
+        Some("--envelope" | "--wire")
+    ) {
         let sequence: u64 = args[3].parse().expect("sequence");
         let session = xyz_core::ssh::SessionRef {
             session_id: "fixture-session".into(),
@@ -13,6 +16,18 @@ fn main() {
             revision: 1,
             shadowed_commands: vec![],
         };
+        if args[1] == "--wire" {
+            use std::io::Write;
+            std::io::stdout()
+                .write_all(
+                    &xyz_core::shell_integration::action_wire_frame(
+                        &session, &args[2], &args[4], &ready,
+                    )
+                    .expect("valid wire"),
+                )
+                .unwrap();
+            return;
+        }
         print!(
             "{}",
             xyz_core::shell_integration::action_envelope(&session, &args[2], &args[4], &ready)

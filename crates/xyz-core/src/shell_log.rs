@@ -351,7 +351,7 @@ impl ShellLogService {
         let result = self.shared.update(|s| {
             s.state = CaptureState::Paused;
             s.reason = Some(if c.integration_lost {
-                "Collection paused; shell integration was lost. Reconnect and enable integration before recording again."
+                "Collection paused; shell integration was lost. Reconnect and wait for automatic shell preparation before recording again."
             } else {
                 "Collection paused; protocol metadata remains filtered."
             }.into());
@@ -366,7 +366,7 @@ impl ShellLogService {
         let c = self.capture.lock().unwrap_or_else(|p| p.into_inner());
         let s = self.status();
         if c.integration_lost && s.session.as_ref() == Some(session) {
-            return Err(error("SHELL_LOG_INTEGRATION_LOST", "Shell integration was lost while recording or paused. Reconnect and enable integration before recording again."));
+            return Err(error("SHELL_LOG_INTEGRATION_LOST", "Shell integration was lost while recording or paused. Reconnect and wait for automatic shell preparation before recording again."));
         }
         if !s.enabled
             || s.session.as_ref() != Some(session)
@@ -509,7 +509,7 @@ impl ShellLogService {
         self.finish_active(c, CommandStatus::Unknown, None);
         self.shared.update(|s| {
             if s.state != CaptureState::Paused { s.state = CaptureState::Gap; }
-            s.reason = Some("Shell integration was lost; records may be incomplete. Reconnect and enable integration before recording again.".into());
+            s.reason = Some("Shell integration was lost; records may be incomplete. Reconnect and wait for automatic shell preparation before recording again.".into());
         });
     }
     fn handle_event(&self, c: &mut Capture, event: WireEvent) {
@@ -518,7 +518,8 @@ impl ShellLogService {
             return;
         }
         match event {
-            WireEvent::Ready { .. }
+            WireEvent::ReceiverReady { .. }
+            | WireEvent::Ready { .. }
             | WireEvent::ActionBegin { .. }
             | WireEvent::ActionEnd { .. } => {}
             WireEvent::Unsupported { .. } => {

@@ -373,6 +373,7 @@ async fn server_shell_rejection_is_not_reported_as_connected() {
             accept_pty: true,
             accept_exec: false,
             accept_shell: false,
+            quiet_receiver: false,
         },
         "SSH_SHELL_FAILED",
         true,

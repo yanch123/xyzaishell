@@ -61,6 +61,8 @@ struct Pending {
     stage: Stage,
     secret: Option<SecretInput>,
     transport: Option<Zeroizing<Vec<u8>>>,
+    wire: Option<Zeroizing<Vec<u8>>>,
+    body_started: bool,
 }
 struct Lease {
     owner: Owner,
@@ -85,11 +87,28 @@ pub(crate) struct DispatchPermit {
     action_id: String,
     digest: String,
     pub(crate) bytes: Zeroizing<Vec<u8>>,
+    /// Commands have a second, non-executable wire frame. Secret input remains
+    /// a single-stage dispatch and must never enter the command receiver.
+    pub(crate) wire: Option<Zeroizing<Vec<u8>>>,
     pub(crate) started: Arc<AtomicBool>,
     pub(crate) on_started: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub(crate) on_validate: Option<Arc<dyn Fn() -> Result<(), ApiError> + Send + Sync>>,
     disk_validate: Option<Arc<dyn Fn() -> Result<(), ApiError> + Send + Sync>>,
     disk_validated: AtomicBool,
+}
+/// Bind the stage boundary as well as both exact byte sequences. A concatenated
+/// hash would permit bytes to move between the kickoff and body undetected.
+fn transport_digest(kickoff: &[u8], wire: Option<&[u8]>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"xyz-action-transport-v2\0");
+    digest.update((kickoff.len() as u64).to_be_bytes());
+    digest.update(kickoff);
+    digest.update([u8::from(wire.is_some())]);
+    if let Some(wire) = wire {
+        digest.update((wire.len() as u64).to_be_bytes());
+        digest.update(wire);
+    }
+    format!("{:x}", digest.finalize())
 }
 fn command_kind() -> String {
     "command".into()
@@ -97,7 +116,7 @@ fn command_kind() -> String {
 fn stale() -> ApiError {
     ApiError::new(
         "ACTION_STALE",
-        "This action or run is no longer current. Nothing was sent.",
+        "操作已过期、已停止或终端状态已改变，本次未继续发送。",
     )
 }
 fn lease<'a>(s: &'a mut State, owner: &Owner) -> Result<&'a mut Lease, ApiError> {
@@ -119,12 +138,12 @@ impl ExecutionGate {
             .as_ref()
             .is_some_and(|u| u.session == owner.session)
         {
-            return Err(ApiError::new("TERMINAL_OUTCOME_UNKNOWN", "Inspect the terminal and explicitly confirm readiness on the previous task before another AI write."));
+            return Err(ApiError::new("TERMINAL_OUTCOME_UNKNOWN", "上一次执行结果仍不确定。请查看终端输出，等待 Shell 自动确认就绪；若持续无法恢复，请停止任务并重新连接。"));
         }
         if !readiness {
             return Err(ApiError::new(
                 "TERMINAL_READINESS_REQUIRED",
-                "Confirm that the current terminal is at an empty shell prompt before starting.",
+                "终端尚未自动确认就绪。请等待 Shell 准备完成并查看终端提示；若持续无法恢复，请停止任务并重新连接。",
             ));
         }
         // A new physical PTY cannot inherit uncertainty or approval from an old one.
@@ -159,6 +178,19 @@ impl ExecutionGate {
         };
         let mut bytes = transport.into_bytes();
         bytes.push(b'\r');
+        let wire = assessment
+            .executable
+            .then(|| {
+                crate::shell_integration::action_wire_frame(
+                    &owner.session,
+                    &action_id,
+                    command,
+                    ready,
+                )
+                .map(Zeroizing::new)
+            })
+            .transpose()?;
+        let digest = transport_digest(&bytes, wire.as_ref().map(|body| body.as_slice()));
         let action = PreparedAction {
             kind: "command".into(),
             secret_field: None,
@@ -166,7 +198,7 @@ impl ExecutionGate {
             display_revision: "1".into(),
             command_text: command.into(),
             append_enter: true,
-            digest: format!("{:x}", Sha256::digest(&bytes)),
+            digest,
             policy: if auto {
                 "auto_normal"
             } else if assessment.executable {
@@ -201,6 +233,8 @@ impl ExecutionGate {
             stage: Stage::Prepared,
             secret: None,
             transport: Some(Zeroizing::new(bytes)),
+            wire,
+            body_started: false,
         });
         Ok(action)
     }
@@ -245,6 +279,8 @@ impl ExecutionGate {
             stage: Stage::Prepared,
             secret: Some(secret),
             transport: None,
+            wire: None,
+            body_started: false,
         });
         Ok(action)
     }
@@ -326,6 +362,7 @@ impl ExecutionGate {
             action_id: p.action.action_id.clone(),
             digest: p.action.digest.clone(),
             bytes,
+            wire: p.wire.clone(),
             on_started: None,
             on_validate: None,
             disk_validate: p.secret.as_ref().map(|secret| secret.validate.clone()),
@@ -396,6 +433,7 @@ impl ExecutionGate {
                     && p.stage == Stage::Settled
                     && p.action.delivery == "write_accepted"
                     && p.secret.is_none()
+                    && p.body_started
             })
             .ok_or_else(stale)?;
         let mut action = p.action.clone();
@@ -474,10 +512,11 @@ impl DispatchPermit {
             || p.action.action_id != self.action_id
             || p.action.digest != self.digest
             || (p.secret.is_none()
-                && format!("{:x}", Sha256::digest(&self.bytes[..])) != self.digest)
-            || p.secret
-                .as_ref()
-                .is_some_and(|secret| secret.bytes.as_slice() != self.bytes.as_slice())
+                && transport_digest(&self.bytes, self.wire.as_ref().map(|body| body.as_slice()))
+                    != self.digest)
+            || p.secret.as_ref().is_some_and(|secret| {
+                secret.bytes.as_slice() != self.bytes.as_slice() || self.wire.is_some()
+            })
             || (p.action.approval_id.is_some() && !p.approved)
         {
             return Err(stale());
@@ -496,6 +535,57 @@ impl DispatchPermit {
         l.ready = false;
         s.uncertain = Some(self.owner.clone());
         self.started.store(true, Ordering::Release);
+        Ok(())
+    }
+    pub(crate) fn action_id(&self) -> &str {
+        &self.action_id
+    }
+    /// While waiting for the remote receiver, cancellation, expiry and owner
+    /// changes still revoke the second stage. The already-sent kickoff remains
+    /// uncertain and never authorizes replay or a manual readiness override.
+    pub(crate) fn validate_receiver_body(
+        &self,
+        actual_session: &SessionRef,
+    ) -> Result<(), ApiError> {
+        let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.receiver_pending(&mut state, actual_session)
+            .map(|_| ())
+    }
+    fn receiver_pending<'a>(
+        &self,
+        state: &'a mut State,
+        actual_session: &SessionRef,
+    ) -> Result<&'a mut Pending, ApiError> {
+        let lease = lease(state, &self.owner)?;
+        let pending = lease.pending.as_mut().ok_or_else(stale)?;
+        if actual_session != &self.owner.session
+            || lease.cancelled
+            || pending.stage != Stage::Started
+            || pending.body_started
+            || pending.secret.is_some()
+            || self.wire.is_none()
+            || Instant::now() >= pending.deadline
+            || pending.action.action_id != self.action_id
+            || pending.action.digest != self.digest
+            || transport_digest(&self.bytes, self.wire.as_ref().map(|body| body.as_slice()))
+                != self.digest
+        {
+            return Err(stale());
+        }
+        Ok(pending)
+    }
+    /// The actor invokes the exact receiver-correlation check under the same
+    /// authority lock as the final cancellation check, then consumes this stage
+    /// once. This never runs the initial on_validate hook a second time.
+    pub(crate) fn begin_receiver_body(
+        &self,
+        actual_session: &SessionRef,
+        consume_receiver: impl FnOnce() -> Result<(), ApiError>,
+    ) -> Result<(), ApiError> {
+        let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = self.receiver_pending(&mut state, actual_session)?;
+        consume_receiver()?;
+        pending.body_started = true;
         Ok(())
     }
     /// Called only after the SSH-state and execution locks have been released.
@@ -687,6 +777,9 @@ mod tests {
         let permit = gate.queue(&owner).unwrap();
         permit.begin(&owner.session).unwrap();
         assert!(gate.complete_ready(&owner, &action.action_id, 0).is_err());
+        permit
+            .begin_receiver_body(&owner.session, || Ok(()))
+            .unwrap();
         gate.settle(&owner, "write_accepted");
         assert!(gate.complete_ready(&owner, "stale-action", 0).is_err());
         let completed = gate.complete_ready(&owner, &action.action_id, 7).unwrap();
@@ -786,13 +879,170 @@ mod tests {
             .unwrap()
         );
         assert_eq!(permit.bytes.as_slice(), expected.as_bytes());
+        let wire = crate::shell_integration::action_wire_frame(
+            &owner.session,
+            &action.action_id,
+            "printf '%s' 'literal # content'",
+            &ready(),
+        )
+        .unwrap();
+        assert_eq!(permit.wire.as_ref().unwrap().as_slice(), wire.as_slice());
         assert_eq!(
             action.digest,
-            format!("{:x}", Sha256::digest(expected.as_bytes()))
+            transport_digest(expected.as_bytes(), Some(&wire))
         );
+        assert!(!expected.contains("literal # content"));
         permit.bytes[0] = b'x';
         assert!(permit.begin(&owner.session).is_err());
         assert!(!permit.started.load(Ordering::Acquire));
+    }
+    fn queued_normal() -> (ExecutionGate, Owner, DispatchPermit) {
+        let (gate, owner, action) = prepared("pwd");
+        gate.acknowledge(&owner, &action.action_id, "1").unwrap();
+        let permit = gate.queue(&owner).unwrap();
+        (gate, owner, permit)
+    }
+    #[test]
+    fn transport_digest_binds_both_frames_and_the_boundary() {
+        assert_ne!(
+            transport_digest(b"ab", Some(b"c")),
+            transport_digest(b"a", Some(b"bc"))
+        );
+        assert_ne!(
+            transport_digest(b"a", Some(b"")),
+            transport_digest(b"a", None)
+        );
+        let (_, owner, mut permit) = queued_normal();
+        permit.wire.as_mut().unwrap()[0] ^= 1;
+        assert!(permit.begin(&owner.session).is_err());
+        assert!(!permit.started.load(Ordering::Acquire));
+    }
+    #[test]
+    fn receiver_body_needs_started_authority_and_is_consumed_once() {
+        let (_, owner, permit) = queued_normal();
+        let mut called = false;
+        assert!(permit
+            .begin_receiver_body(&owner.session, || {
+                called = true;
+                Ok(())
+            })
+            .is_err());
+        assert!(!called);
+        permit.begin(&owner.session).unwrap();
+        assert!(permit
+            .begin_receiver_body(&owner.session, || Err(stale()))
+            .is_err());
+        permit.validate_receiver_body(&owner.session).unwrap();
+        permit
+            .begin_receiver_body(&owner.session, || Ok(()))
+            .unwrap();
+        assert!(permit.validate_receiver_body(&owner.session).is_err());
+        assert!(permit
+            .begin_receiver_body(&owner.session, || {
+                called = true;
+                Ok(())
+            })
+            .is_err());
+        assert!(!called);
+        assert!(permit.begin(&owner.session).is_err());
+    }
+    #[test]
+    fn kickoff_receipt_alone_cannot_complete_the_original_command() {
+        let (gate, owner, permit) = queued_normal();
+        permit.begin(&owner.session).unwrap();
+        gate.settle(&owner, "write_accepted");
+        assert!(gate.complete_ready(&owner, permit.action_id(), 0).is_err());
+        assert!(gate.prepare(&owner, "pwd", &ready()).is_err());
+    }
+    #[test]
+    fn cancellation_after_kickoff_revokes_body_and_preserves_uncertainty() {
+        let (gate, owner, permit) = queued_normal();
+        permit.begin(&owner.session).unwrap();
+        assert!(gate.cancel(&owner));
+        assert!(permit.validate_receiver_body(&owner.session).is_err());
+        assert!(permit
+            .begin_receiver_body(&owner.session, || panic!(
+                "cancelled receiver must not be consumed"
+            ))
+            .is_err());
+        gate.settle(&owner, "unknown");
+        assert_eq!(
+            gate.acquire(owner.clone(), true).unwrap_err().code,
+            "TERMINAL_OUTCOME_UNKNOWN"
+        );
+    }
+    #[test]
+    fn expired_or_reconnected_receiver_body_fails_closed() {
+        let (gate, owner, permit) = queued_normal();
+        permit.begin(&owner.session).unwrap();
+        let mut wrong = owner.session.clone();
+        wrong.generation = "2".into();
+        assert!(permit
+            .begin_receiver_body(&wrong, || panic!("stale generation"))
+            .is_err());
+        gate.state
+            .lock()
+            .unwrap()
+            .lease
+            .as_mut()
+            .unwrap()
+            .pending
+            .as_mut()
+            .unwrap()
+            .deadline = Instant::now() - Duration::from_secs(1);
+        assert!(permit
+            .begin_receiver_body(&owner.session, || panic!("expired action"))
+            .is_err());
+    }
+    #[test]
+    fn mutating_either_frame_after_kickoff_revokes_the_body() {
+        for mutate_wire in [false, true] {
+            let (_, owner, mut permit) = queued_normal();
+            permit.begin(&owner.session).unwrap();
+            if mutate_wire {
+                permit.wire.as_mut().unwrap()[0] ^= 1;
+            } else {
+                permit.bytes[0] ^= 1;
+            }
+            assert!(permit
+                .begin_receiver_body(&owner.session, || panic!("changed immutable frame"))
+                .is_err());
+        }
+    }
+    #[tokio::test]
+    async fn secret_input_has_no_second_stage() {
+        let gate = ExecutionGate::default();
+        let owner = owner();
+        gate.acquire(owner.clone(), true).unwrap();
+        let action = gate
+            .prepare_secret(
+                &owner,
+                "password",
+                "fixture",
+                SecretInput {
+                    bytes: Zeroizing::new(b"synthetic\r".to_vec()),
+                    snapshot_id: "revision".into(),
+                    current: Arc::new(|| true),
+                    validate: Arc::new(|| Ok(())),
+                },
+            )
+            .unwrap();
+        gate.acknowledge(&owner, &action.action_id, &action.display_revision)
+            .unwrap();
+        gate.approve(
+            &owner,
+            &action.action_id,
+            action.approval_id.as_ref().unwrap(),
+        )
+        .unwrap();
+        let permit = gate.queue(&owner).unwrap();
+        assert!(permit.wire.is_none());
+        permit.validate_before_begin().await.unwrap();
+        permit.begin(&owner.session).unwrap();
+        assert!(permit
+            .begin_receiver_body(&owner.session, || panic!("secret cannot consume receiver"))
+            .is_err());
+        assert_eq!(permit.bytes.as_slice(), b"synthetic\r");
     }
     #[test]
     fn identical_dangerous_command_needs_fresh_action_approval() {
@@ -805,7 +1055,11 @@ mod tests {
             first.approval_id.as_ref().unwrap(),
         )
         .unwrap();
-        gate.queue(&owner).unwrap().begin(&owner.session).unwrap();
+        let permit = gate.queue(&owner).unwrap();
+        permit.begin(&owner.session).unwrap();
+        permit
+            .begin_receiver_body(&owner.session, || Ok(()))
+            .unwrap();
         gate.settle(&owner, "write_accepted");
         gate.complete_ready(&owner, &first.action_id, 0).unwrap();
         let second = gate

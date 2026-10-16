@@ -42,7 +42,7 @@ else
   if [[ $pc_decl =~ ^declare\ -[^\ ]*[rxAn] || $ps_decl =~ ^declare\ -[^\ ]*[rxanA] ]]; then
    builtin printf '\033]777;xyzlog;2;@NONCE@;U;unsupported_hook_attributes\007'; builtin return
   fi
-  command -v base64 >/dev/null || {
+  command -v base64 >/dev/null && command -v stty >/dev/null && command -v sha256sum >/dev/null || {
    builtin printf '\033]777;xyzlog;2;@NONCE@;U;missing_tools\007'; builtin return
   }
   __xyz_nonce='@NONCE@'
@@ -50,7 +50,7 @@ else
   __xyz_ended=0
   __xyz_empty=
   __xyz_failed=0
-  __xyz_ai_active=0
+  __xyz_ai_active=0; __xyz_receiving=0; __xyz_tty_saved=
   __xyz_original_ps0_set=${PS0+x}
   __xyz_original_ps0=${PS0-}
   __xyz_original_pc_decl=$pc_decl
@@ -62,8 +62,9 @@ else
   __xyz_last_history=$(HISTTIMEFORMAT= builtin history 1; builtin printf x)
   __xyz_b64() { builtin local encoded; encoded=$(builtin printf '%s' "$1" | command base64) || builtin return; builtin printf '%s' "${encoded//$'\n'/}"; }
   __xyz_gap() {
+   if [[ -z ${__xyz_tty_saved-} ]]; then __xyz_receiving=0; fi
    __xyz_failed=1
-   builtin printf '\033]777;xyzlog;2;%s;G;%s;hooks_changed\007' "$__xyz_nonce" "$__xyz_seq"
+   builtin printf '\033]777;xyzlog;2;%s;G;%s;%s\007' "$__xyz_nonce" "$__xyz_seq" "${1:-hooks_changed}"
   }
   __xyz_begin() {
    builtin local LC_ALL=C h cmd cwd now command64 cwd64
@@ -87,6 +88,9 @@ else
   }
   __xyz_end() {
    builtin local code=$? now
+   if [[ -n ${__xyz_tty_saved-} || ${__xyz_receiving-0} != 0 ]]; then
+    __xyz_restore_tty; __xyz_receiving=0; __xyz_gap receiver_failed; builtin return "$code"
+   fi
    if (( __xyz_ai_active == 1 )); then __xyz_action_end "$code"; builtin return "$code"; fi
    if (( __xyz_failed == 0 && __xyz_seq > __xyz_ended )); then
     builtin printf -v now '%(%s)T' -1
@@ -146,7 +150,7 @@ else
   else
    PROMPT_COMMAND=$'__xyz_end\n'${PROMPT_COMMAND-}$'\n__xyz_ready "$(builtin trap -p)"'
   fi
-  __xyz_helper_names='__xyz_controls_ok __xyz_norm_traps __xyz_is_envelope __xyz_manual_step __xyz_action_begin __xyz_action_end __xyz_b64 __xyz_gap __xyz_begin __xyz_end __xyz_intact __xyz_ready __xyz_uninstall'
+  __xyz_helper_names='__xyz_controls_ok __xyz_norm_traps __xyz_is_envelope __xyz_manual_step __xyz_action_begin __xyz_action_end __xyz_restore_tty __xyz_receive __xyz_b64 __xyz_gap __xyz_begin __xyz_end __xyz_intact __xyz_ready __xyz_uninstall'
   __xyz_owned_helpers=$(builtin declare -f $__xyz_helper_names)
   __xyz_owned_pc_decl=$(builtin declare -p PROMPT_COMMAND)
   builtin printf '\033]777;xyzlog;2;%s;H;%s\007' "$__xyz_nonce" "$BASH_VERSION"

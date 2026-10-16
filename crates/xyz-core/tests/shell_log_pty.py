@@ -15,6 +15,7 @@ import shlex
 import sys
 import os
 import tempfile
+import termios
 import pexpect
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -326,7 +327,7 @@ class CurrentShellContract(unittest.TestCase):
 
 
 class ControlledStartupContract(unittest.TestCase):
-    def launch(self, rc='', account_shell=BASH):
+    def launch(self, rc='', account_shell=BASH, echo=False):
         home = tempfile.TemporaryDirectory(prefix='xyz-startup-')
         self.addCleanup(home.cleanup)
         path = pathlib.Path(home.name)
@@ -336,7 +337,7 @@ class ControlledStartupContract(unittest.TestCase):
         before = (path / '.bashrc').read_bytes()
         process = pexpect.spawn('/bin/sh', ['-c', STARTUP],
             env=dict(os.environ, HOME=home.name, SHELL=account_shell),
-            encoding=None, timeout=5, echo=False)
+            encoding=None, timeout=5, echo=echo)
         self.addCleanup(process.close, force=True)
         return process, path, before
 
@@ -453,22 +454,50 @@ def envelope(action_id, sequence, command):
     ], cwd=ROOT)
 
 
+def wire(action_id, sequence, command):
+    return subprocess.check_output([
+        'cargo', 'run', '-p', 'xyz-core', '--locked', '--quiet', '--example',
+        'shell_log_bootstrap', '--', '--wire', action_id, str(sequence), command,
+    ], cwd=ROOT)
+
+
+RECEIVER_FRAME = re.compile(rb'\x1b\]777;xyzlog;3;' + NONCE.encode() + rb';M;[^\x07]*\x07')
+
+
 class ExplicitActionEnvelopeContract(unittest.TestCase):
     launch = ControlledStartupContract.launch
 
-    def prepared(self, rc=''):
-        process, _, _ = self.launch(rc)
+    def prepared(self, rc='', echo=False):
+        process, _, _ = self.launch(rc, echo=echo)
         process.expect_exact(PROMPT)
         self.assertEqual([f[0] for f in action_frames(process.before)], [b'H', b'R'], process.before)
         return process
 
-    def action(self, process, command, sequence, code=0):
-        action_id = f'fixture-action-{sequence}'
+    def receiver(self, process, action_id, sequence, command):
         transport = envelope(action_id, sequence, command)
         self.assertNotIn(b'\n', transport.rstrip(b'\n'))
+        self.assertLess(len(transport), 1024, 'receiver kickoff must stay short')
         process.sendline(transport.rstrip(b'\n'))
+        process.expect(RECEIVER_FRAME)
+        events = action_frames(process.after)
+        self.assertEqual(events, [[b'M', str(sequence).encode(), b'fixture-session', b'1',
+                                  action_id.encode(), hashlib.sha256(command.encode()).hexdigest().encode()]])
+        return process.before
+
+    def send_action(self, process, action_id, sequence, command):
+        before = self.receiver(process, action_id, sequence, command)
+        payload = wire(action_id, sequence, command)
+        self.assertEqual(set(payload) - {32, 35, 10}, set(), 'late suffix must be shell-comment safe')
+        self.assertEqual(payload.count(b'\n'), 1)
+        self.assertTrue(payload.endswith(b'\n'))
+        process.send(payload)
+        return before
+
+    def action(self, process, command, sequence, code=0):
+        action_id = f'fixture-action-{sequence}'
+        before = self.send_action(process, action_id, sequence, command)
         process.expect_exact(PROMPT)
-        output = process.before
+        output = before + process.before
         events = action_frames(output)
         self.assertEqual([f[0] for f in events], [b'A', b'Z', b'R'], output)
         begin, end, ready = events
@@ -518,7 +547,9 @@ class ExplicitActionEnvelopeContract(unittest.TestCase):
                 self.assertIn(b'beta', output)
                 command = 'false && printf MUST_NOT_RUN || printf FALLBACK; printf LAST'
                 output, _ = self.action(p, command, 3)
-                self.assertNotIn(b'MUST_NOT_RUN', output)
+                # The exact original command is deliberately displayed once.
+                self.assertIn(('[AI] ' + command + '\r\n').encode(), output)
+                self.assertEqual(output.count(b'MUST_NOT_RUN'), 1)
                 self.assertIn(b'FALLBACKLAST', output)
                 p.close(force=True)
 
@@ -538,7 +569,7 @@ class ExplicitActionEnvelopeContract(unittest.TestCase):
         p = self.prepared()
         helper = 'import signal,time; signal.signal(signal.SIGINT, signal.SIG_DFL); print("AI_INTERRUPT_READY", flush=True); time.sleep(30)'
         command = shlex.quote(sys.executable) + ' -c ' + shlex.quote(helper)
-        p.sendline(envelope('fixture-interrupt', 1, command).rstrip(b'\n'))
+        self.send_action(p, 'fixture-interrupt', 1, command)
         p.expect_exact(b'AI_INTERRUPT_READY\r\n')
         start = action_frames(p.before)
         self.assertEqual([f[0] for f in start], [b'A'])
@@ -584,19 +615,21 @@ class ExplicitActionEnvelopeContract(unittest.TestCase):
             sequence = int(events[-1][1]) + 1
 
     def test_maximum_original_payload_survives_real_pty_transport(self):
-        p = self.prepared()
+        p = self.prepared(echo=True)
         prefix = "printf '%s' '"
         literal = 'x' * (8192 - len(prefix.encode()) - 1)
         command = prefix + literal + "'"
         self.assertEqual(len(command.encode()), 8192)
         output, _ = self.action(p, command, 1)
         self.assertIn(literal.encode(), output)
+        self.assertEqual(output.count(command.encode()), 1)
+        self.assertNotIn(wire('fixture-action-1', 1, command).rstrip(b'\n'), output)
 
     def test_ai_parent_death_never_fabricates_end_or_ready(self):
         p = self.prepared()
         helper = 'import os,signal; os.kill(os.getppid(),signal.SIGKILL)'
         command = shlex.quote(sys.executable) + ' -c ' + shlex.quote(helper)
-        p.sendline(envelope('fixture-parent-death', 1, command).rstrip(b'\n'))
+        self.send_action(p, 'fixture-parent-death', 1, command)
         p.expect(pexpect.EOF)
         self.assertEqual([f[0] for f in action_frames(p.before)], [b'A'])
 
@@ -655,6 +688,118 @@ class ExplicitActionEnvelopeContract(unittest.TestCase):
                     p.expect_exact(PROMPT)
                     self.assertEqual(frames(p.before), [[b'U', b'control_conflict']], p.before)
                     self.assertNotIn(b'CONTROL_SHADOW_INVOKED', p.before)
+
+
+class QuietReceiverContract(unittest.TestCase):
+    launch = ControlledStartupContract.launch
+    prepared = ExplicitActionEnvelopeContract.prepared
+    receiver = ExplicitActionEnvelopeContract.receiver
+    send_action = ExplicitActionEnvelopeContract.send_action
+    action = ExplicitActionEnvelopeContract.action
+
+    def assert_failed_without_execution(self, output):
+        events = action_frames(output)
+        self.assertTrue(any(f[0] == b'G' and f[-1] == b'receiver_failed' for f in events), output)
+        self.assertFalse(any(f[0] in [b'A', b'Z', b'R'] for f in events), output)
+        self.assertNotIn(b'PAYLOAD_EXECUTED', output)
+
+    def test_c_locale_ascii_input_and_unicode_quiet_wire_preserve_bytes(self):
+        p = self.prepared('export LC_ALL=C', echo=True)
+        # Raw user input stays ASCII: old Readline's C-locale meta-key behavior
+        # is native shell behavior, not a promise of raw UTF-8 line editing.
+        p.sendline(b'printf "ASCII_OK:%s:" "$LC_ALL"; locale charmap')
+        p.expect_exact(PROMPT)
+        self.assertIn(b'ASCII_OK:C:ANSI_X3.4-1968', p.before)
+        events = action_frames(p.before)
+        self.assertEqual([f[0] for f in events],
+                         [b'B', b'E', b'R'] if HAS_PS0 else [b'G', b'R'])
+        baseline = termios.tcgetattr(p.child_fd)
+        command = "printf '%s' '中文🙂 café'"
+        output, _ = self.action(p, command, int(events[-1][1]) + 1)
+        self.assertIn('中文🙂 café'.encode(), output)
+        self.assertEqual(output.count(command.encode()), 1)
+        self.assertEqual(termios.tcgetattr(p.child_fd), baseline)
+
+    def test_echo_enabled_shows_original_once_and_restores_exact_termios(self):
+        p = self.prepared('stty -ixon -ixoff eof "^F"', echo=True)
+        baseline = termios.tcgetattr(p.child_fd)
+        command = "printf '%s' QUIET_SUCCESS"
+        output, _ = self.action(p, command, 1)
+        self.assertEqual(output.count(command.encode()), 1, output)
+        self.assertEqual(termios.tcgetattr(p.child_fd), baseline)
+        self.assertNotIn(wire('fixture-action-1', 1, command).rstrip(b'\n'), output)
+        self.assertNotIn(b'\\x70\\x72\\x69\\x6e', output)
+        self.assertIn(b'QUIET_SUCCESS', output)
+
+    def test_background_output_is_preserved_while_receiver_waits(self):
+        p = self.prepared('(sleep 1; printf "BACKGROUND_OUTPUT_PRESERVED\\n") &', echo=True)
+        baseline = termios.tcgetattr(p.child_fd)
+        command = 'printf RECEIVER_DONE'
+        prefix = self.receiver(p, 'background-action', 1, command)
+        p.expect_exact(b'BACKGROUND_OUTPUT_PRESERVED\r\n')
+        background = prefix + p.before + p.after
+        p.send(wire('background-action', 1, command))
+        p.expect_exact(PROMPT)
+        self.assertIn(b'BACKGROUND_OUTPUT_PRESERVED', background)
+        self.assertEqual([f[0] for f in action_frames(p.before)], [b'A', b'Z', b'R'])
+        self.assertEqual(termios.tcgetattr(p.child_fd), baseline)
+
+    def test_foreign_wire_never_evaluates_and_restores_termios(self):
+        p = self.prepared(echo=True)
+        baseline = termios.tcgetattr(p.child_fd)
+        command = 'printf PAYLOAD_EXECUTED'
+        self.receiver(p, 'expected-action', 1, command)
+        p.send(wire('foreign-action', 1, command))
+        p.expect_exact(PROMPT)
+        self.assert_failed_without_execution(p.before)
+        self.assertEqual(termios.tcgetattr(p.child_fd), baseline)
+
+    def test_timeout_then_late_complete_frame_is_harmless(self):
+        p = self.prepared(echo=True)
+        baseline = termios.tcgetattr(p.child_fd)
+        command = 'printf PAYLOAD_EXECUTED'
+        self.receiver(p, 'late-action', 1, command)
+        p.expect_exact(PROMPT, timeout=20)
+        self.assert_failed_without_execution(p.before)
+        self.assertEqual(termios.tcgetattr(p.child_fd), baseline)
+        p.send(wire('late-action', 1, command))
+        p.expect_exact(PROMPT)
+        self.assertNotIn(b'PAYLOAD_EXECUTED', p.before)
+        self.assertFalse(any(f[0] in [b'A', b'Z', b'R'] for f in action_frames(p.before)))
+        self.assertEqual(termios.tcgetattr(p.child_fd), baseline)
+
+    def test_partial_timeout_then_late_suffix_is_harmless(self):
+        p = self.prepared(echo=True)
+        baseline = termios.tcgetattr(p.child_fd)
+        command = 'printf PAYLOAD_EXECUTED'
+        payload = wire('partial-timeout', 1, command)
+        self.receiver(p, 'partial-timeout', 1, command)
+        midpoint = len(payload) // 2
+        p.send(payload[:midpoint])
+        p.expect_exact(PROMPT, timeout=20)
+        self.assert_failed_without_execution(p.before)
+        self.assertEqual(termios.tcgetattr(p.child_fd), baseline)
+        p.send(payload[midpoint:])
+        p.expect_exact(PROMPT)
+        self.assertNotIn(b'PAYLOAD_EXECUTED', p.before)
+        self.assertFalse(any(f[0] in [b'A', b'Z', b'R'] for f in action_frames(p.before)))
+
+    def test_ctrl_c_during_partial_receive_restores_modes_and_never_runs_tail(self):
+        p = self.prepared(echo=True)
+        baseline = termios.tcgetattr(p.child_fd)
+        command = 'printf PAYLOAD_EXECUTED'
+        payload = wire('partial-cancel', 1, command)
+        self.receiver(p, 'partial-cancel', 1, command)
+        midpoint = len(payload) // 2
+        p.send(payload[:midpoint])
+        p.sendcontrol('c')
+        p.expect_exact(PROMPT)
+        self.assert_failed_without_execution(p.before)
+        self.assertEqual(termios.tcgetattr(p.child_fd), baseline)
+        p.send(payload[midpoint:])
+        p.expect_exact(PROMPT)
+        self.assertNotIn(b'PAYLOAD_EXECUTED', p.before)
+        self.assertFalse(any(f[0] in [b'A', b'Z', b'R'] for f in action_frames(p.before)))
 
 if __name__ == '__main__':
     if len(BOOTSTRAP.encode()) >= 16384:

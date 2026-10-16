@@ -24,6 +24,17 @@ describe('automatic current-shell preparation',()=>{
     expect(screen.getByText('Startup needs user interaction.')).toBeDefined();
     expect(integrationBridge.install).not.toHaveBeenCalled();
   });
+  it.each([
+    ['awaiting_receiver', '正在准备发送命令'],
+    ['receiving', '正在发送命令'],
+  ] as const)('shows %s as transport progress, never Ready', async (phase, label) => {
+    vi.mocked(integrationBridge.status).mockResolvedValue({ ...status, phase });
+    render(<Harness />);
+    await screen.findByText(label);
+    expect(screen.queryByText('可执行 · Shell 已就绪')).toBeNull();
+    expect(screen.queryByRole('checkbox')).toBeNull();
+    expect(integrationBridge.install).not.toHaveBeenCalled();
+  });
   it('keeps legacy manual tracking capability in details without changing actual readiness', async () => {
     vi.mocked(integrationBridge.status).mockResolvedValue({ ...status, phase: 'ready', manual_tracking: 'prompt_gap_only' });
     render(<Harness />);
