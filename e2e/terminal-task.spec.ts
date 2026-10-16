@@ -47,6 +47,7 @@ test('synthetic unified task: scope consent, painted command, approval and hones
           return structuredClone(config);
         }
         if (cmd === 'submit_conversation_turn') {
+          if (typeof args.submissionId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(args.submissionId)) throw new Error('Missing submission UUID');
           if (!config.consented || args.revision !== config.revision || JSON.stringify(args.session) !== JSON.stringify(session)) throw new Error('Missing scope consent');
           task = { chat_id: chat.chat_id, task_id: chat.task_id, run_id: 'synthetic-run', session, target: { host: 'synthetic-server.invalid', username: 'synthetic-user', port: 22 }, revision: '1', phase: 'awaiting_display', instruction: String(args.text), assistant_text: '<script>window.unsafe = true</script> 合成模型分析，仅验证界面。', action: { action_id: 'synthetic-action-1', display_revision: '1', command_text: 'uname -a', append_enter: true, digest: 'synthetic-binding-1', policy: 'auto_read_only', reason: '合成测试：基础策略允许。', approval_id: null, expires_at_unix_ms: Date.now() + 120000, displayed: false, delivery: 'not_sent' }, actions: [], error: null, owner: true, remote_outcome: 'not_sent', terminal_ready: true, round: 1 };
           task.task_context = { task_id: task.task_id, run_id: task.run_id, session, summary: '合成任务摘要，仅测试界面', confirmed_facts: [], findings: [], hypotheses: [{ id: 'guess-1', text: '尚未核实系统版本', evidence_command_ids: [] }], remaining_steps: [{ id: 'step-1', text: '核查系统版本', status: 'pending', evidence_command_ids: [] }], evidence: [], truncated: false };
@@ -65,7 +66,7 @@ test('synthetic unified task: scope consent, painted command, approval and hones
           if (request?.readiness_confirmed !== true) throw new Error('Missing explicit recovery request');
           task.actions.push(structuredClone(task.action)); task.round = 2; task.terminal_ready = true;
           task.phase = 'awaiting_display'; task.assistant_text = '第二轮合成分析：需要单次授权。';
-          task.action = { ...task.action, action_id: 'synthetic-action-2', command_text: 'touch ./synthetic-marker', digest: 'synthetic-binding-2', policy: 'require_approval', reason: '将修改文件系统，需单次确认。', approval_id: 'synthetic-approval-2', displayed: false, delivery: 'not_sent' };
+          task.action = { ...task.action, action_id: 'synthetic-action-2', command_text: 'rm -rf ./synthetic-marker', digest: 'synthetic-binding-2', policy: 'require_approval', reason: '将递归删除指定路径，需单次确认。', approval_id: 'synthetic-approval-2', displayed: false, delivery: 'not_sent' };
           return update();
         }
         if (cmd === 'decide_terminal_action' && task) {
@@ -112,7 +113,7 @@ test('synthetic unified task: scope consent, painted command, approval and hones
   await expect(card.locator('.action-target')).toBeInViewport({ ratio: 1 });
   await expect(card.getByLabel('准确命令文本')).toBeInViewport({ ratio: 1 });
   await expect(page.getByRole('button', { name: '仅批准这条命令' })).toBeEnabled();
-  await expect(card.getByLabel('准确命令文本')).toHaveText('touch ./synthetic-marker');
+  await expect(card.getByLabel('准确命令文本')).toHaveText('rm -rf ./synthetic-marker');
   await page.screenshot({ path: testInfo.outputPath('synthetic-task-single-approval.png'), fullPage: true });
   const beforeDecision = await page.evaluate(() => (window as unknown as { __SYNTHETIC_TASK_CALLS__: Array<{ cmd: string }> }).__SYNTHETIC_TASK_CALLS__);
   expect(beforeDecision.filter(call => call.cmd === 'decide_terminal_action')).toHaveLength(0);

@@ -188,7 +188,7 @@ export function useTerminalAgent(config: ModelConfigStatus, session: SessionSnap
   };
   const continueTask = async (taskId: string, runId: string) => {
     const task = tasksRef.current[taskId];
-    if (!task || task.run_id !== runId || !connected(task) || (task.phase !== 'needs_user' && task.phase !== 'needs_secrets' && !(task.phase === 'cancelled' && !task.terminal_ready))) return;
+    if (!task || task.run_id !== runId || !connected(task) || (task.phase !== 'needs_user' && task.phase !== 'needs_secrets' && task.phase !== 'budget_paused' && !(task.phase === 'cancelled' && !task.terminal_ready))) return;
     await mutate(taskId, `continue:${runId}:${task.revision}`, 'continuing', () => agentBridge.continue({ task_id: taskId, run_id: runId, readiness_confirmed: true }));
   };
   const prepareSecret = async (taskId: string, runId: string, fieldName: string, purpose: string) => {
@@ -196,10 +196,16 @@ export function useTerminalAgent(config: ModelConfigStatus, session: SessionSnap
     if (!task || task.run_id !== runId || !task.owner || !connected(task) || !['needs_user', 'needs_secrets'].includes(task.phase) || !fieldName || !purpose.trim()) return;
     await mutate(taskId, `secret:${runId}:${task.revision}:${fieldName}`, 'preparing_secret', () => agentBridge.prepareSecret({ task_id: taskId, run_id: runId, field_name: fieldName, purpose: purpose.trim(), prompt_confirmed: true }));
   };
+  const readOutput = async (taskId: string, runId: string, actionId: string, offset: number) => {
+    const task = tasksRef.current[taskId];
+    if (!native || !task || task.run_id !== runId || !connected(task)) throw { code: 'SESSION_STALE', safe_message: '这段输出属于旧连接，无法继续读取。' };
+    if (task.action?.action_id !== actionId && !task.actions.some(action => action.action_id === actionId)) throw { code: 'ACTION_STALE', safe_message: '此命令记录已变化。' };
+    return agentBridge.readOutput({ task_id: taskId, run_id: runId, action_id: actionId, offset, max_bytes: 4096 });
+  };
   const owner = Object.values(tasks).find(task => task.owner) ?? null;
   const unresolved = Object.values(tasks).some(task => task.phase === 'cancelled' && !task.terminal_ready && connected(task));
   const blocked = !!owner || unresolved || Object.keys(pending).length > 0 || Object.keys(uncertain).length > 0;
   const retryLoad = () => { if (native && !ready) setLoadAttempt(value => value + 1); };
-  return { accept, native, ready, tasks, owner, blocked, error, errors, pending, uncertain, drafts, updateDraft, start, acknowledge, decide, cancel, continueTask, prepareSecret, refresh, retryLoad, actionIdentity };
+  return { readOutput, accept, native, ready, tasks, owner, blocked, error, errors, pending, uncertain, drafts, updateDraft, start, acknowledge, decide, cancel, continueTask, prepareSecret, refresh, retryLoad, actionIdentity };
 }
 export type TerminalAgentController = ReturnType<typeof useTerminalAgent>;

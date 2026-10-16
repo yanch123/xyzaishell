@@ -18,6 +18,21 @@ const open = () => render(<ShellLogDialog native snapshot={snapshot} integration
 async function consent() { await waitFor(() => expect((screen.getAllByRole('checkbox')[0] as HTMLInputElement).disabled).toBe(false)); for (const checkbox of screen.getAllByRole('checkbox')) fireEvent.click(checkbox); }
 describe('independent shell log dialog', () => {
   beforeEach(() => { vi.resetAllMocks(); vi.mocked(shellLogBridge.status).mockResolvedValue(status); vi.mocked(shellLogBridge.listen).mockResolvedValue(vi.fn()); vi.mocked(shellLogBridge.query).mockResolvedValue(page); });
+  it('explains legacy manual gaps without claiming logging started or blocking later AI logging', async () => {
+    const legacy = { ...integration, manual_tracking: 'prompt_gap_only' as const };
+    const view = render(<ShellLogDialog native snapshot={snapshot} integration={legacy} onClose={vi.fn()} />);
+    await screen.findByText('记录状态：未启用');
+    expect(screen.getByLabelText('手动命令记录能力').textContent).toContain('启用日志后，AI 执行命令可正常记录');
+    expect(shellLogBridge.start).not.toHaveBeenCalled();
+    expect((screen.getByRole('button', { name: '启动终端日志' }) as HTMLButtonElement).disabled).toBe(true);
+    await consent();
+    expect((screen.getByRole('button', { name: '启动终端日志' }) as HTMLButtonElement).disabled).toBe(false);
+    view.rerender(<ShellLogDialog native snapshot={snapshot} integration={{ ...integration, manual_tracking: 'exact' }} onClose={vi.fn()} />);
+    expect(screen.queryByLabelText('手动命令记录能力')).toBeNull();
+    view.rerender(<ShellLogDialog native snapshot={snapshot} integration={{ ...legacy, session: { session_id: 'old', generation: '1' } }} onClose={vi.fn()} />);
+    expect(screen.queryByLabelText('手动命令记录能力')).toBeNull();
+    expect((screen.getByRole('button', { name: '启动终端日志' }) as HTMLButtonElement).disabled).toBe(true);
+  });
   it('requires verified readiness and explicit plaintext consent while preventing duplicate start clicks', async () => {
     const pending = deferred<ShellLogStatus>(); vi.mocked(shellLogBridge.start).mockReturnValue(pending.promise);
     open(); await consent(); const button = screen.getByRole('button', { name: '启动终端日志' });

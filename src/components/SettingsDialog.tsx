@@ -19,7 +19,7 @@ function testHeading(result: ModelTestResult): string {
   return result.kind === 'task_capability' ? '合成工具调用格式已验证' : '流式聊天测试通过';
 }
 function testBoundary(kind: ModelTestKind): string {
-  return kind === 'task_capability' ? '仅验证固定的合成工具调用格式，不执行工具，不连接 SSH。通过不代表真实任务一定可执行、安全或可靠；每次终端任务仍需单独授权与就绪检查。' : '仅检查流式文字连通性，不验证工具调用或任务执行。';
+  return kind === 'task_capability' ? '仅验证固定的合成工具调用格式，不执行工具，不连接 SSH。通过不代表真实任务一定可执行、安全或可靠；终端执行仍需当前目标授权和可靠就绪状态。' : '仅检查流式文字连通性，不验证工具调用或任务执行。';
 }
 
 function normalizeDestination(value: string): string | null {
@@ -109,11 +109,12 @@ export function SettingsDialog({ onClose, model, onConsent, onHistoryStatus }: {
     </nav>
     {category === 'model' && <div className="settings-model-editor">
       <div className="settings-model-heading"><h3>模型连接</h3><span className={dirty ? 'subtle-badge' : 'feature-badge'}>{!model.native ? '网页预览' : dirty ? '有未保存修改' : config.file_revision ? '已读取保存状态' : '需要重新读取'}</span></div>
-      <p>OpenAI-compatible Chat Completions。保存只写入本机配置；测试只发送下方确认的固定合成数据。</p>
+      <p>填写这三项，保存后即可聊天。</p>
       <fieldset className="model-fields" disabled={!model.native || model.configBusy}>
-        <label className="field">Base URL<input type="url" value={baseUrl} onChange={event => { setBaseUrl(event.target.value); setReuse(false); setPendingTest(null); setMessage(null); }} placeholder="https://api.example.com/v1" autoComplete="off" spellCheck={false} aria-invalid={validation && !normalized} /><span className="field-hint">填写 API 根地址，不包含 /chat/completions。HTTP 仅限在高级文件中明确允许的本机测试。</span>{validation && !normalized && <span className="field-error">请填写有效 HTTPS API 根地址，不含账号、查询参数或片段。</span>}</label>
+        <label className="field">Base URL<input type="url" value={baseUrl} onChange={event => { setBaseUrl(event.target.value); setReuse(false); setPendingTest(null); setMessage(null); }} placeholder="https://api.example.com/v1" autoComplete="off" spellCheck={false} aria-invalid={validation && !normalized} /><span className="field-hint">API 根地址，不包含 /chat/completions。</span>{validation && !normalized && <span className="field-error">请填写有效 HTTPS API 根地址，不含账号、查询参数或片段。</span>}</label>
         <label className="field">API Key<input type="password" value={newKey} onChange={event => { const value = event.target.value; setNewKey(value); setKeyMode(value ? 'replace' : 'keep'); setPendingTest(null); setMessage(null); }} placeholder={baseline.key_present ? '已配置，留空保持不变' : '输入新的 API Key'} autoComplete="new-password" spellCheck={false} disabled={keyMode === 'clear'} aria-invalid={validation && invalidKey} /><span className="field-hint">{keyMode === 'clear' ? '保存后将清除 Key，并禁用模型发送。' : baseline.key_present ? '已有 Key 只保留在本机后端，不会回填。' : 'Key 将以明文保存在受限的本机 model.toml 中。'}</span>{validation && invalidKey && <span className="field-error">请输入非占位 Key，不含首尾空格或控制字符。</span>}</label>
-        <div className="settings-key-actions">{keyMode !== 'keep' && <button type="button" className="button secondary" onClick={() => { setNewKey(''); setKeyMode('keep'); setClearDecision(false); }}>取消{keyMode === 'clear' ? '清除' : '替换'}</button>}{baseline.key_present && keyMode !== 'clear' && <button type="button" className="button secondary" onClick={() => setClearDecision(true)}>清除已保存 Key…</button>}</div>
+        <details className="settings-key-management"><summary>密钥管理</summary><div className="settings-key-actions">{keyMode !== 'keep' && <button type="button" className="button secondary" onClick={() => { setNewKey(''); setKeyMode('keep'); setClearDecision(false); }}>取消{keyMode === 'clear' ? '清除' : '替换'}</button>}{baseline.key_present && keyMode !== 'clear' && <button type="button" className="button secondary" onClick={() => setClearDecision(true)}>清除已保存 Key…</button>}</div>
+        </details>
         {clearDecision && <div className="settings-decision" role="group" aria-label="确认清除 Key"><p>清除这个模型配置的 API Key？保存后不能再发送新模型请求，已启动请求仍使用原快照。</p><button type="button" className="button danger" onClick={() => { setKeyMode('clear'); setNewKey(''); setClearDecision(false); setPendingTest(null); }}>确认清除，保存时生效</button><button type="button" className="button secondary" onClick={() => setClearDecision(false)}>保留 Key</button></div>}
         <label className="field">模型名<input value={modelName} onChange={event => { setModelName(event.target.value); setPendingTest(null); setMessage(null); }} placeholder="精确模型标识" autoComplete="off" spellCheck={false} aria-invalid={validation && invalidModel} />{validation && invalidModel && <span className="field-error">请输入有效模型名，最多 256 字节。</span>}</label>
         {reuseRequired && <label className="check-field model-reuse"><input type="checkbox" checked={reuse} onChange={event => setReuse(event.target.checked)} /><span>将已有 Key 用于这个新目标：{normalized ?? '请先填写有效地址'}。这只允许保存，发送数据仍需另行确认。</span></label>}
@@ -124,11 +125,11 @@ export function SettingsDialog({ onClose, model, onConsent, onHistoryStatus }: {
       {config.error && <div className="inline-error" role="alert">{config.error.safe_message}</div>}
       {model.configWriteBlocked && <div className="inline-error" role="alert">保存结果需要核对。请先重新加载模型配置；不会重复保存或发起测试。</div>}
       {model.error && <div className="inline-error" role="alert">{model.error}</div>}
-      <fieldset className="settings-test-kinds" disabled={model.configBusy || model.configTestBusy}>
+      <details className="settings-advanced-tests"><summary>高级测试选项</summary><fieldset className="settings-test-kinds" disabled={model.configBusy || model.configTestBusy}>
         <legend>选择测试范围</legend>
         {(['chat_connectivity', 'task_capability'] as const).map(kind => <label className="settings-test-kind" key={kind}><input type="radio" name="model-test-kind" value={kind} checked={testKind === kind} onChange={() => { setTestKind(kind); setPendingTest(null); setTestConsent(false); setMessage(null); }} /><span><strong>{TEST_LABELS[kind]}</strong><span>{kind === 'chat_connectivity' ? '发送固定文字，检查能否接收流式回复。' : '发送固定工具声明，检查合成工具调用格式。'}</span></span></label>)}
         <p>{testBoundary(testKind)}</p>
-      </fieldset>
+      </fieldset></details>
       <div className="settings-actions">
         <button type="button" className="button primary" disabled={!canSave} onClick={() => void save()}>{model.configBusy ? '正在保存 / 读取…' : '保存'}</button>
         <button type="button" className="button secondary" disabled={!canSave || model.configTestBusy || keyMode === 'clear'} onClick={() => void save(true)}>保存并测试</button>

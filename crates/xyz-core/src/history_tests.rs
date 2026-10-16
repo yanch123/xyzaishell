@@ -88,6 +88,7 @@ fn terminal(chat: &ChatSnapshot, phase: &str) -> TerminalTaskSnapshot {
         remote_outcome: "unknown".into(),
         terminal_ready: false,
         round: 1,
+        batch_round: 1,
         secret_request: None,
         task_context: None,
     }

@@ -344,11 +344,14 @@ def enable_history(driver, version):
     wait_for(lambda: driver.find(driver.button("停止保存聊天历史")))
 
 
-def configure_candidate_model(driver, server):
+def configure_candidate_model(driver, server, version):
     # The fixture file authorizes loopback HTTP and advanced options only. The
     # synthetic key is entered/saved through the actual candidate UI, not IPC.
     driver.click(driver.button("打开设置"))
     wait_for(lambda: driver.js("return document.querySelector('.settings-modal')?.getAttribute('aria-modal') === 'false'"))
+    if version == TARGET_VERSION:
+        assert driver.js("return !document.querySelector('.settings-advanced-tests').open && !document.querySelector('.settings-key-management').open")
+        assert driver.js("return [...document.querySelectorAll('.settings-modal input')].filter(e=>e.getClientRects().length && e.type !== 'checkbox' && e.type !== 'radio').length === 3")
     save = wait_for(lambda: driver.find(driver.button("保存")))
     wait_for(lambda: driver.command("GET", f"/element/{save}/enabled"))
     assert driver.js("return !document.querySelector('.app-shell').hasAttribute('inert')")
@@ -384,8 +387,27 @@ def assert_literal_reply(driver):
     assert driver.js("return window.unsafe === undefined")
 
 
+def wait_for_chat_idle(driver, version):
+    if version == BASE_VERSION:
+        wait_for(lambda: driver.js("return document.body.textContent.includes('无生成中的聊天')"))
+    else:
+        wait_for(lambda: driver.js("return ![...document.querySelectorAll('button')].some(e=>['停止生成','正在提交…'].includes(e.textContent.trim())) && document.querySelector('textarea[aria-label=\"聊天消息\"]')?.value === ''"))
+
+
+def rendered_task_identity(driver, version):
+    if version == BASE_VERSION:
+        label = driver.js("return document.querySelector('.chat-status span[title]')?.getAttribute('title')")
+        assert isinstance(label, str) and label.startswith("任务 ID: "), "Missing released task identity"
+        return label.removeprefix("任务 ID: ")
+    # This DOM attribute comes from the real backend ChatSnapshot. No injected
+    # IPC or test-only application endpoint is used; default UI stays uncluttered.
+    value = driver.js("return document.querySelector('.conversation-details')?.getAttribute('data-task-id')")
+    assert isinstance(value, str) and value, "Missing rendered candidate task identity"
+    return value
+
+
 def seed(driver, server, version):
-    configure_candidate_model(driver, server)
+    configure_candidate_model(driver, server, version)
     if version == TARGET_VERSION:
         assert driver.js("return ![...document.querySelectorAll('[role=tab]')].some(e=>['文字聊天','执行终端任务'].includes(e.textContent.trim())) && !document.querySelector('textarea[aria-label=\"终端任务指令\"]')")
     driver.click(driver.button("新建 SSH 连接"))
@@ -413,7 +435,7 @@ def seed(driver, server, version):
     driver.click("//label[contains(.,'我确认此地址')]/input")
     driver.click(driver.button("同意并发送"))
     assert_literal_reply(driver)
-    wait_for(lambda: driver.js("return document.body.textContent.includes('无生成中的聊天')"))
+    wait_for_chat_idle(driver, version)
     assert len(server.requests) == 1 and server.invalid_requests == 0
     driver.screenshot("actual-ipc-streamed-chat")
     if version == TARGET_VERSION:
@@ -421,7 +443,7 @@ def seed(driver, server, version):
         driver.click(driver.button("发送"))
         wait_for(lambda: driver.js("return [...document.querySelectorAll('article[aria-label=\"模型回复\"] p')].some(e=>e.textContent === " + json.dumps(FOLLOWUP_REPLY) + ")"))
         assert not driver.command("POST", "/elements", {"using": "xpath", "value": "//*[@role='dialog' and @aria-label='确认模型接收方']"})
-        wait_for(lambda: driver.js("return document.body.textContent.includes('无生成中的聊天')"))
+        wait_for_chat_idle(driver, version)
         assert len(server.requests) == 2 and server.invalid_requests == 0
         assert server.requests[1]["messages"][-1]["content"] == FOLLOWUP
         driver.screenshot("unified-no-ssh-contextual-followup")
@@ -659,7 +681,7 @@ allow_loopback_http = true
                 else:
                     verify_preserved(driver, server, args.application_version, profile_id, message_count)
                 verify_empty_shell_log(driver, history, server, args.application_version)
-                visible_task_identity = driver.js("return document.querySelector('.chat-status span[title]')?.getAttribute('title')")
+                visible_task_identity = rendered_task_identity(driver, args.application_version)
             except BaseException:
                 with contextlib.suppress(Exception):
                     driver.screenshot("failure")
@@ -672,7 +694,7 @@ allow_loopback_http = true
             assert len(server.test_requests) == (1 if phase == "seed" else 0), "Unexpected model configuration test"
             assert server.invalid_requests == 0
             actual = list(stored_identity(history))
-            assert visible_task_identity == f"任务 ID: {actual[1]}", "Visible native task identity differs from persisted history"
+            assert visible_task_identity == actual[1], "Visible native task identity differs from persisted history"
             if identity is None:
                 identity = actual
             assert actual == identity, "Restoration changed the stored task/chat identity"

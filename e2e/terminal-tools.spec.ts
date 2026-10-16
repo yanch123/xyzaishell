@@ -44,7 +44,10 @@ test('synthetic IPC: real terminal search, reviewed attachment and persistent di
     };
   });
   await page.goto('/');
+  await expect(page.locator('.conversation-details')).not.toHaveAttribute('open', '');
+  await page.locator('.conversation-details > summary').click();
   await expect(page.getByLabel('聊天来源')).toContainText('synthetic-terminal');
+  await page.locator('.conversation-details > summary').click();
   await page.evaluate(() => (window as unknown as { __TERMINAL_TOOLS_OUTPUT__: () => void }).__TERMINAL_TOOLS_OUTPUT__());
   await expect.poll(async () => page.evaluate(() => (window as unknown as { __TERMINAL_TOOLS_CALLS__: { cmd: string }[] }).__TERMINAL_TOOLS_CALLS__.some(call => call.cmd === 'ack_terminal_output'))).toBe(true);
   await page.locator('.xterm-helper-textarea').press('Control+Shift+F');

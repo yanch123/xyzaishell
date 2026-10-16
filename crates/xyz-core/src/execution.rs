@@ -60,6 +60,7 @@ struct Pending {
     approved: bool,
     stage: Stage,
     secret: Option<SecretInput>,
+    transport: Option<Zeroizing<Vec<u8>>>,
 }
 struct Lease {
     owner: Owner,
@@ -140,7 +141,7 @@ impl ExecutionGate {
         &self,
         owner: &Owner,
         command: &str,
-        shadowed: &[String],
+        ready: &crate::shell_integration::ReadyBinding,
     ) -> Result<PreparedAction, ApiError> {
         validate_command(command)?;
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -148,11 +149,11 @@ impl ExecutionGate {
         if l.cancelled || !l.ready || l.pending.is_some() {
             return Err(stale());
         }
-        let assessment = classify(command, shadowed);
+        let assessment = classify(command, &ready.shadowed_commands);
         let auto = assessment.risk == Risk::Normal;
         let action_id = Uuid::new_v4().to_string();
         let transport = if assessment.executable {
-            crate::shell_integration::correlated_command(&action_id, command)?
+            crate::shell_integration::action_envelope(&owner.session, &action_id, command, ready)?
         } else {
             command.to_owned()
         };
@@ -183,7 +184,7 @@ impl ExecutionGate {
             blocked: !assessment.executable,
             exit_code: None,
             command_completed: false,
-            reason: assessment.reason.into(),
+            reason: assessment.reason,
             approval_id: (!auto && assessment.executable).then(|| Uuid::new_v4().to_string()),
             expires_at_unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -199,6 +200,7 @@ impl ExecutionGate {
             approved: false,
             stage: Stage::Prepared,
             secret: None,
+            transport: Some(Zeroizing::new(bytes)),
         });
         Ok(action)
     }
@@ -242,6 +244,7 @@ impl ExecutionGate {
             approved: false,
             stage: Stage::Prepared,
             secret: Some(secret),
+            transport: None,
         });
         Ok(action)
     }
@@ -313,15 +316,7 @@ impl ExecutionGate {
             }
             secret.bytes.clone()
         } else {
-            let mut bytes = Zeroizing::new(
-                crate::shell_integration::correlated_command(
-                    &p.action.action_id,
-                    &p.action.command_text,
-                )?
-                .into_bytes(),
-            );
-            bytes.push(b'\r');
-            bytes
+            p.transport.clone().ok_or_else(stale)?
         };
         p.stage = Stage::Queued;
         p.action.delivery = "queued".into();
@@ -534,11 +529,19 @@ mod tests {
             },
         }
     }
+    fn ready() -> crate::shell_integration::ReadyBinding {
+        crate::shell_integration::ReadyBinding {
+            shell_id: "0123456789abcdef0123456789abcdef".into(),
+            sequence: 0,
+            revision: 1,
+            shadowed_commands: vec![],
+        }
+    }
     fn prepared(command: &str) -> (ExecutionGate, Owner, PreparedAction) {
         let g = ExecutionGate::default();
         let o = owner();
         g.acquire(o.clone(), true).unwrap();
-        let a = g.prepare(&o, command, &[]).unwrap();
+        let a = g.prepare(&o, command, &ready()).unwrap();
         (g, o, a)
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -617,9 +620,9 @@ mod tests {
         p.begin(&o.session).unwrap();
         assert!(p.begin(&o.session).is_err());
         g.settle(&o, "write_accepted");
-        assert!(g.prepare(&o, "pwd", &[]).is_err());
+        assert!(g.prepare(&o, "pwd", &ready()).is_err());
         g.confirm_ready(&o).unwrap();
-        assert!(g.prepare(&o, "pwd", &[]).is_ok());
+        assert!(g.prepare(&o, "pwd", &ready()).is_ok());
     }
     #[test]
     fn queued_cancel_is_not_sent_and_unknown_survives_owner_release() {
@@ -629,7 +632,7 @@ mod tests {
         assert!(!g.cancel(&o));
         assert!(p.begin(&o.session).is_err());
         g.acquire(o.clone(), true).unwrap();
-        let a = g.prepare(&o, "pwd", &[]).unwrap();
+        let a = g.prepare(&o, "pwd", &ready()).unwrap();
         g.acknowledge(&o, &a.action_id, "1").unwrap();
         let p = g.queue(&o).unwrap();
         p.begin(&o.session).unwrap();
@@ -690,7 +693,7 @@ mod tests {
         assert!(completed.command_completed);
         assert_eq!(completed.exit_code, Some(7));
         assert!(gate.complete_ready(&owner, &action.action_id, 0).is_err());
-        assert!(gate.prepare(&owner, "pwd", &[]).is_ok());
+        assert!(gate.prepare(&owner, "pwd", &ready()).is_ok());
     }
     #[test]
     fn changed_shell_binding_blocks_before_bytes_and_consumes_no_authority() {
@@ -719,7 +722,7 @@ mod tests {
         let mut second = first.clone();
         second.run_id = "second".into();
         g.acquire(second.clone(), true).unwrap();
-        let a = g.prepare(&second, "pwd", &[]).unwrap();
+        let a = g.prepare(&second, "pwd", &ready()).unwrap();
         g.acknowledge(&second, &a.action_id, "1").unwrap();
         g.queue(&second).unwrap().begin(&second.session).unwrap();
         g.cancel(&second);
@@ -773,8 +776,14 @@ mod tests {
             .unwrap();
         let mut permit = gate.queue(&owner).unwrap();
         let expected = format!(
-            "printf '%s' 'literal # content' # xyz-action:{}\r",
-            action.action_id
+            "{}\r",
+            crate::shell_integration::action_envelope(
+                &owner.session,
+                &action.action_id,
+                "printf '%s' 'literal # content'",
+                &ready()
+            )
+            .unwrap()
         );
         assert_eq!(permit.bytes.as_slice(), expected.as_bytes());
         assert_eq!(
@@ -799,7 +808,9 @@ mod tests {
         gate.queue(&owner).unwrap().begin(&owner.session).unwrap();
         gate.settle(&owner, "write_accepted");
         gate.complete_ready(&owner, &first.action_id, 0).unwrap();
-        let second = gate.prepare(&owner, "rm -f /tmp/fixture", &[]).unwrap();
+        let second = gate
+            .prepare(&owner, "rm -f /tmp/fixture", &ready())
+            .unwrap();
         assert_ne!(first.digest, second.digest);
         assert_ne!(first.approval_id, second.approval_id);
         gate.acknowledge(&owner, &second.action_id, &second.display_revision)

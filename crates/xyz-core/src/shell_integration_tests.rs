@@ -52,6 +52,34 @@ impl Fixture {
         self.event("H;5.2.37(1)-release");
         self.event("R;0;123;");
     }
+    fn action_begin(&self, sequence: u64, binding: &DispatchBinding) {
+        self.action_event(&format!(
+            "A;{sequence};123;{};{};{};{};L3RtcA==;{}",
+            self.session().session_id,
+            self.session().generation,
+            binding.action_id,
+            binding.payload_digest,
+            STANDARD.encode(&binding.command)
+        ));
+    }
+    fn action_end(&self, sequence: u64, binding: &DispatchBinding, code: u8) {
+        self.action_event(&format!(
+            "Z;{sequence};124;{};{};{};{};{code}",
+            self.session().session_id,
+            self.session().generation,
+            binding.action_id,
+            binding.payload_digest
+        ));
+    }
+    fn action_event(&self, body: &str) {
+        assert!(self
+            .service
+            .ingest(
+                self.session(),
+                format!("\x1b]777;xyzlog;3;{};{body}\x07", self.nonce).as_bytes()
+            )
+            .is_empty());
+    }
     fn begin(&self, sequence: u64, command: &str) {
         self.event(&format!(
             "B;{sequence};123;L3RtcA==;{}",
@@ -85,7 +113,7 @@ fn unsupported_reasons_have_specific_safe_diagnostics_and_never_restore_readines
         (
             "unsupported_bash",
             "SHELL_UNSUPPORTED_BASH",
-            "Bash 5.1 或 5.2",
+            "Bash 4.2、5.1 或 5.2",
         ),
         (
             "namespace_conflict",
@@ -139,8 +167,8 @@ fn matched_end_is_not_ready_and_never_approves_another_action() {
         .prepare_dispatch(f.session(), "action-1", "pwd", &ready)
         .unwrap();
     assert!(f.service.validate_dispatch(f.session(), &binding).is_ok());
-    f.begin(1, &binding.transport_command);
-    f.event("E;1;124;7");
+    f.action_begin(1, &binding);
+    f.action_end(1, &binding, 7);
     let status = f.service.status();
     assert_eq!(status.completed.unwrap().exit_code, 7);
     assert_eq!(status.phase, IntegrationPhase::AwaitingReady);
@@ -239,8 +267,8 @@ fn disabled_or_failed_logs_cannot_disable_execution_tracking() {
         .service
         .prepare_dispatch(f.session(), "a", "pwd", &ready)
         .unwrap();
-    f.begin(1, &binding.transport_command);
-    f.event("E;1;124;0");
+    f.action_begin(1, &binding);
+    f.action_end(1, &binding, 0);
     f.event("R;1;125;");
     assert_eq!(f.service.status().phase, IntegrationPhase::Ready);
     assert_eq!(f.service.status().completed.unwrap().action_id, "a");
@@ -264,8 +292,8 @@ fn shared_logger_strips_only_exact_owned_comment_and_pause_is_independent() {
         .service
         .prepare_dispatch(f.session(), "one", "pwd", &ready)
         .unwrap();
-    f.begin(1, &first.transport_command);
-    f.event("E;1;124;0");
+    f.action_begin(1, &first);
+    f.action_end(1, &first, 0);
     f.event("R;1;125;");
     log.flush().unwrap();
     let rows = log
@@ -281,8 +309,8 @@ fn shared_logger_strips_only_exact_owned_comment_and_pause_is_independent() {
         .prepare_dispatch(f.session(), "two", "pwd", &ready)
         .unwrap();
     assert_ne!(first.transport_command, second.transport_command);
-    f.begin(2, &second.transport_command);
-    f.event("E;2;124;0");
+    f.action_begin(2, &second);
+    f.action_end(2, &second, 0);
     f.event("R;2;125;");
     assert_eq!(f.service.status().phase, IntegrationPhase::Ready);
     assert_eq!(
@@ -323,7 +351,7 @@ fn proven_unsent_cancellation_restores_new_ready_revision_but_never_started_inpu
         .service
         .prepare_dispatch(f.session(), "started", "pwd", &now)
         .unwrap();
-    f.begin(1, &binding.transport_command);
+    f.action_begin(1, &binding);
     f.service
         .dispatch_failed(f.session(), "started", "not_sent");
     assert_eq!(f.service.status().phase, IntegrationPhase::Unknown);
@@ -481,4 +509,259 @@ fn startup_timeout_and_explicit_refusal_never_accept_late_ready() {
         assert!(service.ready_snapshot(&session).is_err());
         assert!(service.prepare_startup(&session).is_err());
     }
+}
+
+#[test]
+fn explicit_action_identity_and_payload_must_match_before_begin() {
+    for field in 0..7 {
+        let f = Fixture::new();
+        f.ready();
+        let ready = f.service.ready_snapshot(f.session()).unwrap();
+        let binding = f
+            .service
+            .prepare_dispatch(f.session(), "action-one", "pwd", &ready)
+            .unwrap();
+        let mut parts = vec![
+            "A".to_owned(),
+            "1".into(),
+            "123".into(),
+            f.session().session_id.clone(),
+            f.session().generation.clone(),
+            binding.action_id.clone(),
+            binding.payload_digest.clone(),
+            "L3RtcA==".into(),
+            STANDARD.encode("pwd"),
+        ];
+        let index = [1, 3, 4, 5, 6, 7, 8][field];
+        parts[index] = match index {
+            1 => "2".into(),
+            6 => "a".repeat(64),
+            7 => STANDARD.encode("not-an-absolute-cwd"),
+            8 => STANDARD.encode("whoami"),
+            _ => "wrong".into(),
+        };
+        f.action_event(&parts.join(";"));
+        assert_eq!(
+            f.service.status().phase,
+            IntegrationPhase::Unknown,
+            "field {index}"
+        );
+        assert!(f.service.status().completed.is_none());
+        f.action_end(1, &binding, 0);
+        f.event("R;1;125;");
+        assert_eq!(f.service.status().phase, IntegrationPhase::Unknown);
+    }
+}
+
+#[test]
+fn manual_begin_and_end_cannot_complete_an_explicit_action() {
+    let f = Fixture::new();
+    f.ready();
+    let ready = f.service.ready_snapshot(f.session()).unwrap();
+    let binding = f
+        .service
+        .prepare_dispatch(f.session(), "action-one", "pwd", &ready)
+        .unwrap();
+    f.begin(1, &binding.transport_command);
+    f.event("E;1;124;0");
+    f.event("R;1;125;");
+    assert_eq!(f.service.status().phase, IntegrationPhase::Unknown);
+    assert!(f.service.status().completed.is_none());
+}
+
+#[test]
+fn action_transport_encodes_original_bytes_and_has_explicit_bounds() {
+    let f = Fixture::new();
+    f.ready();
+    let ready = f.service.ready_snapshot(f.session()).unwrap();
+    let command = "x".repeat(8192);
+    let transport = action_envelope(f.session(), "max-action", &command, &ready).unwrap();
+    assert!(transport.len() <= MAX_ACTION_TRANSPORT_BYTES);
+    assert!(!transport.contains('\n'));
+    assert!(transport.contains("__xyz_payload=$'\\x78\\x78"));
+    assert!(action_envelope(f.session(), "oversize", &(command + "x"), &ready).is_err());
+    for command in ["pwd\nwhoami", "pwd\0", "pwd\r"] {
+        assert!(action_envelope(f.session(), "invalid", command, &ready).is_err());
+    }
+}
+
+#[test]
+fn final_visible_bytes_are_observed_before_completion_notifications() {
+    let f = Fixture::new();
+    f.ready();
+    let ready = f.service.ready_snapshot(f.session()).unwrap();
+    let binding = f
+        .service
+        .prepare_dispatch(f.session(), "ordered-output", "pwd", &ready)
+        .unwrap();
+    f.action_begin(1, &binding);
+    let updates = f.service.subscribe();
+    let service = f.service.clone();
+    let session = f.session().clone();
+    let bytes = format!("FINAL_VISIBLE\x1b]777;xyzlog;3;{};Z;1;124;{};{};{};{};0\x07\x1b]777;xyzlog;2;{};R;1;125;\x07", f.nonce, session.session_id, session.generation, binding.action_id, binding.payload_digest, f.nonce).into_bytes();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        service.ingest_with_observer(&session, &bytes, |visible| {
+            assert_eq!(visible, b"FINAL_VISIBLE");
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(updates.borrow().phase, IntegrationPhase::Running);
+    assert!(updates.borrow().completed.is_none());
+    release_tx.send(()).unwrap();
+    assert_eq!(worker.join().unwrap(), b"FINAL_VISIBLE");
+    assert_eq!(updates.borrow().phase, IntegrationPhase::Ready);
+    assert_eq!(updates.borrow().completed.as_ref().unwrap().exit_code, 0);
+}
+
+#[test]
+fn explicit_end_identity_cannot_cross_action_session_or_sequence() {
+    for index in [1, 3, 4, 5, 6] {
+        let f = Fixture::new();
+        f.ready();
+        let ready = f.service.ready_snapshot(f.session()).unwrap();
+        let binding = f
+            .service
+            .prepare_dispatch(f.session(), "end-owner", "pwd", &ready)
+            .unwrap();
+        f.action_begin(1, &binding);
+        let mut parts = [
+            "Z".to_owned(),
+            "1".into(),
+            "124".into(),
+            f.session().session_id.clone(),
+            f.session().generation.clone(),
+            binding.action_id.clone(),
+            binding.payload_digest.clone(),
+            "0".into(),
+        ];
+        parts[index] = match index {
+            1 => "2".into(),
+            6 => "b".repeat(64),
+            _ => "wrong".into(),
+        };
+        f.action_event(&parts.join(";"));
+        f.event("R;1;125;");
+        assert_eq!(f.service.status().phase, IntegrationPhase::Unknown);
+        assert!(f.service.status().completed.is_none());
+    }
+}
+
+#[test]
+fn exact_envelope_echo_is_filtered_across_chunks_without_hiding_other_text() {
+    let f = Fixture::new();
+    f.ready();
+    let ready = f.service.ready_snapshot(f.session()).unwrap();
+    let binding = f
+        .service
+        .prepare_dispatch(f.session(), "echo-owner", "pwd", &ready)
+        .unwrap();
+    let mut output = Vec::new();
+    for chunk in binding.transport_command.as_bytes().chunks(7) {
+        output.extend(f.service.ingest(f.session(), chunk));
+    }
+    output.extend(f.service.ingest(f.session(), b"\r\nif ordinary output\n"));
+    assert_eq!(output, b"\r\nif ordinary output\n");
+}
+
+#[test]
+fn manual_observation_gap_invalidates_old_readiness_but_never_resolves_ai() {
+    for sequence in [0, 1] {
+        let f = Fixture::new();
+        f.ready();
+        let old = f.service.ready_snapshot(f.session()).unwrap();
+        f.event(&format!("G;{sequence};legacy_history_fidelity"));
+        assert_eq!(f.service.status().phase, IntegrationPhase::AwaitingReady);
+        assert!(f.service.ready_snapshot(f.session()).is_err());
+        assert!(f.service.status().completed.is_none());
+        f.event(&format!("R;{sequence};125;"));
+        assert_eq!(f.service.status().phase, IntegrationPhase::Ready);
+        assert!(f
+            .service
+            .prepare_dispatch(f.session(), "stale", "pwd", &old)
+            .is_err());
+        let fresh = f.service.ready_snapshot(f.session()).unwrap();
+        assert_ne!(fresh.revision, old.revision);
+        let binding = f
+            .service
+            .prepare_dispatch(f.session(), "pending", "pwd", &fresh)
+            .unwrap();
+        f.event(&format!("G;{sequence};legacy_history_fidelity"));
+        f.event(&format!("R;{sequence};126;"));
+        assert_eq!(f.service.status().phase, IntegrationPhase::Unknown);
+        assert!(f.service.status().completed.is_none());
+        assert!(f.service.validate_dispatch(f.session(), &binding).is_err());
+    }
+}
+
+#[test]
+fn idle_blank_prompt_refresh_invalidates_preview_but_never_pending_action() {
+    let f = Fixture::new();
+    f.ready();
+    let old = f.service.ready_snapshot(f.session()).unwrap();
+    f.event("R;0;124;");
+    assert_eq!(f.service.status().phase, IntegrationPhase::Ready);
+    assert!(f
+        .service
+        .prepare_dispatch(f.session(), "old", "pwd", &old)
+        .is_err());
+    let current = f.service.ready_snapshot(f.session()).unwrap();
+    assert_ne!(old.revision, current.revision);
+    f.service
+        .prepare_dispatch(f.session(), "pending", "pwd", &current)
+        .unwrap();
+    f.event("R;0;125;");
+    assert_eq!(f.service.status().phase, IntegrationPhase::Unknown);
+    assert!(f.service.status().completed.is_none());
+}
+
+#[test]
+fn legacy_manual_gap_does_not_disable_later_original_ai_logging() {
+    let f = Fixture::new();
+    f.event("H;4.2.46(2)-release");
+    f.event("R;0;123;");
+    assert_eq!(
+        f.service.status().manual_tracking.as_deref(),
+        Some("prompt_gap_only")
+    );
+    let path = std::env::temp_dir().join(format!("xyz-legacy-log-{}", Uuid::new_v4()));
+    let log = ShellLogService::new(
+        Ok(path),
+        crate::observation::ObservationBuffer::new(),
+        Arc::new(|_| {}),
+    );
+    f.service.attach_log(log.clone());
+    let ready = f.service.ready_snapshot(f.session()).unwrap();
+    log.start_shared(f.snapshot.clone(), true, ready.shell_id.clone(), true)
+        .unwrap();
+    f.event("G;0;legacy_unobserved_command");
+    f.event("R;0;124;");
+    assert!(log.status().enabled);
+    assert_eq!(
+        log.status().state,
+        crate::shell_log_types::CaptureState::Gap
+    );
+    let ready = f.service.ready_snapshot(f.session()).unwrap();
+    let binding = f
+        .service
+        .prepare_dispatch(f.session(), "after-manual-gap", "pwd", &ready)
+        .unwrap();
+    f.action_begin(1, &binding);
+    f.action_end(1, &binding, 0);
+    f.event("R;1;125;");
+    log.flush().unwrap();
+    let entries = log
+        .query(crate::shell_log_types::ShellLogQuery::default())
+        .unwrap()
+        .entries;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].command, "pwd");
+    assert_eq!(entries[0].exit_code, Some(0));
+    assert_eq!(
+        log.status().state,
+        crate::shell_log_types::CaptureState::Recording
+    );
 }

@@ -2,7 +2,7 @@
 
 日期：2026-10-16。基线：v0.1.3 发布源码 `00660aa73474827cbd78e6f821c3e2b9a254dad2`；开发起点 `94102c9e6af42aa1195546d5d2da3e4dfa5b01fa`。
 
-状态：修订设计，部分初版实现已提交 dev；通用命令封装、扩大能力与简化界面正在重新对齐。下列目标不是完成或测试通过声明。
+状态：修订设计与本地实现已对齐，正在平台验收；不等于已经发布。下列目标不是完成或测试通过声明。
 
 用户反馈：终端已返回提示符，但未手动启用识别时，任务入口仍接受“确认空闲”后报 `SHELL_NOT_READY`。更根本的问题是将自然对话拆成文字聊天和终端任务，要求用户理解内部执行机制。
 
@@ -12,7 +12,7 @@
 2. [架构与接口](02-architecture-and-contracts.md)
 3. [验收与交付](03-acceptance-and-delivery.md)
 4. [Agent 循环与命令策略](04-agent-loop-and-command-policy.md)
-5. [使用指南草稿](05-user-guide.md)
+5. [使用指南](05-user-guide.md)
 6. [执行封装与 Bash 兼容](06-execution-framing-and-compatibility.md)
 7. [上下文与恢复](07-context-and-recovery.md)
 

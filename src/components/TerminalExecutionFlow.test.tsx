@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentEvent } from '../lib/agent';
 import { chat, modelConfig } from '../test/modelFixtures';
 import { action, connectedSession, task } from '../test/agentFixtures';
-const model = vi.hoisted(() => ({ listen: vi.fn(), config: vi.fn(), list: vi.fn(), create: vi.fn(), get: vi.fn(), send: vi.fn(), cancel: vi.fn(), reload: vi.fn(), confirm: vi.fn(), confirmScope: vi.fn(), probe: vi.fn() }));
+const model = vi.hoisted(() => ({ listen: vi.fn(), config: vi.fn(), list: vi.fn(), create: vi.fn(), get: vi.fn(), send: vi.fn(), submission: vi.fn(), cancel: vi.fn(), reload: vi.fn(), confirm: vi.fn(), confirmScope: vi.fn(), probe: vi.fn() }));
 const agent = vi.hoisted(() => ({ listen: vi.fn(), list: vi.fn(), get: vi.fn(), start: vi.fn(), ack: vi.fn(), decide: vi.fn(), cancel: vi.fn(), continue: vi.fn() }));
 vi.mock('../lib/bridge', () => ({ desktopAvailable: () => true }));
 vi.mock('../lib/modelBridge', () => ({ modelBridge: model }));
@@ -43,7 +43,7 @@ describe('M3 integrated execution UI', () => {
     await user.click(screen.getByRole('checkbox'));
     await user.click(screen.getByRole('button', { name: '同意并发送' }));
     await waitFor(() => expect(agent.ack).toHaveBeenCalledOnce());
-    expect(model.send).toHaveBeenCalledExactlyOnceWith('chat-a', '检查服务器状态', modelConfig.revision, modelConfig.destination, connectedSession.session);
+    expect(model.send).toHaveBeenCalledExactlyOnceWith('chat-a', '检查服务器状态', modelConfig.revision, modelConfig.destination, connectedSession.session, expect.any(String));
     expect(agent.start).not.toHaveBeenCalled();
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(await screen.findByText('SSH 接受写入 · 不代表命令成功')).toBeDefined();
@@ -56,7 +56,7 @@ describe('M3 integrated execution UI', () => {
     act(() => emit({ kind: 'task_updated', task: prepared }));
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 60)); });
     expect(agent.ack).not.toHaveBeenCalled();
-    expect(screen.getByText(/另一个聊天拥有 AI 写入权/)).toBeDefined();
+    expect(screen.getByText(/另一个聊天正在操作终端/)).toBeDefined();
     agent.ack.mockResolvedValue({ ...prepared, revision: '2', phase: 'waiting_approval', action: { ...prepared.action!, displayed: true, policy: 'require_approval', approval_id: 'approval-b' } });
     await user.click(screen.getByRole('button', { name: '查看正在执行的任务' }));
     await waitFor(() => expect(agent.ack).toHaveBeenCalledOnce());

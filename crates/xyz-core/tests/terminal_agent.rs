@@ -4,6 +4,7 @@
 #[allow(dead_code)]
 mod support;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -154,23 +155,44 @@ impl Fixture {
         let nonce = self.ssh.shell_integration().status().shell_id.unwrap();
         format!("\x1b]777;xyzlog;2;{nonce};{body}\x07").into_bytes()
     }
+    fn expected_envelope(&self, action_id: &str, command: &str) -> Vec<u8> {
+        let status = self.ssh.shell_integration().status();
+        let ready = xyz_core::shell_integration::ReadyBinding {
+            shell_id: status.shell_id.unwrap(),
+            sequence: status.sequence,
+            revision: status.revision,
+            shadowed_commands: status.shadowed_commands,
+        };
+        let transport =
+            xyz_core::shell_integration::action_envelope(&self.session, action_id, command, &ready)
+                .unwrap();
+        format!("{transport}\r").into_bytes()
+    }
     async fn foreground_return(&self, server: &LoopbackServer, command: &str, code: u8) -> u64 {
         let status = self.ssh.shell_integration().status();
         let sequence = status.sequence + 1;
-        let command = xyz_core::shell_integration::correlated_command(
-            status.active_action_id.as_ref().unwrap(),
-            command,
-        )
-        .unwrap();
+        let nonce = status.shell_id.unwrap();
+        let action = status.active_action_id.unwrap();
+        let digest = format!("{:x}", Sha256::digest(command.as_bytes()));
+        let identity = format!(
+            "{};{};{action};{digest}",
+            self.session.session_id, self.session.generation
+        );
         server
-            .send_output(self.metadata(&format!(
-                "B;{sequence};123;{};{}",
-                STANDARD.encode("/tmp"),
-                STANDARD.encode(command)
-            )))
+            .send_output(
+                format!(
+                    "\x1b]777;xyzlog;3;{nonce};A;{sequence};123;{identity};{};{}\x07",
+                    STANDARD.encode("/tmp"),
+                    STANDARD.encode(command),
+                )
+                .into_bytes(),
+            )
             .await;
         server
-            .send_output(self.metadata(&format!("E;{sequence};124;{code}")))
+            .send_output(
+                format!("\x1b]777;xyzlog;3;{nonce};Z;{sequence};124;{identity};{code}\x07",)
+                    .into_bytes(),
+            )
             .await;
         sequence
     }
@@ -329,11 +351,7 @@ async fn real_model_command_waits_for_finished_stream_and_visible_preview_then_s
         .await;
     assert_eq!(
         trace.input[1].1,
-        format!(
-            "pwd # xyz-action:{}\r",
-            prepared.action.as_ref().unwrap().action_id
-        )
-        .as_bytes()
+        f.expected_envelope(&prepared.action.as_ref().unwrap().action_id, "pwd")
     );
     assert_eq!(trace.input[0].0, trace.input[1].0);
     assert_eq!(trace.channels.len(), 1);
@@ -436,7 +454,7 @@ async fn destructive_command_requires_exact_single_use_approval_and_same_chat_is
         .await;
     assert_eq!(
         trace.input[0].1,
-        format!("rm -rf /tmp/fixture # xyz-action:{}\r", a.action_id).as_bytes()
+        f.expected_envelope(&a.action_id, "rm -rf /tmp/fixture")
     );
 }
 
@@ -535,11 +553,7 @@ async fn queued_ai_cancellation_is_revalidated_after_real_ssh_backpressure() {
     assert_eq!(trace.input.len(), 1);
     assert_eq!(
         trace.input[0].1,
-        format!(
-            "id # xyz-action:{}\r",
-            second.action.as_ref().unwrap().action_id
-        )
-        .as_bytes()
+        f.expected_envelope(&second.action.as_ref().unwrap().action_id, "id")
     );
     tokio::time::timeout(WAIT, async {
         loop {
@@ -1267,6 +1281,7 @@ async fn planning_round_cap_is_explicit_and_preserves_final_command_output_witho
                     .is_err(),
                 "a capped run must not launch another model request"
             );
+            http
         });
         let started = fixture.start();
         if final_command {
@@ -1280,10 +1295,11 @@ async fn planning_round_cap_is_explicit_and_preserves_final_command_output_witho
             let sequence = fixture.foreground_return(&server, "pwd", 0).await;
             fixture.shell_ready(&server, sequence).await;
         }
-        let capped = phase(&fixture.agent, &started.task_id, "failed").await;
-        assert_eq!(capped.error.as_ref().unwrap().code, "TASK_ROUND_LIMIT");
+        let capped = phase(&fixture.agent, &started.task_id, "budget_paused").await;
+        assert!(capped.error.is_none());
         assert_eq!(capped.round, 16);
-        assert!(!capped.owner && capped.action.is_none());
+        assert!(capped.owner && capped.action.is_none());
+        assert_eq!(capped.batch_round, 16);
         assert_eq!(requests.load(Ordering::SeqCst), 16);
         let context = capped.task_context.as_ref().unwrap();
         assert_eq!(
@@ -1300,8 +1316,65 @@ async fn planning_round_cap_is_explicit_and_preserves_final_command_output_witho
             assert!(context.evidence.is_empty());
             assert_eq!(capped.remote_outcome, "not_sent");
         }
-        responder.await.unwrap();
-        assert_eq!(server.trace().input.len(), usize::from(final_command));
+        let http = responder.await.unwrap();
+        let writes_before_read = server.trace().input.len();
+        if final_command {
+            use xyz_core::agent::ReadActionOutput;
+            let read = ReadActionOutput {
+                task_id: capped.task_id.clone(),
+                run_id: capped.run_id.clone(),
+                action_id: capped.actions[0].action_id.clone(),
+                offset: 0,
+                max_bytes: 16_384,
+            };
+            let output = fixture.agent.read_action_output(read.clone()).unwrap();
+            assert!(output.text.contains("unique-final-round-output"));
+            assert!(output.complete);
+            assert!(!output.text.contains("xyzlog"));
+            let mut stale_run = read.clone();
+            stale_run.run_id = "old-run".into();
+            assert!(fixture.agent.read_action_output(stale_run).is_err());
+            let mut wrong_action = read;
+            wrong_action.action_id = "foreign-action".into();
+            assert!(fixture.agent.read_action_output(wrong_action).is_err());
+        }
+        assert_eq!(
+            server.trace().input.len(),
+            writes_before_read,
+            "output reads must never rerun SSH"
+        );
+        let responder = tokio::spawn(async move {
+            let (mut socket, _) = http.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let body = chunk(
+                serde_json::json!({"role":"assistant","content":"Budget continued; the goal still needs verification."}),
+                serde_json::Value::Null,
+            ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+                + "data: [DONE]\n\n";
+            reply(&mut socket, &body).await;
+            request
+        });
+        let continued = fixture
+            .agent
+            .continue_task(ContinueTerminalTask {
+                task_id: capped.task_id.clone(),
+                run_id: capped.run_id.clone(),
+                readiness_confirmed: true,
+            })
+            .unwrap();
+        assert_eq!(continued.round, 17);
+        assert_eq!(continued.batch_round, 1);
+        assert_eq!(continued.run_id, capped.run_id);
+        assert_eq!(continued.actions.len(), capped.actions.len());
+        let done = phase(&fixture.agent, &started.task_id, "completed").await;
+        assert_eq!(done.round, 17);
+        let request = responder.await.unwrap();
+        assert!(request.contains("Still planning; success is unverified."));
+        assert_eq!(
+            server.trace().input.len(),
+            usize::from(final_command),
+            "continue must not replay completed actions"
+        );
     }
 }
 
@@ -1818,4 +1891,334 @@ async fn unified_other_chat_can_talk_while_ready_owner_waits_for_approval_withou
     );
     assert!(server.trace().input.is_empty());
     assert!(fixture.agent.get(&second.task_id).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_program_and_ast_write_require_exact_single_use_envelope_approval() {
+    for command in [
+        "/opt/xyz-fixture/check-health --summary",
+        "printf '%s' synthetic > /tmp/xyz-fixture-output",
+    ] {
+        let server = LoopbackServer::start(Behavior::default()).await;
+        let (http, base) = listener().await;
+        let fixture = Fixture::new(&server, &base).await;
+        tokio::spawn(async move {
+            let (mut socket, _) = http.accept().await.unwrap();
+            read_request(&mut socket).await;
+            reply(
+                &mut socket,
+                &tool_body(
+                    "terminal_action",
+                    &serde_json::json!({"command_text":command}).to_string(),
+                    "tool_calls",
+                ),
+            )
+            .await;
+        });
+        let started = fixture.start();
+        let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
+        let action = preview.action.as_ref().unwrap();
+        assert_eq!(action.command_text, command);
+        assert!(!action.blocked);
+        assert_eq!(action.policy, "require_approval");
+        assert!(matches!(action.risk.as_str(), "unknown" | "dangerous"));
+        assert!(server.trace().input.is_empty());
+        ack(&fixture.agent, &preview);
+        let waiting = phase(&fixture.agent, &started.task_id, "waiting_approval").await;
+        let action = waiting.action.as_ref().unwrap();
+        assert!(server.trace().input.is_empty());
+        let approve = || DecideTerminalAction {
+            task_id: waiting.task_id.clone(),
+            run_id: waiting.run_id.clone(),
+            action_id: action.action_id.clone(),
+            approval_id: action.approval_id.clone().unwrap(),
+            decision: "approve".into(),
+        };
+        fixture.agent.decide(approve()).unwrap();
+        assert!(fixture.agent.decide(approve()).is_err());
+        phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+        let trace = server
+            .wait_for("approved original payload", |trace| !trace.input.is_empty())
+            .await;
+        assert_eq!(trace.input.len(), 1);
+        assert_eq!(trace.channels.len(), 1);
+        assert_eq!(trace.exec_requests, 1);
+        assert_eq!(trace.input[0].0, trace.channels[0]);
+        assert_eq!(
+            trace.input[0].1,
+            fixture.expected_envelope(&action.action_id, command)
+        );
+        assert_eq!(
+            action.digest,
+            format!("{:x}", Sha256::digest(&trace.input[0].1))
+        );
+        assert_eq!(
+            fixture.agent.get(&started.task_id).unwrap().remote_outcome,
+            "unknown"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_begin_end_with_matching_text_cannot_complete_explicit_ai_action() {
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let responder = tokio::spawn(async move {
+        let (mut socket, _) = http.accept().await.unwrap();
+        read_request(&mut socket).await;
+        reply(
+            &mut socket,
+            &tool_body("terminal_action", r#"{"command_text":"pwd"}"#, "tool_calls"),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), http.accept())
+                .await
+                .is_err()
+        );
+    });
+    let started = fixture.start();
+    let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
+    ack(&fixture.agent, &preview);
+    phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+    server
+        .send_output(fixture.metadata(&format!(
+            "B;1;123;{};{}",
+            STANDARD.encode("/tmp"),
+            STANDARD.encode("pwd")
+        )))
+        .await;
+    server.send_output(fixture.metadata("E;1;124;0")).await;
+    server.send_output(fixture.metadata("R;1;125;")).await;
+    let stopped = phase(&fixture.agent, &started.task_id, "needs_user").await;
+    assert!(!stopped.action.as_ref().unwrap().command_completed);
+    assert_eq!(stopped.remote_outcome, "unknown");
+    assert!(!stopped.terminal_ready);
+    assert_eq!(server.trace().input.len(), 1);
+    responder.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_output_reads_consume_planning_rounds_without_replaying_ssh() {
+    for foreign_scope in [false, true] {
+        let server = LoopbackServer::start(Behavior::default()).await;
+        let (http, base) = listener().await;
+        let fixture = Fixture::new(&server, &base).await;
+        let (args_tx, args_rx) = oneshot::channel::<serde_json::Value>();
+        let responder = tokio::spawn(async move {
+            let (mut socket, _) = http.accept().await.unwrap();
+            read_request(&mut socket).await;
+            reply(
+                &mut socket,
+                &tool_body("terminal_action", r#"{"command_text":"pwd"}"#, "tool_calls"),
+            )
+            .await;
+            let (mut socket, _) = http.accept().await.unwrap();
+            let second = read_request(&mut socket).await;
+            assert!(second.contains("read_action_output"));
+            reply(
+                &mut socket,
+                &tool_body(
+                    "read_action_output",
+                    &args_rx.await.unwrap().to_string(),
+                    "tool_calls",
+                ),
+            )
+            .await;
+            if foreign_scope {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(200), http.accept())
+                        .await
+                        .is_err()
+                );
+                return None;
+            }
+            let (mut socket, _) = http.accept().await.unwrap();
+            let third = read_request(&mut socket).await;
+            let body = chunk(
+                serde_json::json!({"role":"assistant","content":"The retained output is available; no rerun was needed."}),
+                serde_json::Value::Null,
+            ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+                + "data: [DONE]\n\n";
+            reply(&mut socket, &body).await;
+            Some(third)
+        });
+        let started = fixture.start();
+        let preview = phase(&fixture.agent, &started.task_id, "awaiting_display").await;
+        let action_id = preview.action.as_ref().unwrap().action_id.clone();
+        ack(&fixture.agent, &preview);
+        phase(&fixture.agent, &started.task_id, "awaiting_completion").await;
+        server
+            .send_output(b"OUTPUT_PAGE_UNIQUE_EVIDENCE\n".to_vec())
+            .await;
+        let sequence = fixture.foreground_return(&server, "pwd", 0).await;
+        args_tx.send(serde_json::json!({
+            "task_id":started.task_id,"run_id":if foreign_scope {"foreign-run"} else {&started.run_id},
+            "action_id":action_id,"offset":0,"max_bytes":16384,
+        })).unwrap();
+        fixture.shell_ready(&server, sequence).await;
+        let done = phase(
+            &fixture.agent,
+            &started.task_id,
+            if foreign_scope { "failed" } else { "completed" },
+        )
+        .await;
+        assert_eq!(
+            server.trace().input.len(),
+            1,
+            "reading retained output must never execute another SSH command"
+        );
+        if let Some(request) = responder.await.unwrap() {
+            assert_eq!(done.round, 3);
+            assert_eq!(done.batch_round, 3);
+            assert!(request.contains("OUTPUT_PAGE_UNIQUE_EVIDENCE"));
+            assert!(request.contains("next_offset"));
+        } else {
+            assert!(done.error.is_some());
+            assert_eq!(done.round, 2);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_budget_renewal_cannot_reset_the_total_response_cap() {
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    let responder = tokio::spawn(async move {
+        for _ in 0..256 {
+            let (mut socket, _) = http.accept().await.unwrap();
+            read_request(&mut socket).await;
+            seen.fetch_add(1, Ordering::SeqCst);
+            reply(&mut socket, &tool_body("task_context_update", r#"{"summary":"Still planning, no execution verified.","findings":[],"hypotheses":[],"remaining_steps":[]}"#, "tool_calls")).await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), http.accept())
+                .await
+                .is_err(),
+            "total-cap continuation must not send response257"
+        );
+    });
+    let started = fixture.start();
+    for batch in 1..=16 {
+        let paused = phase(&fixture.agent, &started.task_id, "budget_paused").await;
+        assert_eq!(paused.round, batch * 16);
+        assert_eq!(paused.batch_round, 16);
+        assert_eq!(requests.load(Ordering::SeqCst), (batch * 16) as usize);
+        let continue_request = || ContinueTerminalTask {
+            task_id: started.task_id.clone(),
+            run_id: started.run_id.clone(),
+            readiness_confirmed: true,
+        };
+        if batch < 16 {
+            assert!(paused.error.is_none());
+            let continued = fixture.agent.continue_task(continue_request()).unwrap();
+            assert_eq!(continued.round, batch * 16 + 1);
+            assert_eq!(continued.batch_round, 1);
+        } else {
+            assert_eq!(
+                paused.error.as_ref().unwrap().code,
+                "TASK_TOTAL_BUDGET_EXHAUSTED"
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    fixture
+                        .agent
+                        .continue_task(continue_request())
+                        .unwrap_err()
+                        .code,
+                    "TASK_TOTAL_BUDGET_EXHAUSTED"
+                );
+            }
+            assert_eq!(fixture.agent.get(&started.task_id).unwrap().round, 256);
+        }
+    }
+    responder.await.unwrap();
+    assert!(server.trace().input.is_empty());
+    assert_eq!(requests.load(Ordering::SeqCst), 256);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replaced_terminal_submission_returns_current_chat_without_replaying_old_run() {
+    use xyz_core::agent::{ConversationScopeConsent, ConversationTurn};
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let chat = fixture.chats.create_chat("Submission replacement").unwrap();
+    let status = fixture.config.status();
+    let scope = fixture
+        .agent
+        .confirm_conversation_scope(ConversationScopeConsent {
+            revision: status.revision.unwrap(),
+            destination: status.destination.unwrap(),
+            session: Some(fixture.session.clone()),
+        })
+        .unwrap();
+    let first_id = uuid::Uuid::new_v4().to_string();
+    let second_id = uuid::Uuid::new_v4().to_string();
+    let submit = |id: &str, message: &str| {
+        fixture
+            .agent
+            .submit_idempotent_conversation_turn(
+                id,
+                &chat.chat_id,
+                message,
+                scope.revision.as_deref().unwrap(),
+                scope.destination.as_deref().unwrap(),
+                Some(&fixture.session),
+            )
+            .unwrap()
+    };
+    let mut runs = Vec::new();
+    for (id, message, answer) in [
+        (&first_id, "First greeting", "First answer"),
+        (&second_id, "Second greeting", "Second answer"),
+    ] {
+        let ConversationTurn::Terminal { task } = submit(id, message) else {
+            panic!("ready terminal turn expected");
+        };
+        runs.push(task.run_id.clone());
+        let (mut socket, _) = http.accept().await.unwrap();
+        let _request = read_request(&mut socket).await;
+        let body = chunk(
+            serde_json::json!({"role":"assistant","content":answer}),
+            serde_json::Value::Null,
+        ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+            + "data: [DONE]\n\n";
+        reply(&mut socket, &body).await;
+        phase(&fixture.agent, &task.task_id, "completed").await;
+    }
+    assert_ne!(runs[0], runs[1]);
+    for recovered in [
+        fixture
+            .agent
+            .get_conversation_submission(&first_id)
+            .unwrap()
+            .unwrap(),
+        submit(&first_id, "First greeting"),
+    ] {
+        let ConversationTurn::Chat { chat: current } = recovered else {
+            panic!("replaced run should recover current chat, not stale task");
+        };
+        assert_eq!(current.chat_id, chat.chat_id);
+        assert!(current.messages.iter().any(|m| m.text == "Second answer"));
+        assert_eq!(
+            current
+                .messages
+                .iter()
+                .filter(|m| m.text == "First greeting")
+                .count(),
+            1
+        );
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), http.accept())
+            .await
+            .is_err()
+    );
+    assert!(server.trace().input.is_empty());
+    assert_eq!(server.trace().exec_requests, 1);
 }

@@ -8,7 +8,7 @@
 # Dependencies: sshd, ssh-keygen, Python 3, setsid, Rust/Cargo. Installation is
 # deliberately outside this script. Never run --disposable-user on a real host.
 # Unprivileged mode also needs usable /dev/pts and an unlocked current account;
-# Current-shell integration acceptance specifically needs Bash 5.1/5.2; other shells
+# Integration acceptance exercises implemented Bash adapters; other shells
 # remain manual-only in the application. Disposable CI creates a Bash account.
 # Restricted containers may authenticate but refuse OS PTY allocation. That is
 # a failure, not a skip. Its shell uses the current account's normal login setup.
@@ -102,17 +102,25 @@ mkdir "$fixture/client" "$fixture/server"
 ssh-keygen -q -t ed25519 -N '' -C 'xyzaishell-ephemeral-client' -f "$fixture/client/key"
 ssh-keygen -q -t ed25519 -N '' -C 'xyzaishell-ephemeral-host' -f "$fixture/server/host_key"
 username=$(id -un)
+fixture_bash=${XYZ_TEST_BASH:-/bin/bash}
+[[ -x "$fixture_bash" && "$fixture_bash" == /*/bash ]] || { echo 'XYZ_TEST_BASH must be an executable absolute path ending /bash.' >&2; exit 1; }
 if [[ "$mode" == --current-user ]]; then
   login_shell=$(getent passwd "$username" | cut -d: -f7)
-  [[ "$login_shell" == /bin/bash || "$login_shell" == /usr/bin/bash ]] || {
-    echo 'Current-shell acceptance requires the current account to use Bash 5.1/5.2; no login-shell setting will be changed.' >&2
+  [[ $(readlink -f "$login_shell") == $(readlink -f "$fixture_bash") ]] || {
+    echo 'Current-user acceptance requires the selected Bash to match the current account shell; no login-shell setting will be changed.' >&2
     exit 1
   }
 fi
-/bin/bash -c '[[ ${BASH_VERSINFO[0]} == 5 && ( ${BASH_VERSINFO[1]} == 1 || ${BASH_VERSINFO[1]} == 2 ) ]]' || {
-  echo 'Current-shell acceptance requires Bash 5.1/5.2; unsupported shells are manual-only and are not a passing integration test.' >&2
+"$fixture_bash" --noprofile --norc -c '[[ ( ${BASH_VERSINFO[0]} == 4 && ${BASH_VERSINFO[1]} == 2 ) || ( ${BASH_VERSINFO[0]} == 5 && ( ${BASH_VERSINFO[1]} == 1 || ${BASH_VERSINFO[1]} == 2 ) ) ]]' || {
+  echo 'Selected runtime has no tested Bash adapter; unsupported shells are not a passing integration test.' >&2
   exit 1
 }
+fixture_bash_version=$("$fixture_bash" --noprofile --norc -c 'printf "%s" "$BASH_VERSION"')
+if [[ -n ${XYZ_TEST_BASH_VERSION:-} && "$fixture_bash_version" != "$XYZ_TEST_BASH_VERSION("* ]]; then
+  echo "Expected Bash $XYZ_TEST_BASH_VERSION, got $fixture_bash_version" >&2
+  exit 1
+fi
+printf 'OpenSSH fixture selected real Bash %s (%s)\n' "$fixture_bash_version" "$fixture_bash"
 authorized_keys="$fixture/client/authorized_keys"
 cp "$fixture/client/key.pub" "$authorized_keys"
 if [[ "$mode" == --disposable-user ]]; then
@@ -123,7 +131,7 @@ if [[ "$mode" == --disposable-user ]]; then
   # to /etc/default/useradd and is not a valid --key login.defs override.
   "${as_root[@]}" useradd --system --no-log-init --no-create-home --no-user-group \
     --home-dir "$fixture/home" \
-    --shell /bin/bash --password '*' "$username"
+    --shell "$fixture_bash" --password '*' "$username"
   fixture_user=$username
   fixture_uid=$(id -u "$username")
   "${as_root[@]}" install -d -m 700 -o "$fixture_uid" "$fixture/home" "$fixture/home/.ssh"
@@ -218,6 +226,7 @@ done
 [[ -n "$daemon_pid" ]] || { echo 'sshd never became ready.' >&2; exit 1; }
 
 export XYZ_OPENSSH_PORT=$port XYZ_OPENSSH_USER=$username
+export XYZ_OPENSSH_BASH_VERSION=$fixture_bash_version
 export XYZ_OPENSSH_PRIVATE_KEY="$fixture/client/key"
 export XYZ_OPENSSH_HOST_FINGERPRINT
 XYZ_OPENSSH_HOST_FINGERPRINT=$(ssh-keygen -lf "$fixture/server/host_key.pub" -E sha256 | awk '{print $2}')

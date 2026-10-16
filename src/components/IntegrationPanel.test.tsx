@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { IntegrationPanel } from './IntegrationPanel';
 import { useShellIntegration } from '../hooks/useShellIntegration';
@@ -24,4 +24,23 @@ describe('automatic current-shell preparation',()=>{
     expect(screen.getByText('Startup needs user interaction.')).toBeDefined();
     expect(integrationBridge.install).not.toHaveBeenCalled();
   });
+  it('keeps legacy manual tracking capability in details without changing actual readiness', async () => {
+    vi.mocked(integrationBridge.status).mockResolvedValue({ ...status, phase: 'ready', manual_tracking: 'prompt_gap_only' });
+    render(<Harness />);
+    await screen.findByText('可执行 · Shell 已就绪');
+    const notice = screen.getByLabelText('手动命令记录能力');
+    expect(notice.closest('details')?.open).toBe(false);
+    fireEvent.click(screen.getByText('支持范围与识别原理'));
+    expect(notice.closest('details')?.open).toBe(true);
+    expect(notice.textContent).toContain('不代表 Shell 忙碌或日志已启用');
+    expect(screen.queryByRole('checkbox')).toBeNull();
+    expect(integrationBridge.install).not.toHaveBeenCalled();
+  });
+  it('does not confuse exact modern tracking with a legacy limitation', async () => {
+    vi.mocked(integrationBridge.status).mockResolvedValue({ ...status, phase: 'ready', manual_tracking: 'exact' });
+    render(<Harness />);
+    await screen.findByText('可执行 · Shell 已就绪');
+    expect(screen.queryByLabelText('手动命令记录能力')).toBeNull();
+  });
+
 });

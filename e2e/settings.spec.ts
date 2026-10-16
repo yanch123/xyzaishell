@@ -77,6 +77,8 @@ test(`synthetic settings (${colorScheme} OS): save, kind-bound consent, terminal
   await expect(settings.getByRole('button', { name: '保存', exact: true })).toBeEnabled();
   await settings.getByLabel('Base URL').fill('https://model-fixture.example/v1');
   await settings.getByLabel('API Key', { exact: false }).fill('SYNTHETIC_BROWSER_KEY');
+  await expect(settings.locator('.settings-advanced-tests')).not.toHaveAttribute('open', '');
+  await expect(settings.locator('.settings-key-management')).not.toHaveAttribute('open', '');
   await settings.getByLabel('模型名').fill('synthetic-model');
   for (const field of ['Base URL', 'API Key', '模型名']) await expectReadable(settings.getByLabel(field, { exact: false }));
   await expectReadable(settings.getByLabel('API Key', { exact: false }), '::placeholder');
@@ -95,6 +97,7 @@ test(`synthetic settings (${colorScheme} OS): save, kind-bound consent, terminal
   await expect(settings.getByText('设置已保存，流式聊天测试通过。未验证工具调用。')).toBeVisible();
   for (const text of await settings.locator('.settings-test-result strong, .settings-test-result p').all()) await expectReadable(text);
   await page.screenshot({ path: testInfo.outputPath('settings-minimal-test-complete.png'), fullPage: true });
+  await settings.locator('.settings-advanced-tests > summary').click();
   await settings.getByRole('button', { name: '测试已保存配置', exact: true }).click();
   await consent.getByRole('checkbox').check();
   for (const radio of await settings.getByRole('radio').all()) {

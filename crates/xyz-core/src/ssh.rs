@@ -673,8 +673,11 @@ impl SessionManager {
             }
             // Metadata is passive and must not become an AI observation. Keep the
             // original bytes/seq for the visible terminal and its backpressure ACK.
-            let visible = self.inner.shell_integration.ingest(session, chunk);
-            self.inner.observation.push(session, &visible);
+            self.inner
+                .shell_integration
+                .ingest_with_observer(session, chunk, |visible| {
+                    self.inner.observation.push(session, visible);
+                });
             self.emit(SshEvent::Output {
                 session: session.clone(),
                 seq: seq.to_string(),
@@ -1641,7 +1644,18 @@ mod tests {
                 session: session.clone(),
             };
             gate.acquire(owner.clone(), true).unwrap();
-            let action = gate.prepare(&owner, "pwd", &[]).unwrap();
+            let action = gate
+                .prepare(
+                    &owner,
+                    "pwd",
+                    &crate::shell_integration::ReadyBinding {
+                        shell_id: "0123456789abcdef0123456789abcdef".into(),
+                        sequence: 0,
+                        revision: 1,
+                        shadowed_commands: vec![],
+                    },
+                )
+                .unwrap();
             gate.acknowledge(&owner, &action.action_id, "1").unwrap();
             let permit = gate.queue(&owner).unwrap();
             let writer = manager.clone();

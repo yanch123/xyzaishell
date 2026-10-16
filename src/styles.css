@@ -38,3 +38,19 @@ select { width: 100%; padding: 9px 10px; color: var(--text-primary, #e5e7eb); ba
 .conversation-task-timeline { min-width: 0; }
 .conversation-task-timeline .terminal-task { padding: 16px 14px; }
 .connection-shell-notice { color: var(--muted); font-size: 12px; line-height: 1.6; }
+
+/* Keep everyday conversation light; identity and diagnostics remain available. */
+.conversation-details{flex-shrink:0;font-size:10px;color:var(--muted);border-bottom:1px solid var(--line)}
+.conversation-details>summary{cursor:pointer;padding:5px 13px}
+.conversation-details[open]{max-height:120px;overflow:auto}
+.conversation-details .chat-source,.conversation-details .chat-subheader{background:transparent;padding:5px 13px}
+.action-details{font-size:10px;color:var(--muted);margin-top:10px;line-height:1.6}
+.action-details>summary{cursor:pointer}
+.action-result{font-size:11px;color:#a8c9ac;margin:9px 0}
+.action-target{scroll-margin-top:8px}
+.consent-summary{padding-left:20px;line-height:1.7;font-size:12px}
+.settings-advanced-tests,.settings-key-management{margin:7px 0;color:var(--muted);font-size:11px}
+.settings-advanced-tests>summary,.settings-key-management>summary{cursor:pointer}
+.action-output{font-size:11px;color:var(--muted);margin-top:9px}
+.action-output>summary{cursor:pointer}
+.action-output pre{max-height:240px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:10px;background:#10151e;border:1px solid var(--line);border-radius:5px;font-family:monospace;color:#c9d4e5}

@@ -113,12 +113,13 @@ export function ShellLogDialog({ native, snapshot, onClose, initialScope = { kin
   };
   return <NonModalPanel title="终端日志" eyebrow="本机记录 · 独立于聊天和模型" onClose={onClose} className="shell-log-dialog">
     <div className="shell-log-body">
-      <p>默认关闭。命令、时间和远程工作目录以明文保存在本机，可能包含密码、令牌等秘密；脱敏不能保证识别所有秘密。不保存终端输出，不自动发送给模型。手动与 AI 命令使用同一记录方式。</p>
+      <p>默认关闭。命令、时间和远程工作目录以明文保存在本机，可能包含密码、令牌等秘密；脱敏不能保证识别所有秘密。不保存终端输出，不自动发送给模型。记录能力取决于当前 Shell。</p>
       {!native && <p role="status">网页预览不提供本机终端日志，请使用桌面应用。</p>}
       <p role="status">记录状态：{effectiveState ? labels[effectiveState] : native ? '正在读取' : '不可用'}{status?.reason && ` · ${status.reason}`}</p>
+      {native && connected && sameSession(integration?.session, snapshot.session) && integration?.manual_tracking === 'prompt_gap_only' && <p className="notice warning" aria-label="手动命令记录能力">当前 Shell 的手动命令仅能记录观察缺口；启用日志后，AI 执行命令可正常记录。</p>}
       {status?.error && <p role="alert" className="inline-error">{status.error.safe_message}</p>}
       {error && <p role="alert" className="inline-error">{error}</p>}
-      <details><summary>记录范围与启动说明</summary><p>使用连接时自动准备的当前交互 Bash 集成，不改变工作目录。当前支持 Bash 5.1 / 5.2；请等待工具栏显示“可执行 · Shell 已就绪”，再在此处同意明文记录。只记录该 Shell 顶层命令；嵌套 Shell、不受支持的配置、hook 被修改或断线会造成记录缺口。这不是防篡改审计。暂停只影响日志记录，不关闭执行生命周期集成。</p></details>
+      <details><summary>记录范围与启动说明</summary><p>使用连接时自动准备的当前交互 Bash 集成，不改变工作目录。当前支持 Bash 4.2 / 5.1 / 5.2；请等待工具栏显示“可执行 · Shell 已就绪”，再在此处同意明文记录。只记录该 Shell 顶层命令；嵌套 Shell、不受支持的配置、hook 被修改或断线会造成记录缺口。这不是防篡改审计。暂停只影响日志记录，不关闭执行生命周期集成。</p></details>
       {native && connected && !integrationReady && !status?.enabled && <p className="notice warning" role="status">开始记录前，请等待自动准备完成，工具栏显示“可执行 · Shell 已就绪”。此窗口只开启日志记录，不会重装命令识别；不兼容或状态未知时请查看具体状态。</p>}
       {effectiveState !== 'recording' && effectiveState !== 'paused' && <div className="shell-log-consent">
         <label><input type="checkbox" checked={consent} disabled={!startable || busy} onChange={e => setConsent(e.target.checked)} />我理解本机明文可能包含秘密，同意本次启动记录。</label>

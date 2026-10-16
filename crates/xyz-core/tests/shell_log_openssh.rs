@@ -156,6 +156,45 @@ impl Terminal {
             .find(|r| r.command.trim_end_matches('\n') == command)
             .unwrap()
     }
+    async fn ai_completed(&mut self, session: &SessionRef, command: &str) -> ShellLogEntry {
+        self.until(|t| {
+            t.manager
+                .shell_integration()
+                .ready_snapshot(session)
+                .is_ok()
+        })
+        .await;
+        let integration = self.manager.shell_integration();
+        let ready = integration.ready_snapshot(session).unwrap();
+        let action_id = Uuid::new_v4().to_string();
+        let binding = integration
+            .prepare_dispatch(session, &action_id, command, &ready)
+            .unwrap();
+        self.write(session, &format!("{}\n", binding.transport_command))
+            .await;
+        self.until(|t| {
+            t.manager.shell_integration().status().phase == IntegrationPhase::Ready
+                && t.rows(session)
+                    .iter()
+                    .any(|row| row.command == command && row.status == CommandStatus::Completed)
+        })
+        .await;
+        let rows = self.rows(session);
+        assert_eq!(
+            rows.iter().filter(|row| row.command == command).count(),
+            1,
+            "one AI payload must create exactly one log entry"
+        );
+        assert!(
+            !rows.iter().any(|row| row.command.contains("__xyz_")),
+            "envelope internals must never be duplicated as manual commands"
+        );
+        let completed = integration.status().completed.unwrap();
+        assert_eq!(completed.action_id, action_id);
+        assert_eq!(completed.sequence, binding.sequence);
+        rows.into_iter().find(|row| row.command == command).unwrap()
+    }
+
     async fn disconnect(&mut self, session: &SessionRef) {
         if self.manager.snapshot().state != SessionState::Disconnected {
             self.manager.disconnect(session).unwrap();
@@ -165,6 +204,114 @@ impl Terminal {
         self.service.flush().unwrap();
     }
 }
+// Bash4.2 promises exact framed AI audit, while manual input has an explicit
+// observation gap followed by an independently verified prompt boundary.
+async fn legacy_prompt_only_contract(t: &mut Terminal, first: &SessionRef) {
+    for (command, code) in [
+        ("xyz_fixture_function", 23),
+        ("xyz_fixture_alias", 0),
+        ("printf 'XYZ_RUNTIME:%s\\n' \"$BASH_VERSION\"", 0),
+        ("printf '%s\\n' alpha beta | grep beta", 0),
+        ("false || printf RECOVERED; true", 0),
+        ("false", 1),
+        ("export XYZ_AI_TEST_STATE=preserved", 0),
+        ("printenv XYZ_AI_TEST_STATE", 0),
+        ("cd /tmp; pwd", 0),
+    ] {
+        assert_eq!(t.ai_completed(first, command).await.exit_code, Some(code));
+    }
+    let expected = format!(
+        "XYZ_RUNTIME:{}\r\n",
+        env::var("XYZ_OPENSSH_BASH_VERSION").unwrap()
+    );
+    assert!(t
+        .output
+        .windows(expected.len())
+        .any(|b| b == expected.as_bytes()));
+    if env::var_os("XYZ_OPENSSH_FIXTURE_BASHRC").is_some() {
+        assert!(t
+            .output
+            .windows(b"XYZ_ALIAS_PRESERVED".len())
+            .any(|b| b == b"XYZ_ALIAS_PRESERVED"));
+    }
+    let before = t.manager.shell_integration().ready_snapshot(first).unwrap();
+    t.write(first, "printf MANUAL_OBSERVATION_GAP\n").await;
+    t.until(|t| {
+        t.manager
+            .shell_integration()
+            .ready_snapshot(first)
+            .is_ok_and(|ready| ready.revision > before.revision)
+    })
+    .await;
+    assert!(t
+        .rows(first)
+        .iter()
+        .all(|r| r.command != "printf MANUAL_OBSERVATION_GAP"));
+    assert_eq!(t.service.status().state, CaptureState::Gap);
+    assert_eq!(
+        t.ai_completed(first, "printf AI_AFTER_MANUAL_GAP")
+            .await
+            .exit_code,
+        Some(0)
+    );
+    t.output.clear();
+    let before = t.manager.shell_integration().ready_snapshot(first).unwrap();
+    t.write(first, "read -s -p XYZ_SECRET_READY xyz_secret\n")
+        .await;
+    t.until(|t| t.output.windows(16).any(|b| b == b"XYZ_SECRET_READY"))
+        .await;
+    let secret = "SYNTHETIC_READ_PASSWORD_NOT_A_COMMAND";
+    t.write(first, &format!("{secret}\n")).await;
+    t.until(|t| {
+        t.manager
+            .shell_integration()
+            .ready_snapshot(first)
+            .is_ok_and(|ready| ready.revision > before.revision)
+    })
+    .await;
+    assert!(t.rows(first).iter().all(|r| !r.command.contains(secret)));
+    t.write(first, "exit\n").await;
+    t.until(|t| !t.service.status().enabled).await;
+    assert!(t.rows(first).iter().all(|r| r.command != "exit"));
+    t.service.flush().unwrap();
+    let exported = t
+        .service
+        .export(ShellLogQuery::default(), ExportFormat::Json)
+        .unwrap();
+    let data = std::fs::read_to_string(exported.path).unwrap();
+    assert!(data.contains("AI_AFTER_MANUAL_GAP"));
+    assert!(!data.contains(secret));
+    t.disconnect(first).await;
+    let second = t.connect().await;
+    t.write(&second, "set +o history\n").await;
+    t.until(|t| t.manager.shell_integration().status().phase == IntegrationPhase::Unknown)
+        .await;
+    assert_eq!(t.service.status().state, CaptureState::Gap);
+    assert!(t
+        .rows(&second)
+        .iter()
+        .all(|r| r.command != "set +o history"));
+    t.disconnect(&second).await;
+    let third = t.connect().await;
+    let integration = t.manager.shell_integration();
+    let ready = integration.ready_snapshot(&third).unwrap();
+    let binding = integration
+        .prepare_dispatch(&third, &Uuid::new_v4().to_string(), "sleep 30", &ready)
+        .unwrap();
+    t.write(&third, &format!("{}\n", binding.transport_command))
+        .await;
+    t.until(|t| t.rows(&third).iter().any(|r| r.command == "sleep 30"))
+        .await;
+    t.disconnect(&third).await;
+    let interrupted = t
+        .rows(&third)
+        .into_iter()
+        .find(|r| r.command == "sleep 30")
+        .unwrap();
+    assert_eq!(interrupted.status, CommandStatus::Unknown);
+    assert_eq!(interrupted.exit_code, None);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires real local OpenSSH fixture; run .github/scripts/openssh-test.sh"]
 async fn shell_log_real_openssh_records_commands_without_model() {
@@ -172,6 +319,15 @@ async fn shell_log_real_openssh_records_commands_without_model() {
         let root = env::temp_dir().join(format!("xyz-shell-log-openssh-{}", Uuid::new_v4()));
         let mut t = Terminal::new(root.clone());
         let first = t.connect().await;
+        if env::var("XYZ_OPENSSH_BASH_VERSION")
+            .unwrap_or_default()
+            .starts_with("4.2.")
+        {
+            legacy_prompt_only_contract(&mut t, &first).await;
+            drop(t);
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
         // Disposable fixture definitions come from .bashrc, before hooks are
         // installed. Verify both are preserved in the prepared shell.
         if env::var_os("XYZ_OPENSSH_FIXTURE_BASHRC").is_some() {
@@ -188,12 +344,50 @@ async fn shell_log_real_openssh_records_commands_without_model() {
                 .windows(b"XYZ_ALIAS_PRESERVED".len())
                 .any(|s| s == b"XYZ_ALIAS_PRESERVED"));
         }
+        let runtime = env::var("XYZ_OPENSSH_BASH_VERSION").expect("fixture Bash runtime");
+        let version = t
+            .completed(&first, "printf 'XYZ_RUNTIME:%s\\n' \"$BASH_VERSION\"")
+            .await;
+        assert_eq!(version.exit_code, Some(0));
+        let expected_runtime = format!("XYZ_RUNTIME:{runtime}\r\n");
+        assert!(t
+            .output
+            .windows(expected_runtime.len())
+            .any(|bytes| bytes == expected_runtime.as_bytes()));
+        assert_eq!(
+            t.ai_completed(&first, "printf '%s\\n' alpha beta | grep beta")
+                .await
+                .exit_code,
+            Some(0)
+        );
+        assert_eq!(
+            t.ai_completed(&first, "false || printf RECOVERED; true")
+                .await
+                .exit_code,
+            Some(0)
+        );
+        assert_eq!(t.ai_completed(&first, "false").await.exit_code, Some(1));
+        assert_eq!(
+            t.ai_completed(&first, "export XYZ_AI_TEST_STATE=preserved")
+                .await
+                .exit_code,
+            Some(0)
+        );
+        assert_eq!(
+            t.ai_completed(&first, "printenv XYZ_AI_TEST_STATE")
+                .await
+                .exit_code,
+            Some(0)
+        );
+        assert!(t
+            .output
+            .windows(b"preserved\r\n".len())
+            .any(|bytes| bytes == b"preserved\r\n"));
         let initial = t.completed(&first, "pwd").await;
         let cd = t.completed(&first, "cd /tmp; pwd").await;
         assert_eq!(cd.cwd, initial.cwd);
         for command in [
             "printf a | cat",
-            "(cd /; pwd)",
             "printf '%s\\n' 'one\ntwo'",
             "cat <<'XYZ_END'\nhello\nXYZ_END",
         ] {
@@ -203,7 +397,12 @@ async fn shell_log_real_openssh_records_commands_without_model() {
             assert!(row.started_at_ms > 0 && row.finished_at_ms.unwrap() >= row.started_at_ms);
             assert!(row.remote_started_at.is_some());
         }
-        assert_eq!(t.completed(&first, "false").await.exit_code, Some(1));
+        // The modern PS0 adapter also records complete manual subshells.
+        assert_eq!(t.completed(&first, "(cd /; pwd)").await.exit_code, Some(0));
+        assert_eq!(
+            t.completed(&first, "false # manual").await.exit_code,
+            Some(1)
+        );
         t.output.clear();
         let read = "read -s -p 'XYZ_SECRET_READY' xyz_secret";
         t.write(&first, &format!("{read}\n")).await;

@@ -31,6 +31,7 @@ pub struct Observation {
 #[derive(Clone, Default)]
 pub struct ObservationBuffer {
     state: Arc<Mutex<State>>,
+    outputs: crate::action_output::OutputRegistry,
 }
 
 impl ObservationBuffer {
@@ -64,6 +65,9 @@ impl ObservationBuffer {
                 .iter()
                 .any(|known| known.as_str() == secret.as_str())
         });
+        if !secrets.is_empty() {
+            self.outputs.invalidate_all();
+        }
         let mut context = Zeroizing::new(String::new());
         let mut state = State {
             session: Some(session.clone()),
@@ -107,7 +111,12 @@ impl ObservationBuffer {
             return Ok(());
         }
         let mut state = self.lock();
-        if state.registered.iter().any(|s| s.as_str() == secret) {
+        if state
+            .registered
+            .iter()
+            .chain(state.run_secrets.iter())
+            .any(|s| s.as_str() == secret)
+        {
             return Ok(());
         }
         if !valid_secret_budget(
@@ -119,12 +128,14 @@ impl ObservationBuffer {
                 .chain(std::iter::once(secret)),
         ) {
             state.blocked = true;
+            self.outputs.invalidate_all();
             state.tail = Tail::default();
             return Err(ApiError::new(
                 "OBSERVATION_SECRET_LIMIT",
                 "The known-secret filter limit was exceeded; capture is disabled.",
             ));
         }
+        self.outputs.invalidate_all();
         state.registered.push(Zeroizing::new(secret.to_owned()));
         state.rebuild_redactor();
         state.tail = Tail::default();
@@ -218,11 +229,17 @@ impl ObservationBuffer {
         }
         Self {
             state: Arc::new(Mutex::new(state)),
+            outputs: self.outputs.clone(),
         }
     }
 
     /// Feed the same bytes delivered by the visible SSH output path. Stale or
     /// unrelated sessions, and output before capture starts, are ignored.
+    pub(crate) fn attach_action_output(&self, store: crate::action_output::ActionOutputStore) {
+        self.outputs.register(&store);
+        self.lock().output = Some(store);
+    }
+
     pub fn push(&self, session: &SessionRef, bytes: &[u8]) {
         let mut state = self.lock();
         if state.blocked
@@ -256,6 +273,9 @@ impl ObservationBuffer {
         state.capture(&chunk);
         if state.sanitizer.invalid {
             state.tail.gap |= state.session.is_some();
+            if let Some(output) = &state.output {
+                output.invalidate();
+            }
             state.sanitizer.invalid = false;
         }
     }
@@ -330,6 +350,7 @@ struct State {
     sanitizer: Sanitizer,
     redactor: Redactor,
     tail: Tail,
+    output: Option<crate::action_output::ActionOutputStore>,
 }
 fn valid_secret_budget<'a>(secrets: impl Iterator<Item = &'a str>) -> bool {
     let mut total = 0usize;
@@ -370,7 +391,15 @@ impl State {
     }
 
     fn capture(&mut self, chunk: &str) {
-        self.redactor.push(chunk, &mut self.tail);
+        let mut emitted = Tail::default();
+        emitted.limit = usize::MAX;
+        self.redactor.push(chunk, &mut emitted);
+        if self.session.is_some() {
+            if let Some(output) = &self.output {
+                output.append(&emitted.text);
+            }
+            self.tail.push(&emitted.text);
+        }
         if self.session.is_none() {
             self.tail = Tail::default();
             self.redactor.excluded.fill(true);
@@ -726,6 +755,79 @@ mod tests {
         (buffer, session)
     }
 
+    #[test]
+    fn late_secret_invalidates_all_retained_chat_windows_after_active_store_changes() {
+        let (buffer, session) = started(&[]);
+        let a = crate::action_output::ActionOutputStore::default();
+        buffer.attach_action_output(a.clone());
+        a.start("chat-a");
+        buffer.push(&session, b"old-private-value");
+        a.finish("chat-a");
+        let b = crate::action_output::ActionOutputStore::default();
+        buffer.attach_action_output(b.clone());
+        b.start("chat-b");
+        buffer.push(&session, b"other output");
+        buffer.add_known_secret("old-private-value").unwrap();
+        let old = a.read("chat-a", 0, 16384).unwrap();
+        assert!(old.text.is_empty() && old.gap);
+        assert_eq!(old.earliest_offset, 17);
+        assert!(b.read("chat-b", 0, 16384).unwrap().gap);
+        buffer.reset_capture_preserving_secrets();
+        buffer.begin(session.clone(), vec!["other output".into()]);
+        assert!(a.read("chat-a", 0, 16384).unwrap().text.is_empty());
+    }
+    #[test]
+    fn late_secret_invalidates_cross_page_and_evicted_prefix_without_changing_offsets() {
+        let (buffer, session) = started(&[]);
+        let store = crate::action_output::ActionOutputStore::default();
+        buffer.attach_action_output(store.clone());
+        store.start("cross_page");
+        buffer.push(&session, &vec![b'x'; 16380]);
+        buffer.push(&session, b"late-cross-page-secret");
+        store.finish("cross_page");
+        store.start("evicted");
+        buffer.push(&session, b"late-evicted-prefix-secret");
+        buffer.push(&session, &vec![b'x'; 1024 * 1024 - 10]);
+        let old = store.read("evicted", 0, 16384).unwrap();
+        assert!(old.earliest_offset > 0);
+        buffer.add_known_secret("late-cross-page-secret").unwrap();
+        let page = store.read("cross_page", 16384, 16384).unwrap();
+        assert!(page.text.is_empty() && page.gap);
+        assert!(page.earliest_offset > 16384);
+        buffer
+            .add_known_secret("late-evicted-prefix-secret")
+            .unwrap();
+        let evicted = store.read("evicted", old.earliest_offset, 16384).unwrap();
+        assert!(evicted.text.is_empty() && evicted.gap);
+        assert!(evicted.earliest_offset > old.earliest_offset);
+    }
+    #[test]
+    fn action_windows_keep_stream_before_tail_eviction_and_late_secret_creates_gap() {
+        let (buffer, session) = started(&["split-secret"]);
+        let store = crate::action_output::ActionOutputStore::default();
+        buffer.attach_action_output(store.clone());
+        store.start("action");
+        buffer.push(&session, b"prefix split-");
+        buffer.push(&session, b"secret suffix ");
+        buffer.push(&session, &vec![b'x'; 100_000]);
+        assert!(buffer.read().truncated);
+        let page = store.read("action", 0, 16384).unwrap();
+        assert!(page.text.starts_with("prefix [REDACTED] suffix "));
+        assert!(!page.text.contains("split-secret"));
+        let later = store.read("action", 70_000, 100).unwrap();
+        assert_eq!(later.text.len(), 100);
+        buffer.add_known_secret("split-secret").unwrap();
+        assert_eq!(store.read("action", 70_000, 100).unwrap(), later);
+        buffer.add_known_secret("newly-learned").unwrap();
+        let invalidated = store.read("action", 0, 16384).unwrap();
+        assert!(invalidated.gap && invalidated.text.is_empty());
+        assert!(invalidated.earliest_offset > 90_000);
+        buffer.push(&session, b"newly-learned safe");
+        let new_page = store
+            .read("action", invalidated.earliest_offset, 16384)
+            .unwrap();
+        assert_eq!(new_page.text, "[REDACTED] safe");
+    }
     #[test]
     fn captures_only_new_matching_session_output_and_reads_incrementally() {
         let buffer = ObservationBuffer::new();

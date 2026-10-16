@@ -13,7 +13,7 @@ import { attachmentConsented, boundSelection, composeAttachedMessage, selectionM
 // These errors are returned before a unified turn is accepted. Unknown failures
 // may follow real execution and must never unlock a replay of the same draft.
 const SEND_PREFLIGHT_ERRORS = new Set(['MODEL_CONFIG_CHANGED', 'MODEL_CONFIG_UNAVAILABLE', 'CONVERSATION_SCOPE_REQUIRED', 'SESSION_STALE', 'CHAT_BUSY', 'CHAT_NOT_FOUND', 'AI_OWNER_BUSY', 'CHAT_RESTORED_READ_ONLY', 'CHAT_TARGET_MISMATCH', 'TASK_INPUT_INVALID']);
-type UncertainSubmission = { revision: string; text: string; draft: string | undefined; messageIds: string[]; attachment?: TerminalAttachmentDraft };
+type UncertainSubmission = { submissionId?: string; revision: string; text: string; draft: string | undefined; messageIds: string[]; attachment?: TerminalAttachmentDraft };
 
 function previewChat(): ChatSnapshot {
   const id = crypto.randomUUID();
@@ -67,7 +67,7 @@ export function useModelChat(target?: SessionSnapshot) {
 
   const acceptChat = useCallback((next: ChatSnapshot) => {
     const uncertain = uncertainSubmissionsRef.current.get(next.chat_id);
-    if (uncertain && newerRevision(next.revision, uncertain.revision) && next.messages.some(message => message.role === 'user' && !uncertain.messageIds.includes(message.id) && message.text === uncertain.text)) {
+    if (uncertain && !uncertain.submissionId && newerRevision(next.revision, uncertain.revision) && next.messages.some(message => message.role === 'user' && !uncertain.messageIds.includes(message.id) && message.text === uncertain.text)) {
       // A newer authoritative transcript proves acceptance, even if execution
       // already finished. Consume the original draft before lifting the fence.
       if (draftsRef.current[next.chat_id] === uncertain.draft) {
@@ -86,6 +86,22 @@ export function useModelChat(target?: SessionSnapshot) {
     chatsRef.current = updated;
     setChats(updated);
   }, []);
+  const reconcileById = useCallback(async (chatId: string) => {
+    const uncertain = uncertainSubmissionsRef.current.get(chatId);
+    if (!uncertain?.submissionId) return;
+    const result = await modelBridge.submission(uncertain.submissionId);
+    if (!alive.current || !result || uncertainSubmissionsRef.current.get(chatId) !== uncertain) return;
+    const returnedChatId = result.kind === 'chat' ? result.chat.chat_id : result.task.chat_id;
+    if (returnedChatId !== chatId) return;
+    // The host's submission lookup is authoritative even after redaction or a
+    // completed run. It never resends or obtains new execution authority.
+    if (result.kind === 'terminal') setTerminalTask(result.task); else acceptChat(result.chat);
+    if (draftsRef.current[chatId] === uncertain.draft) {
+      draftsRef.current = { ...draftsRef.current, [chatId]: '' }; setDrafts(draftsRef.current);
+    }
+    uncertainSubmissionsRef.current.delete(chatId);
+    setUncertainSubmissions(Object.fromEntries([...uncertainSubmissionsRef.current.keys()].map(id => [id, true])));
+  }, [acceptChat]);
   const acceptConfig = useCallback((next: ModelConfigStatus) => {
     const old = configRef.current;
     if (old.revision && (!next.revision || !newerRevision(next.revision, old.revision))) return;
@@ -136,7 +152,7 @@ export function useModelChat(target?: SessionSnapshot) {
       if (!active.length) return;
       reading = true;
       await Promise.all(active.map(async chat => {
-        try { const next = await modelBridge.get(chat.chat_id); if (!disposed) acceptChat(next); }
+        try { await reconcileById(chat.chat_id); const next = await modelBridge.get(chat.chat_id); if (!disposed) acceptChat(next); }
         catch (failure) { if (!disposed) setErrors(items => ({ ...items, [chat.chat_id]: safeError(failure) })); }
       }));
       reading = false;
@@ -146,7 +162,7 @@ export function useModelChat(target?: SessionSnapshot) {
     const onVisible = () => { if (document.visibilityState === 'visible') void reconcile(); };
     document.addEventListener('visibilitychange', onVisible);
     return () => { disposed = true; window.clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); };
-  }, [native, ready, acceptChat]);
+  }, [native, ready, acceptChat, reconcileById]);
 
   const retryLoad = () => { if (native && !ready) { setError(null); initialChat.current = null; setLoadAttempt(value => value + 1); } };
 
@@ -236,10 +252,11 @@ export function useModelChat(target?: SessionSnapshot) {
     markPending(chatId, 'sending');
     setErrors(items => ({ ...items, [chatId]: null }));
     const submittedDraft = draftsRef.current[chatId];
+    const submissionId = attachment ? undefined : crypto.randomUUID();
     try {
       const next = attachment
         ? { kind: 'chat' as const, chat: await modelBridge.sendText(chatId, text) }
-        : await modelBridge.send(chatId, text, configRef.current.revision!, configRef.current.destination!, targetRef.current?.state === 'connected' ? targetRef.current.session : null);
+        : await modelBridge.send(chatId, text, configRef.current.revision!, configRef.current.destination!, targetRef.current?.state === 'connected' ? targetRef.current.session : null, submissionId!);
       if (alive.current) {
         if (next.kind === 'terminal') setTerminalTask(next.task);
         else if (next.kind === 'chat') acceptChat(next.chat);
@@ -253,21 +270,21 @@ export function useModelChat(target?: SessionSnapshot) {
         setErrors(items => ({ ...items, [chatId]: safeError(failure) }));
         const code = typeof failure === 'object' && failure !== null && 'code' in failure ? String(failure.code) : null;
         if (!code || !SEND_PREFLIGHT_ERRORS.has(code)) {
-          uncertainSubmissionsRef.current.set(chatId, { revision: chat.revision, text, draft: submittedDraft, messageIds: chat.messages.map(message => message.id), attachment });
+          uncertainSubmissionsRef.current.set(chatId, { submissionId, revision: chat.revision, text, draft: submittedDraft, messageIds: chat.messages.map(message => message.id), attachment });
           setUncertainSubmissions(items => ({ ...items, [chatId]: true }));
           // An event may have arrived before the failed IPC response.
           const known = chatsRef.current.find(item => item.chat_id === chatId);
           if (known) acceptChat(known);
         }
         // Only authoritative reads can reconcile this fence; never resubmit.
-        try { const next = await modelBridge.get(chatId); if (alive.current) acceptChat(next); } catch { /* Keep safe original error. */ }
+        try { await reconcileById(chatId); const next = await modelBridge.get(chatId); if (alive.current) acceptChat(next); } catch { /* Keep safe original error and submission fence. */ }
       }
       return false;
     } finally { if (alive.current) markPending(chatId, null); else pendingRef.current.delete(chatId); }
   };
   const reconcileSubmission = async (chatId: string) => {
     if (!native || !uncertainSubmissionsRef.current.has(chatId)) return;
-    try { const next = await modelBridge.get(chatId); if (alive.current) acceptChat(next); }
+    try { await reconcileById(chatId); const next = await modelBridge.get(chatId); if (alive.current) acceptChat(next); }
     catch (failure) { if (alive.current) setErrors(items => ({ ...items, [chatId]: safeError(failure) })); }
   };
   const cancel = async (chatId: string) => {

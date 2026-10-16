@@ -53,7 +53,7 @@ describe('v0.1.3 saved model settings and capability tests', () => {
     expect((screen.getByLabelText(/^API Key/) as HTMLInputElement).value).toBe('');
   });
   it('clears a key only through its separate explicit decision and save', async () => {
-    const user = await ready(); await user.click(button('清除已保存 Key…')); expect(mocks.save).not.toHaveBeenCalled();
+    const user = await ready(); await user.click(screen.getByText('密钥管理')); await user.click(button('清除已保存 Key…')); expect(mocks.save).not.toHaveBeenCalled();
     await user.click(button('确认清除，保存时生效')); expect(mocks.save).not.toHaveBeenCalled();
     await user.click(button('保存')); expect(mocks.save.mock.calls[0][0].key_update).toEqual({ kind: 'clear' });
     expect(screen.getByText(/尚未配置 API Key，发送已禁用/)).toBeDefined(); expect(screen.queryByRole('button', { name: '测试已保存配置' })).toBeNull();
@@ -106,7 +106,7 @@ describe('v0.1.3 saved model settings and capability tests', () => {
   });
   it('sends only a separately consented synthetic tool test and explains its limits', async () => {
     const user = await ready();
-    await user.click(screen.getByRole('radio', { name: /任务工具调用/ }));
+    await user.click(screen.getByText('高级测试选项')); await user.click(screen.getByRole('radio', { name: /任务工具调用/ }));
     await user.click(button('测试已保存配置'));
     const decision = screen.getByRole('group', { name: '确认测试接收方' });
     expect(decision.textContent).toContain('xyz_capability_probe');
@@ -124,7 +124,7 @@ describe('v0.1.3 saved model settings and capability tests', () => {
   it('invalidates consent on test-kind changes and never sends when declined', async () => {
     const user = await ready(); await user.click(button('测试已保存配置'));
     await user.click(screen.getByRole('checkbox', { name: /同意向这个已保存目标/ }));
-    await user.click(screen.getByRole('radio', { name: /任务工具调用/ }));
+    await user.click(screen.getByText('高级测试选项')); await user.click(screen.getByRole('radio', { name: /任务工具调用/ }));
     expect(screen.queryByRole('group', { name: '确认测试接收方' })).toBeNull();
     await user.click(button('测试已保存配置'));
     expect((screen.getByRole('checkbox', { name: /同意向这个已保存目标/ }) as HTMLInputElement).checked).toBe(false);
@@ -133,7 +133,7 @@ describe('v0.1.3 saved model settings and capability tests', () => {
     expect(screen.getByText('设置已保存，测试已取消，未发送请求。')).toBeDefined();
   });
   it('blocks an already checked consent after a saved revision changes', async () => {
-    const user = await ready(); await user.click(screen.getByRole('radio', { name: /任务工具调用/ })); await user.click(button('测试已保存配置'));
+    const user = await ready(); await user.click(screen.getByText('高级测试选项')); await user.click(screen.getByRole('radio', { name: /任务工具调用/ })); await user.click(button('测试已保存配置'));
     await user.click(screen.getByRole('checkbox', { name: /同意向这个已保存目标/ }));
     act(() => emit({ kind: 'config_updated', config: { ...modelConfig, revision: '9', file_revision: 'external-9', model: 'external-model' } }));
     expect((button('确认并测试') as HTMLButtonElement).disabled).toBe(true);
@@ -145,7 +145,7 @@ describe('v0.1.3 saved model settings and capability tests', () => {
   });
   it('keeps unsupported distinct from transport uncertainty and does not grant chat consent', async () => {
     mocks.testSaved.mockImplementation(async request => ({ ...request, outcome: 'unsupported', success: false, error: { code: 'MODEL_TOOL_UNSUPPORTED', safe_message: 'Expected tool call was not returned.', retry: 'after_user_action' } }));
-    const user = await ready(); await user.click(screen.getByRole('radio', { name: /任务工具调用/ })); await user.click(button('保存并测试'));
+    const user = await ready(); await user.click(screen.getByText('高级测试选项')); await user.click(screen.getByRole('radio', { name: /任务工具调用/ })); await user.click(button('保存并测试'));
     await user.click(screen.getByRole('checkbox', { name: /同意向这个已保存目标/ })); await user.click(button('确认并测试'));
     expect(screen.getByText('本次未通过工具调用格式检查')).toBeDefined();
     expect(screen.getByText('设置已保存，本次未通过所选测试的格式检查。不会自动重试。')).toBeDefined();
@@ -159,7 +159,7 @@ describe('v0.1.3 saved model settings and capability tests', () => {
   });
   it('labels a late task-capability result with its original revision after config changes', async () => {
     let finish!: (result: ModelTestResult) => void; mocks.testSaved.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
-    const user = await ready(); await user.click(screen.getByRole('radio', { name: /任务工具调用/ })); await user.click(button('测试已保存配置'));
+    const user = await ready(); await user.click(screen.getByText('高级测试选项')); await user.click(screen.getByRole('radio', { name: /任务工具调用/ })); await user.click(button('测试已保存配置'));
     await user.click(screen.getByRole('checkbox', { name: /同意向这个已保存目标/ })); await user.click(button('确认并测试'));
     act(() => emit({ kind: 'config_updated', config: { ...modelConfig, revision: '9', file_revision: 'external-9', model: 'external-model' } }));
     await act(async () => finish({ ...mocks.testSaved.mock.calls[0][0], outcome: 'supported', success: true, error: null }));

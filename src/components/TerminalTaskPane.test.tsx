@@ -22,7 +22,7 @@ describe('terminal task visible workflow', () => {
     const cancel = vi.fn(); const select = vi.fn(); const user = userEvent.setup();
     const owner = task();
     const view = render(<TerminalTaskPane {...common} current={chat('chat-b')} onSelectChat={select} agent={controller({ owner, blocked: true, tasks: { 'chat-a': owner }, cancel })} />);
-    expect(screen.getByText(/切换页面不会转移或停止任务/)).toBeDefined();
+    expect(screen.getByText(/另一个聊天正在操作终端/)).toBeDefined();
     await user.click(screen.getByRole('button', { name: '查看正在执行的任务' }));
     expect(select).toHaveBeenCalledExactlyOnceWith('chat-a'); expect(cancel).not.toHaveBeenCalled();
     view.rerender(<TerminalTaskPane {...common} agent={controller({ owner, blocked: true, tasks: { 'chat-a': owner }, cancel })} />);
@@ -107,4 +107,27 @@ describe('conversational replies', () => {
     expect(screen.queryByText('AI 流程已结束')).toBeNull();
     expect(screen.queryByLabelText('当前终端任务')).toBeNull();
   });
+});
+
+it('keeps a budget pause explicit and pinned to the current run', async () => {
+  const paused = task({ phase: 'budget_paused', round: 16, batch_round: 16 });
+  const continueTask = vi.fn();
+  render(<TerminalTaskPane {...common} agent={controller({ tasks: { 'chat-a': paused }, continueTask })} />);
+  expect(continueTask).not.toHaveBeenCalled();
+  await userEvent.setup().click(screen.getByRole('button', { name: '继续任务' }));
+  expect(continueTask).toHaveBeenCalledExactlyOnceWith(paused.task_id, paused.run_id);
+});
+
+it('cannot continue past the cumulative budget but still permits stopping', async () => {
+  const exhausted = task({ phase: 'budget_paused', round: 256, batch_round: 16,
+    error: { code: 'TASK_TOTAL_BUDGET_EXHAUSTED', retry: 'never', safe_message: '任务尚未完成，请新建任务继续。' } });
+  const continueTask = vi.fn(); const cancel = vi.fn(); const user = userEvent.setup();
+  render(<TerminalTaskPane {...common} agent={controller({ tasks: { 'chat-a': exhausted }, continueTask, cancel })} />);
+  const resume = screen.getByRole('button', { name: '继续任务' });
+  expect(resume.hasAttribute('disabled')).toBe(true);
+  await user.click(resume);
+  expect(continueTask).not.toHaveBeenCalled();
+  expect(screen.getByText('任务尚未完成，请新建任务继续。')).toBeDefined();
+  await user.click(screen.getByRole('button', { name: '停止 AI 任务' }));
+  expect(cancel).toHaveBeenCalledExactlyOnceWith(exhausted.task_id, exhausted.run_id);
 });

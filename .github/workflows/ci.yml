@@ -134,16 +134,22 @@ jobs:
           compression-level: 0
 
   openssh-integration:
-    name: Real OpenSSH and current Bash PTY integration (${{ matrix.os }})
+    name: Real OpenSSH and Bash ${{ matrix.bash }} PTY integration (${{ matrix.os }})
     needs: frontend
     # Exercise both distro shells and their normal startup defaults. Keep the
     # distributable DEB build on 22.04 for the older runtime baseline.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
+        include:
+          - os: ubuntu-22.04
+            bash: distro-5.1
+          - os: ubuntu-24.04
+            bash: distro-5.2
+          - os: ubuntu-22.04
+            bash: '4.2.46'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -152,9 +158,15 @@ jobs:
       - name: Install isolated integration prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y openssh-server python3-pexpect build-essential pkg-config
+          sudo apt-get install --no-install-recommends -y openssh-server python3-pexpect build-essential pkg-config bison curl
           bash --version
           rustup show
+      - name: Build checksum-pinned GNU Bash 4.2.46 compatibility runtime
+        if: matrix.bash == '4.2.46'
+        run: |
+          bash .github/scripts/build-bash-4.2.sh "$RUNNER_TEMP/xyz-bash42"
+          echo "XYZ_TEST_BASH=$RUNNER_TEMP/xyz-bash42/bin/bash" >> "$GITHUB_ENV"
+          echo "XYZ_TEST_BASH_VERSION=4.2.46" >> "$GITHUB_ENV"
       - name: Cache locked core dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -166,6 +178,8 @@ jobs:
           key: cargo-shell-v1-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
             cargo-shell-v1-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Compare Rust literal grammar with the actual selected Bash parser
+        run: cargo test -p xyz-core --locked command_ast::tests::actual_bash_argv_agrees -- --exact --nocapture
       - name: Test real OpenSSH with a disposable Bash account
         run: bash .github/scripts/openssh-test.sh --disposable-user
       - name: Test current-shell hooks and lifecycle in a real local PTY

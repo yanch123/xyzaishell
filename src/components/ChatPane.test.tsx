@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ModelEvent } from '../lib/model';
 import { chat, modelConfig, stream } from '../test/modelFixtures';
-const mocks = vi.hoisted(() => ({ native: vi.fn(), listen: vi.fn(), config: vi.fn(), list: vi.fn(), create: vi.fn(), get: vi.fn(), send: vi.fn(), cancel: vi.fn(), reload: vi.fn(), confirm: vi.fn(), probe: vi.fn() }));
+const mocks = vi.hoisted(() => ({ native: vi.fn(), listen: vi.fn(), config: vi.fn(), list: vi.fn(), create: vi.fn(), get: vi.fn(), send: vi.fn(), submission: vi.fn(), cancel: vi.fn(), reload: vi.fn(), confirm: vi.fn(), probe: vi.fn() }));
 vi.mock('../lib/bridge', () => ({ desktopAvailable: mocks.native }));
 vi.mock('../lib/modelBridge', () => ({ modelBridge: mocks }));
 import { ChatPane } from './ChatPane';
@@ -31,10 +31,10 @@ async function ready() {
 describe('M2 model chat UI', () => {
   it('sends explicit chat text and streams a real backend response without implying terminal access', async () => {
     const user = userEvent.setup(); await ready();
-    expect(screen.getByText(/普通命令可自动在当前终端执行/)).toBeDefined();
+    expect(screen.getByText(/普通命令自动执行，危险操作会先问你/)).toBeDefined();
     await user.type(screen.getByRole('textbox', { name: '聊天消息' }), '解释这条命令');
     await user.click(screen.getByRole('button', { name: '发送' }));
-    expect(mocks.send).toHaveBeenCalledWith('chat-a', '解释这条命令', modelConfig.revision, modelConfig.destination, null);
+    expect(mocks.send).toHaveBeenCalledWith('chat-a', '解释这条命令', modelConfig.revision, modelConfig.destination, null, expect.any(String));
     expect(screen.getByText('正在等待模型响应…')).toBeDefined();
     act(() => emit({ kind: 'chat_updated', chat: stream('chat-a', '3', 'This is a streamed response.') }));
     expect(screen.getByText('This is a streamed response.')).toBeDefined();

@@ -14,10 +14,10 @@ type TerminalTaskSnapshot = {
 
 // Frontend regression only: native IPC, SSH evidence and model replies are synthetic.
 
-test('synthetic unified conversation: greeting, displayed ordinary command and contextual follow-up share one composer', async ({ page }, testInfo) => {
+for (const ambiguousGreeting of [false, true]) test(`synthetic unified conversation (${ambiguousGreeting ? 'lost reply reconciled by UUID' : 'normal'}): greeting, pipeline, budget continuation and local output pages`, async ({ page }, testInfo) => {
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
-  await page.addInitScript(() => {
+  await page.addInitScript((ambiguousGreeting: boolean) => {
     const callbacks = new Map<number, (event: unknown) => void>();
     const listeners = new Map<string, Set<number>>();
     const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
@@ -27,6 +27,7 @@ test('synthetic unified conversation: greeting, displayed ordinary command and c
     const chat: ChatSnapshot = { chat_id: 'synthetic-chat', task_id: 'synthetic-chat', title: '新任务', revision: '1', active_run_id: null, messages: [] };
     let task: TerminalTaskSnapshot | null = null;
     let turn = 0;
+    const submissions = new Map<string, unknown>();
     const emit = (event: string, payload: unknown) => listeners.get(event)?.forEach(id => callbacks.get(id)?.({ event, id, payload: structuredClone(payload) }));
     const unlisten = (event: string, id: number) => { listeners.get(event)?.delete(id); callbacks.delete(id); };
     const update = () => { if (task) { task.revision = String(Number(task.revision) + 1); emit('agent:event', { kind: 'task_updated', task }); } return structuredClone(task); };
@@ -59,16 +60,24 @@ test('synthetic unified conversation: greeting, displayed ordinary command and c
           emit('model:event', { kind: 'config_updated', config });
           return structuredClone(config);
         }
+        if (cmd === 'get_conversation_submission') {
+          if (typeof args.submissionId !== 'string' || !submissions.has(args.submissionId)) throw new Error('Lookup must use the original UUID');
+          return root.__SYNTHETIC_ALLOW_LOOKUP__ ? structuredClone(submissions.get(args.submissionId)) : null;
+        }
         if (cmd === 'submit_conversation_turn') {
+          if (typeof args.submissionId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(args.submissionId) || submissions.has(args.submissionId)) throw new Error('Missing or reused submission UUID');
           if (!config.consented || args.revision !== config.revision || args.destination !== config.destination || JSON.stringify(args.session) !== JSON.stringify(session)) throw new Error('No current target scope');
           if (turn === 2 && !chat.messages.some(message => message.text === 'Linux verified by uname.')) throw new Error('Prior tool result missing from conversation');
           turn++;
           const run = 'run-' + turn;
           chat.messages.push({ id: 'user-' + turn, role: 'user', text: String(args.text), run_id: run, state: 'complete', error: null, destination: null, model: null });
-          task = { chat_id: chat.chat_id, task_id: chat.task_id, run_id: run, session, target: {host:'synthetic-server.invalid', username:'synthetic-user',port:22}, revision:String(turn*10), phase: turn===2?'awaiting_display':'completed', instruction:String(args.text), assistant_text: turn===1?'Hello, ready to help.':turn===2?'Inspecting server now.':'The server uses Linux.', action:turn===2?{action_id:'ordinary-2',display_revision:'1',command_text:'command uname -a',append_enter:true,digest:'digest',policy:'auto_normal',reason:'Inspection',approval_id:null,expires_at_unix_ms:Date.now()+120000,displayed:false,delivery:'not_sent'}:null, actions:[],error:null,owner:turn===2,remote_outcome:'not_sent',terminal_ready:true,round:1};
+          task = { chat_id: chat.chat_id, task_id: chat.task_id, run_id: run, session, target: {host:'synthetic-server.invalid', username:'synthetic-user',port:22}, revision:String(turn*10), phase: turn===2?'awaiting_display':'completed', instruction:String(args.text), assistant_text: turn===1?'Hello, ready to help.':turn===2?'Inspecting server now.':'The server uses Linux.', action:turn===2?{action_id:'ordinary-2',display_revision:'1',command_text:'uname -a | head -n 1',append_enter:true,digest:'digest',policy:'auto_normal',reason:'Inspection',approval_id:null,expires_at_unix_ms:Date.now()+120000,displayed:false,delivery:'not_sent'}:null, actions:[],error:null,owner:turn===2,remote_outcome:'not_sent',terminal_ready:true,round:1};
           if(turn!==2) chat.messages.push({id:'assistant-'+turn,role:'assistant',text:task.assistant_text,run_id:run,state:'complete',error:null,destination:null,model:null});
           chat.revision=String(turn*10); emit('model:event',{kind:'chat_updated',chat});
-          return {kind:'terminal',task:update()};
+          const result = { kind: 'terminal', task: update() };
+          submissions.set(args.submissionId, result);
+          if (ambiguousGreeting && turn === 1) throw new Error('Synthetic reply lost after accepted submission');
+          return result;
         }
         if (cmd === 'ack_terminal_action' && task?.action) {
           const action = task.action;
@@ -86,8 +95,17 @@ test('synthetic unified conversation: greeting, displayed ordinary command and c
               || !visible('.action-target') || !visible('.exact-command')) throw new Error('Exact command and target must be on screen before dispatch');
           // Simulate the backend result only after the production component's display ACK.
           action.displayed = true; action.delivery = 'write_accepted'; action.command_completed = true; action.exit_code = 0;
-          task.owner = false; task.phase = 'completed'; task.remote_outcome = 'foreground_returned';
-          task.assistant_text = 'Linux verified by uname.';
+          task.phase = 'budget_paused'; task.remote_outcome = 'foreground_returned';
+          task.assistant_text = 'Inspection output is available; continue this task when ready.';
+          return update();
+        }
+        if (cmd === 'read_action_output' && task?.action) {
+          if (request?.task_id !== task.task_id || request?.run_id !== task.run_id || request?.action_id !== task.action.action_id || request?.max_bytes !== 4096 || ![0, 4096].includes(Number(request?.offset))) throw new Error('Invalid local output read');
+          return { text: request.offset === 0 ? 'Synthetic Linux output page one' : 'Synthetic output page two', next_offset: request.offset === 0 ? 4096 : 4100, earliest_offset: 0, complete: true, has_more: request.offset === 0, truncated: true, gap: false };
+        }
+        if (cmd === 'continue_terminal_task' && task?.phase === 'budget_paused') {
+          if (request?.task_id !== task.task_id || request?.run_id !== task.run_id || request?.readiness_confirmed !== true) throw new Error('Invalid continuation identity');
+          task.owner = false; task.phase = 'completed'; task.assistant_text = 'Linux verified by uname.';
           chat.messages.push({ id: 'assistant-2', role: 'assistant', text: task.assistant_text, run_id: task.run_id, state: 'complete', error: null });
           chat.revision = '21'; emit('model:event', { kind: 'chat_updated', chat });
           return update();
@@ -95,7 +113,7 @@ test('synthetic unified conversation: greeting, displayed ordinary command and c
         throw new Error(`Unexpected synthetic IPC: ${cmd}`);
       },
     };
-  });
+  }, ambiguousGreeting);
   await page.goto('/');
   const composer = page.getByRole('textbox', { name: '聊天消息' });
   const scope = page.getByRole('dialog', { name: '确认模型接收方' });
@@ -103,6 +121,7 @@ test('synthetic unified conversation: greeting, displayed ordinary command and c
     __SYNTHETIC_TASK_CALLS__: Array<{ cmd: string; args: Record<string, unknown> }>;
   }).__SYNTHETIC_TASK_CALLS__);
   await expect(composer).toHaveCount(1);
+  await expect(page.locator('.conversation-details')).not.toHaveAttribute('open', '');
   await expect(page.getByRole('tab', { name: '执行终端任务' })).toHaveCount(0);
   await composer.fill('Hello');
   await page.getByRole('button', { name: '确认并发送', exact: true }).click();
@@ -111,6 +130,16 @@ test('synthetic unified conversation: greeting, displayed ordinary command and c
   await scope.getByRole('checkbox').check();
   await scope.getByRole('button', { name: '同意并发送' }).click();
   await expect(scope).toBeHidden();
+  if (ambiguousGreeting) {
+    await expect(page.getByRole('button', { name: '核对发送状态' })).toBeVisible();
+    await expect(composer).toHaveValue('Hello');
+    await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
+    expect((await recordedCalls()).filter(call => call.cmd === 'submit_conversation_turn')).toHaveLength(1);
+    // Keep background polling pending until the fixture's authoritative record is available.
+    await page.evaluate(() => { (window as unknown as Record<string, unknown>).__SYNTHETIC_ALLOW_LOOKUP__ = true; });
+    await page.getByRole('button', { name: '核对发送状态' }).click();
+    await expect(composer).toHaveValue('');
+  }
   await expect(page.getByText('Hello, ready to help.', { exact: true })).toHaveCount(1);
   await expect(page.getByText('Hello', { exact: true })).toHaveCount(1);
   expect((await recordedCalls()).filter(call => call.cmd === 'ack_terminal_action')).toHaveLength(0);
@@ -119,7 +148,32 @@ test('synthetic unified conversation: greeting, displayed ordinary command and c
   await page.getByRole('button', { name: '发送', exact: true }).click();
   const card = page.getByRole('group', { name: '精确终端命令' });
   await card.locator('.action-target').scrollIntoViewIfNeeded();
-  await expect(card.getByLabel('准确命令文本')).toHaveText('command uname -a');
+  await expect(card.getByLabel('准确命令文本')).toHaveText('uname -a | head -n 1');
+  await expect(card.locator('.action-details')).not.toHaveAttribute('open', '');
+  await expect(page.getByRole('button', { name: '继续任务', exact: true })).toBeVisible();
+  // The result may scroll the timeline; inspect the settled card without racing its ACK update.
+  await card.locator('.action-target').scrollIntoViewIfNeeded();
+  await expect(card.locator('.action-target')).toBeInViewport({ ratio: 1 });
+  await expect(card.getByLabel('准确命令文本')).toBeInViewport({ ratio: 1 });
+  await expect(page.getByRole('button', { name: '继续任务', exact: true })).toBeVisible();
+  expect((await recordedCalls()).filter(call => call.cmd === 'continue_terminal_task')).toHaveLength(0);
+  expect((await recordedCalls()).filter(call => call.cmd === 'read_action_output')).toHaveLength(0);
+  const output = card.locator('.action-output');
+  await output.locator('summary').click();
+  expect((await recordedCalls()).filter(call => call.cmd === 'read_action_output')).toHaveLength(0);
+  await output.getByRole('button', { name: '读取输出', exact: true }).click();
+  await expect(output).toContainText('Synthetic Linux output page one');
+  await expect(output).toContainText('仅保留部分输出');
+  await expect(output.getByRole('button', { name: '上一页', exact: true })).toBeDisabled();
+  await output.getByRole('button', { name: '下一页', exact: true }).click();
+  await expect(output).toContainText('Synthetic output page two');
+  await expect(output.getByRole('button', { name: '下一页', exact: true })).toBeDisabled();
+  await output.getByRole('button', { name: '上一页', exact: true }).click();
+  await expect(output).toContainText('Synthetic Linux output page one');
+  expect((await recordedCalls()).filter(call => call.cmd === 'submit_conversation_turn')).toHaveLength(2);
+  expect((await recordedCalls()).filter(call => call.cmd === 'ack_terminal_action')).toHaveLength(1);
+  await output.locator('summary').click();
+  await page.getByRole('button', { name: '继续任务', exact: true }).click();
   await expect(page.getByText('Linux verified by uname.', { exact: true })).toHaveCount(1);
   await expect(page.getByText('Inspect the server', { exact: true })).toHaveCount(1);
   await expect(page.getByRole('button', { name: '仅批准这条命令' })).toHaveCount(0);
@@ -141,7 +195,15 @@ test('synthetic unified conversation: greeting, displayed ordinary command and c
   expect(calls.filter(call => call.cmd === 'confirm_conversation_scope')).toHaveLength(1);
   expect(calls.filter(call => call.cmd === 'submit_conversation_turn').map(call => call.args.text)).toEqual(['Hello', 'Inspect the server', 'What OS did you find?']);
   expect(calls.filter(call => call.cmd === 'ack_terminal_action')).toHaveLength(1);
-  expect(calls.filter(call => ['start_terminal_task', 'send_chat_message', 'send_user_input', 'continue_terminal_task', 'decide_terminal_action'].includes(call.cmd))).toHaveLength(0);
+  expect(calls.filter(call => call.cmd === 'continue_terminal_task')).toHaveLength(1);
+  expect(calls.filter(call => call.cmd === 'read_action_output').map(call => (call.args.request as { offset: number }).offset)).toEqual([0, 4096, 0]);
+  const submits = calls.filter(call => call.cmd === 'submit_conversation_turn');
+  expect(new Set(submits.map(call => call.args.submissionId)).size).toBe(3);
+  const lookups = calls.filter(call => call.cmd === 'get_conversation_submission');
+  if (ambiguousGreeting) expect(lookups.length).toBeGreaterThanOrEqual(2);
+  else expect(lookups).toHaveLength(0);
+  for (const lookup of lookups) expect(lookup.args.submissionId).toBe(submits[0].args.submissionId);
+  expect(calls.filter(call => ['start_terminal_task', 'send_chat_message', 'send_user_input', 'decide_terminal_action'].includes(call.cmd))).toHaveLength(0);
   await page.screenshot({ path: testInfo.outputPath('synthetic-unified-three-turn-conversation.png'), fullPage: true });
   expect(errors).toEqual([]);
 });

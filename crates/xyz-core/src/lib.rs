@@ -8,7 +8,9 @@ pub mod tasks;
 #[cfg(windows)]
 mod windows_private_file;
 
+pub mod action_output;
 pub mod agent;
+mod command_ast;
 pub mod decision;
 mod execution;
 pub mod observation;

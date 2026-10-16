@@ -212,3 +212,84 @@ async fn unified_submission_fences_stale_model_and_session_before_network() {
     );
     assert!(chats.get_chat(&chat.chat_id).unwrap().messages.is_empty());
 }
+
+#[tokio::test]
+async fn submission_uuid_reconciles_lost_response_without_duplicate_model_request() {
+    use xyz_core::{
+        agent::{AgentManager, ConversationTurn},
+        model::ModelConfigManager,
+        ssh::SessionManager,
+    };
+    let (server, base) = listener().await;
+    let fixture = Fixture::new(&base, "");
+    let config = ModelConfigManager::from_path(Ok(fixture.path.clone()));
+    let chats = TaskManager::new(config.clone(), Arc::new(|_| true));
+    consent(&chats);
+    let agent = AgentManager::new(
+        config.clone(),
+        chats.clone(),
+        SessionManager::new(Arc::new(|_| true)),
+        Arc::new(|_| true),
+    );
+    let chat = chats.create_chat("Exactly one submission").unwrap();
+    let status = config.status();
+    let id = uuid::Uuid::new_v4().to_string();
+    let submit = || {
+        agent
+            .submit_idempotent_conversation_turn(
+                &id,
+                &chat.chat_id,
+                "Hello synthetic-private-key",
+                status.revision.as_deref().unwrap(),
+                status.destination.as_deref().unwrap(),
+                None,
+            )
+            .unwrap()
+    };
+    let ConversationTurn::Chat { chat: first } = submit() else {
+        panic!("expected chat")
+    };
+    let ConversationTurn::Chat { chat: duplicate } = submit() else {
+        panic!("expected chat")
+    };
+    assert_eq!(first.active_run_id, duplicate.active_run_id);
+    let ConversationTurn::Chat { chat: lookup } =
+        agent.get_conversation_submission(&id).unwrap().unwrap()
+    else {
+        panic!("expected lookup")
+    };
+    assert_eq!(first.active_run_id, lookup.active_run_id);
+    assert!(!lookup.messages[0].text.contains("synthetic-private-key"));
+    let (mut socket, _) = server.accept().await.unwrap();
+    let request = read_request(&mut socket).await;
+    let body: serde_json::Value =
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert!(!body.to_string().contains("synthetic-private-key"));
+    reply(&mut socket, "200 OK", &sse_text("Hello!", "stop")).await;
+    finished(&chats, &chat.chat_id).await;
+    let after = submit();
+    assert!(
+        matches!(after,ConversationTurn::Chat{chat} if chat.active_run_id.is_none() && chat.messages.len()==2)
+    );
+    let conflict = agent
+        .submit_idempotent_conversation_turn(
+            &id,
+            &chat.chat_id,
+            "Different message",
+            status.revision.as_deref().unwrap(),
+            status.destination.as_deref().unwrap(),
+            None,
+        )
+        .err()
+        .unwrap();
+    assert_eq!(conflict.code, "SUBMISSION_ID_CONFLICT");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), server.accept())
+            .await
+            .is_err()
+    );
+    assert!(agent
+        .get_conversation_submission(&uuid::Uuid::new_v4().to_string())
+        .unwrap()
+        .is_none());
+}

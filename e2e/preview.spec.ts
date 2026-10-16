@@ -81,6 +81,7 @@ test('synthetic IPC mock: explicit recipient consent and escaped streamed text',
           config.revision = '2'; config.consented = true; emit('model:event', { kind: 'config_updated', config }); return structuredClone(config);
         }
         if (cmd === 'submit_conversation_turn') {
+          if (typeof args.submissionId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(args.submissionId)) throw new Error('Missing submission UUID');
           if (!config.consented) throw new Error('Preview consent is required');
           if (args.session !== null) throw new Error('Greeting must work without SSH');
           turns += 1;
@@ -112,12 +113,14 @@ test('synthetic IPC mock: explicit recipient consent and escaped streamed text',
   await expect(page.getByRole('article', { name: '模型回复' })).toContainText('这是用于界面测试的合成流式回复。');
   await expect(page.getByRole('article', { name: '模型回复' })).toContainText('<script>window.unsafe = true</script>');
   expect(await page.evaluate(() => (window as unknown as { unsafe?: boolean }).unsafe)).toBeUndefined();
-  await expect(page.getByText('无生成中的聊天')).toBeVisible();
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '停止生成', exact: true })).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath('synthetic-ipc-completed-chat.png'), fullPage: true });
   await page.getByRole('textbox', { name: '聊天消息' }).fill('继续刚才的对话');
   await page.getByRole('button', { name: '发送', exact: true }).click();
   await expect(page.getByRole('article', { name: '模型回复' })).toHaveCount(2);
-  await expect(page.getByText('无生成中的聊天')).toBeVisible();
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '停止生成', exact: true })).toHaveCount(0);
   await expect(dialog).toBeHidden();
   const calls = await page.evaluate(() => (window as unknown as { __SYNTHETIC_IPC_CALLS__: string[] }).__SYNTHETIC_IPC_CALLS__);
   expect(calls.filter(cmd => cmd === 'confirm_conversation_scope')).toHaveLength(1);

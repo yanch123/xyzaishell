@@ -1,7 +1,7 @@
 import type { ApiError, SessionRef } from './types';
 
 /** All execution authority lives in the native dispatcher; these are display DTOs. */
-export type TaskPhase = 'preparing' | 'awaiting_display' | 'waiting_approval' | 'dispatching' | 'awaiting_completion' | 'unsupported_action' | 'needs_user' | 'needs_secrets' | 'completed' | 'cancelled' | 'failed';
+export type TaskPhase = 'preparing' | 'awaiting_display' | 'waiting_approval' | 'dispatching' | 'awaiting_completion' | 'unsupported_action' | 'needs_user' | 'needs_secrets' | 'budget_paused' | 'completed' | 'cancelled' | 'failed';
 export type TerminalAction = {
   kind?: 'command' | 'secret_input';
   secret_field?: string | null;
@@ -48,6 +48,7 @@ export type TerminalTaskSnapshot = {
   owner: boolean;
   remote_outcome: 'unknown' | 'not_sent' | 'foreground_returned';
   round: number;
+  batch_round?: number;
   task_context?: TaskContext | null;
   secret_request?: { fields: { name: string; required: boolean }[]; purpose: string } | null;
 };
@@ -62,7 +63,7 @@ export type TaskIdentity = { task_id: string; run_id: string };
 export type ActionIdentity = TaskIdentity & { action_id: string; display_revision: string };
 export type AgentEvent = { kind: 'task_updated'; task: TerminalTaskSnapshot };
 export const TASK_PHASE_LABELS: Record<TaskPhase, string> = {
-  preparing: '模型分析中', awaiting_display: '命令已准备 · 等待显示', waiting_approval: '等待本次批准',
+  budget_paused: '已处理一轮，需要继续吗？', preparing: '模型分析中', awaiting_display: '命令已准备 · 等待显示', waiting_approval: '等待本次批准',
   awaiting_completion: '等待命令返回与 Shell 就绪', unsupported_action: '未知风险 · 需要手动处理',
   needs_secrets: '需要任务秘密 · 等待本机填写', dispatching: '正在派发', needs_user: '需你核实终端', completed: 'AI 流程已结束', cancelled: 'AI 已停止', failed: 'AI 流程出错',
 };
@@ -81,3 +82,5 @@ export function visibleCommand(text: string): string {
 export function actionIdentity(task: TerminalTaskSnapshot): ActionIdentity | null {
   return task.action ? { task_id: task.task_id, run_id: task.run_id, action_id: task.action.action_id, display_revision: task.action.display_revision } : null;
 }
+
+export type ActionOutputPage = { text: string; next_offset: number; earliest_offset: number; complete: boolean; has_more: boolean; truncated: boolean; gap: boolean };

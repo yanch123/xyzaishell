@@ -6,7 +6,9 @@ use crate::{
     shell_log_protocol::{bootstrap_command, startup_command, ProtocolParser, WireEvent},
     ssh::{ApiError, SessionRef, SessionSnapshot, SessionState},
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, VecDeque},
     sync::{Arc, Mutex},
@@ -44,6 +46,9 @@ pub struct IntegrationStatus {
     pub active_action_id: Option<String>,
     pub completed: Option<CommandCompletion>,
     pub shadowed_commands: Vec<String>,
+    /// Manual audit capability; explicit AI action records remain exact.
+    #[serde(default)]
+    pub manual_tracking: Option<String>,
     pub error: Option<ApiError>,
 }
 #[derive(Clone, Debug)]
@@ -61,6 +66,7 @@ pub struct DispatchBinding {
     pub action_id: String,
     pub command: String,
     pub transport_command: String,
+    pub payload_digest: String,
 }
 /// Remove only host-issued correlation suffixes from model-facing echoed text.
 /// Streaming prefixes and the recent marker set are independently bounded; the
@@ -76,6 +82,12 @@ impl EchoMetadataFilter {
         if !self.markers.contains(&marker) {
             self.markers.push_back(marker);
         }
+        while self.markers.len() > 16 {
+            self.markers.pop_front();
+        }
+    }
+    fn register_transport(&mut self, transport: &str) {
+        self.markers.push_back(transport.as_bytes().to_vec());
         while self.markers.len() > 16 {
             self.markers.pop_front();
         }
@@ -124,9 +136,10 @@ fn error(code: &str, message: &str) -> ApiError {
 /// exposed; an unknown reason never becomes UI text or a repair command.
 fn unsupported_shell(reason: &str) -> ApiError {
     let (code, message) = match reason {
+        "control_conflict" => ("SHELL_UNSUPPORTED_CONTROL_CONFLICT", "Shell 的控制原语存在同名函数或别名，无法可靠封装命令。原有定义已保留，可继续使用手动终端。"),
         "unsupported_bash" => (
             "SHELL_UNSUPPORTED_BASH",
-            "自动执行需要交互式 Bash 5.1 或 5.2。当前环境不受支持，请继续使用手动终端；未修改 Shell 设置。",
+            "自动执行需要交互式 Bash 4.2、5.1 或 5.2。当前环境不受支持，请继续使用手动终端；未修改 Shell 设置。",
         ),
         "namespace_conflict" => (
             "SHELL_UNSUPPORTED_NAMESPACE",
@@ -179,6 +192,55 @@ pub fn correlated_command(action_id: &str, command: &str) -> Result<String, ApiE
     }
     Ok(format!("{command} # xyz-action:{action_id}"))
 }
+/// Original bytes are encoded as an inert Bash ANSI-C literal. The approved
+/// action and its exact transport stay separate; no parsing/reprinting occurs.
+pub const MAX_ACTION_TRANSPORT_BYTES: usize = 64 * 1024;
+pub fn action_envelope(
+    session: &SessionRef,
+    action_id: &str,
+    command: &str,
+    expected: &ReadyBinding,
+) -> Result<String, ApiError> {
+    crate::execution::validate_command(command)?;
+    let safe_id = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 128
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    };
+    if !safe_id(action_id)
+        || !safe_id(&session.session_id)
+        || !safe_id(&session.generation)
+        || expected.shell_id.len() != 32
+        || !expected
+            .shell_id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(error(
+            "SHELL_ACTION_INVALID",
+            "命令封装身份无效，未发送任何输入。",
+        ));
+    }
+    let sequence = expected
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| error("SHELL_SEQUENCE_LIMIT", "Shell 序号已耗尽，请重新连接。"))?;
+    let encoded = command
+        .as_bytes()
+        .iter()
+        .map(|b| format!("\\x{b:02x}"))
+        .collect::<String>();
+    let digest = format!("{:x}", Sha256::digest(command.as_bytes()));
+    let transport = format!("if [[ ${{__xyz_nonce-}} == '{}' && ${{__xyz_seq-}} == {} && ${{__xyz_failed-1}} == 0 ]]; then __xyz_payload=$'{}'; if __xyz_action_begin '{}' '{}' '{}' '{}' {} '{}' '{}' \"$(builtin trap -p)\"; then builtin eval -- \"$__xyz_payload\"; __xyz_code=$?; __xyz_action_end \"$__xyz_code\"; fi; else __xyz_gap; fi # xyz-action:{}", expected.shell_id, expected.sequence, encoded, expected.shell_id, session.session_id, session.generation, action_id, sequence, digest, STANDARD.encode(command), action_id);
+    if transport.len() + 1 > MAX_ACTION_TRANSPORT_BYTES {
+        return Err(error(
+            "SHELL_ACTION_INVALID",
+            "命令封装超过传输上限，未发送。",
+        ));
+    }
+    Ok(transport)
+}
 impl Default for ShellIntegrationService {
     fn default() -> Self {
         Self::new()
@@ -195,6 +257,7 @@ impl ShellIntegrationService {
             active_action_id: None,
             completed: None,
             shadowed_commands: vec![],
+            manual_tracking: None,
             error: None,
         };
         let (updates, _) = watch::channel(status.clone());
@@ -316,6 +379,7 @@ impl ShellIntegrationService {
         c.status.active_action_id = None;
         c.status.completed = None;
         c.status.shadowed_commands.clear();
+        c.status.manual_tracking = None;
         c.status.error = None;
         c.hello = false;
         c.pending = None;
@@ -367,7 +431,7 @@ impl ShellIntegrationService {
         {
             return Err(error("SHELL_CONTEXT_CHANGED", "The shell context changed after this action was prepared. Prepare a new action; the old approval cannot be reused."));
         }
-        let transport_command = correlated_command(action_id, command)?;
+        let transport_command = action_envelope(session, action_id, command, expected)?;
         let sequence = c.status.sequence.checked_add(1).ok_or_else(|| {
             error(
                 "SHELL_SEQUENCE_LIMIT",
@@ -381,8 +445,10 @@ impl ShellIntegrationService {
             action_id: action_id.into(),
             command: command.into(),
             transport_command,
+            payload_digest: format!("{:x}", Sha256::digest(command.as_bytes())),
         };
         c.echo_filter.register(action_id);
+        c.echo_filter.register_transport(&binding.transport_command);
         c.pending = Some(binding.clone());
         c.status.active_action_id = Some(action_id.into());
         c.status.completed = None;
@@ -406,6 +472,7 @@ impl ShellIntegrationService {
                     && p.sequence == binding.sequence
                     && p.revision == binding.revision
                     && p.command == binding.command
+                    && p.payload_digest == binding.payload_digest
                     && p.transport_command == binding.transport_command
             })
         {
@@ -442,6 +509,16 @@ impl ShellIntegrationService {
     /// Metadata filtering runs regardless of logs, paused collection, capacity,
     /// or disk failure. Original SSH bytes still go to the visible terminal.
     pub fn ingest(&self, session: &SessionRef, bytes: &[u8]) -> Vec<u8> {
+        self.ingest_with_observer(session, bytes, |_| {})
+    }
+    /// Append filtered output before any lifecycle publication can wake an
+    /// action consumer. The callback must not re-enter this integration service.
+    pub(crate) fn ingest_with_observer(
+        &self,
+        session: &SessionRef,
+        bytes: &[u8],
+        observe: impl FnOnce(&[u8]),
+    ) -> Vec<u8> {
         let (parsed, events) = {
             let mut c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if c.deadline
@@ -469,30 +546,66 @@ impl ShellIntegrationService {
             c.parser_session = Some(session.clone());
             let mut parsed = c.parser.feed(bytes);
             parsed.visible = c.echo_filter.feed(&parsed.visible);
+            observe(&parsed.visible);
             let mut events = Vec::with_capacity(parsed.events.len());
             for event in &parsed.events {
-                let mut log_event = event.clone();
                 if c.status.session.as_ref() == Some(session) {
-                    if c.status.phase == IntegrationPhase::AwaitingBegin {
-                        if let (
-                            WireEvent::Begin {
-                                sequence, command, ..
-                            },
-                            Some(binding),
-                        ) = (event, c.pending.as_ref())
-                        {
-                            if *sequence == binding.sequence
-                                && *command == binding.transport_command
-                            {
-                                if let WireEvent::Begin { command, .. } = &mut log_event {
-                                    *command = binding.command.clone();
-                                }
-                            }
-                        }
-                    }
                     self.event(&mut c, event);
                 }
-                events.push(log_event);
+                // Only the integration validator can convert explicit action
+                // frames into logging events. No wrapper history is recorded.
+                let log_event = match event {
+                    WireEvent::ActionBegin {
+                        sequence,
+                        remote_time_s,
+                        cwd,
+                        command,
+                        ..
+                    } if c.status.phase == IntegrationPhase::Running
+                        && c.active_sequence == Some(*sequence) =>
+                    {
+                        Some(WireEvent::Begin {
+                            sequence: *sequence,
+                            remote_time_s: *remote_time_s,
+                            cwd: cwd.clone(),
+                            command: command.clone(),
+                        })
+                    }
+                    WireEvent::ActionEnd {
+                        sequence,
+                        remote_time_s,
+                        exit_code,
+                        ..
+                    } if c.status.phase == IntegrationPhase::AwaitingReady => {
+                        Some(WireEvent::End {
+                            sequence: *sequence,
+                            remote_time_s: *remote_time_s,
+                            exit_code: *exit_code,
+                        })
+                    }
+                    WireEvent::ActionBegin { sequence, .. }
+                    | WireEvent::ActionEnd { sequence, .. } => Some(WireEvent::Gap {
+                        sequence: *sequence,
+                        reason: "action_mismatch".into(),
+                    }),
+                    WireEvent::Gap { sequence, reason }
+                        if matches!(
+                            reason.as_str(),
+                            "legacy_history_fidelity"
+                                | "legacy_unobserved_command"
+                                | "legacy_async_command"
+                        ) && c.status.phase != IntegrationPhase::AwaitingReady =>
+                    {
+                        Some(WireEvent::Gap {
+                            sequence: *sequence,
+                            reason: "action_mismatch".into(),
+                        })
+                    }
+                    _ => Some(event.clone()),
+                };
+                if let Some(event) = log_event {
+                    events.push(event);
+                }
             }
             (parsed, events)
         };
@@ -514,9 +627,27 @@ impl ShellIntegrationService {
             return;
         }
         match event {
+            WireEvent::ActionBegin { sequence, session_id, generation, action_id, digest, command, .. } => {
+                let matches = c.pending.as_ref().is_some_and(|p| p.sequence == *sequence && p.action_id == *action_id && p.payload_digest == *digest && p.command == *command)
+                    && c.status.session.as_ref().is_some_and(|s| s.session_id == *session_id && s.generation == *generation);
+                if !c.hello || c.status.phase != AwaitingBegin || c.active_sequence.is_some() || c.status.sequence.checked_add(1) != Some(*sequence) || !matches {
+                    self.unknown(c, "SHELL_ACTION_BEGIN_MISMATCH", "命令开始信息与当前动作不匹配，自动执行已停止。"); return;
+                }
+                c.status.sequence = *sequence; c.active_sequence = Some(*sequence); c.status.phase = Running; self.publish(c);
+            }
+            WireEvent::ActionEnd { sequence, session_id, generation, action_id, digest, exit_code, .. } => {
+                let matches = c.pending.as_ref().is_some_and(|p| p.sequence == *sequence && p.action_id == *action_id && p.payload_digest == *digest)
+                    && c.status.session.as_ref().is_some_and(|s| s.session_id == *session_id && s.generation == *generation);
+                if !c.hello || c.status.phase != Running || c.active_sequence != Some(*sequence) || !matches {
+                    self.unknown(c, "SHELL_ACTION_END_MISMATCH", "命令结束信息与当前动作不匹配，结果未知。"); return;
+                }
+                c.active_sequence = None; c.status.phase = AwaitingReady;
+                c.status.completed = Some(CommandCompletion { action_id: action_id.clone(), sequence: *sequence, exit_code: *exit_code }); self.publish(c);
+            }
             WireEvent::Hello { shell_version } => {
-                if c.status.phase != Installing || c.hello || !(shell_version.starts_with("5.1.") || shell_version.starts_with("5.2.")) { self.unknown(c, "SHELL_HANDSHAKE_INVALID", "The current-shell handshake did not match the supported integration."); return; }
+                if c.status.phase != Installing || c.hello || !(shell_version.starts_with("4.2.") || shell_version.starts_with("5.1.") || shell_version.starts_with("5.2.")) { self.unknown(c, "SHELL_HANDSHAKE_INVALID", "The current-shell handshake did not match the supported integration."); return; }
                 c.hello = true;
+                c.status.manual_tracking = Some(if shell_version.starts_with("4.2.") { "prompt_gap_only" } else { "exact" }.into());
                 c.status.phase = AwaitingReady;
                 self.publish(c);
             }
@@ -530,7 +661,7 @@ impl ShellIntegrationService {
                 self.publish(c);
             }
             WireEvent::Ready { sequence, shadowed_commands, .. } => {
-                if !c.hello || c.status.phase != AwaitingReady || c.active_sequence.is_some() || *sequence != c.status.sequence { self.unknown(c, "SHELL_READY_ORDER", "An out-of-order shell-ready event was discarded; automatic input stopped."); return; }
+                if !c.hello || !matches!(c.status.phase, AwaitingReady | Ready) || c.active_sequence.is_some() || (c.status.phase == Ready && c.pending.is_some()) || *sequence != c.status.sequence { self.unknown(c, "SHELL_READY_ORDER", "An out-of-order shell-ready event was discarded; automatic input stopped."); return; }
                 c.deadline = None;
                 c.status.phase = Ready;
                 c.status.shadowed_commands = shadowed_commands.clone();
@@ -538,25 +669,31 @@ impl ShellIntegrationService {
                 c.pending = None;
                 self.publish(c);
             }
-            WireEvent::Begin { sequence, command, .. } => {
+            WireEvent::Begin { sequence, .. } => {
                 if !c.hello || !matches!(c.status.phase, Ready | AwaitingBegin) || c.active_sequence.is_some() || c.status.sequence.checked_add(1) != Some(*sequence) { self.unknown(c, "SHELL_BEGIN_ORDER", "Command start correlation was lost; automatic input stopped."); return; }
-                if c.pending.as_ref().is_some_and(|p| p.sequence != *sequence || p.transport_command != *command) { self.unknown(c, "SHELL_INPUT_CONFLICT", "The observed command did not match the prepared action. Manual/AI input may have overlapped; automatic input stopped."); return; }
+                if c.pending.is_some() { self.unknown(c, "SHELL_INPUT_CONFLICT", "The observed command did not match the prepared action. Manual/AI input may have overlapped; automatic input stopped."); return; }
                 if c.pending.is_none() { c.status.completed = None; }
                 c.status.sequence = *sequence;
                 c.active_sequence = Some(*sequence);
                 c.status.phase = Running;
                 self.publish(c);
             }
-            WireEvent::End { sequence, exit_code, .. } => {
-                if !c.hello || c.status.phase != Running || c.active_sequence != Some(*sequence) { self.unknown(c, "SHELL_END_ORDER", "Command completion correlation was lost; automatic input stopped."); return; }
+            WireEvent::End { sequence, .. } => {
+                if !c.hello || c.pending.is_some() || c.status.phase != Running || c.active_sequence != Some(*sequence) { self.unknown(c, "SHELL_END_ORDER", "Command completion correlation was lost; automatic input stopped."); return; }
                 c.active_sequence = None;
                 c.status.phase = AwaitingReady;
-                if let Some(binding) = c.pending.as_ref() {
-                    c.status.completed = Some(CommandCompletion { action_id: binding.action_id.clone(), sequence: *sequence, exit_code: *exit_code });
-                }
                 self.publish(c);
             }
             WireEvent::Closed => { c.status.phase = Disconnected; c.deadline = None; c.pending = None; c.active_sequence = None; self.publish(c); }
+            WireEvent::Gap { sequence, reason } if matches!(reason.as_str(), "legacy_history_fidelity" | "legacy_unobserved_command" | "legacy_async_command") && c.pending.is_none() && c.active_sequence.is_none() && c.status.phase == Ready && (*sequence == c.status.sequence || c.status.sequence.checked_add(1) == Some(*sequence)) => {
+                // This is only a lost manual observation, never an AI outcome.
+                // Invalidate prior ready bindings and wait for an independent R.
+                c.status.sequence = *sequence;
+                c.status.completed = None;
+                c.status.active_action_id = None;
+                c.status.phase = AwaitingReady;
+                self.publish(c);
+            }
             WireEvent::Gap { .. } | WireEvent::Malformed { .. } => self.unknown(c, "SHELL_METADATA_GAP", "Shell metadata was missing, changed, malformed, or oversized. No completion or readiness was inferred."),
         }
     }

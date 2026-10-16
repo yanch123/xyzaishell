@@ -5,29 +5,34 @@ if [[ ${BASH_VERSINFO[0]-} != 5 || ( ${BASH_VERSINFO[1]-} != 1 && ${BASH_VERSINF
 elif [[ -n $(builtin compgen -A variable __xyz_) || -n $(builtin compgen -A function __xyz_) || -n $(builtin compgen -A alias __xyz_) ]]; then
  builtin printf '\033]777;xyzlog;2;@NONCE@;U;namespace_conflict\007'
 else
+# @ACTION_HELPERS@
  __xyz_install() {
-  local pc_decl ps_decl name value
+  if ! __xyz_controls_ok; then builtin printf '\033]777;xyzlog;2;@NONCE@;U;control_conflict\007'; builtin return; fi
+  builtin local pc_decl ps_decl name value
   if [[ $- == *e* || $- == *T* || $- == *a* || $- == *r* ]] || builtin shopt -q extdebug || [[ -o posix ]] || ! [[ -o history ]] || ! builtin shopt -q cmdhist promptvars interactive_comments || [[ ${HISTSIZE-0} -le 0 || -n ${HISTIGNORE-} || ${histchars-'!^#'} != '!^#' ]]; then
-   builtin printf '\033]777;xyzlog;2;@NONCE@;U;unsupported_options\007'; return
+   builtin printf '\033]777;xyzlog;2;@NONCE@;U;unsupported_options\007'; builtin return
+  fi
+  if [[ ${HISTSIZE+x} != x && $(builtin declare -p HISTSIZE 2>/dev/null) =~ ^declare\ -[^\ ]*r ]]; then
+   builtin printf '\033]777;xyzlog;2;@NONCE@;U;unsupported_options\007'; builtin return
   fi
   # Only an EXIT trap is supported. An async trap can read input between ready
   # and dispatch; DEBUG/RETURN/ERR also alter status/hook semantics. None changed.
-  if [[ $1 != "$2" ]]; then
-   builtin printf '\033]777;xyzlog;2;@NONCE@;U;unsupported_trap\007'; return
+  if [[ $(__xyz_norm_traps "$1") != "$(__xyz_norm_traps "$2")" ]]; then
+   builtin printf '\033]777;xyzlog;2;@NONCE@;U;unsupported_trap\007'; builtin return
   fi
   # Prompt expansion happens AFTER PROMPT_COMMAND. Permit only non-executing
   # parameter forms, including Ubuntu's debian_chroot and native \$ suffix.
   # Reject octal escapes: they could synthesize a dollar/backtick after decoding.
   value=${PS1-}
   if [[ $value == *'$('* || $value == *'$['* || $value == *'`'* || $value =~ \\[0-7]{3} ]]; then
-   builtin printf '\033]777;xyzlog;2;@NONCE@;U;dynamic_prompt\007'; return
+   builtin printf '\033]777;xyzlog;2;@NONCE@;U;dynamic_prompt\007'; builtin return
   fi
   while [[ $value == *'$'* ]]; do
    value=${value#*\$}
    if [[ $value == '{'* ]]; then
     name=${value#\{}; name=${name%%\}*}
     if ! [[ $name =~ ^[a-zA-Z_][a-zA-Z_0-9]*$ || $name =~ ^[a-zA-Z_][a-zA-Z_0-9]*:[+-][^\{\}]*$ ]] || [[ $value != *'}'* ]]; then
-     builtin printf '\033]777;xyzlog;2;@NONCE@;U;dynamic_prompt\007'; return
+     builtin printf '\033]777;xyzlog;2;@NONCE@;U;dynamic_prompt\007'; builtin return
     fi
     value=${value#*\}}
    fi
@@ -35,77 +40,87 @@ else
   pc_decl=$(builtin declare -p PROMPT_COMMAND 2>/dev/null)
   ps_decl=$(builtin declare -p PS0 2>/dev/null)
   if [[ $pc_decl =~ ^declare\ -[^\ ]*[rxAn] || $ps_decl =~ ^declare\ -[^\ ]*[rxanA] ]]; then
-   builtin printf '\033]777;xyzlog;2;@NONCE@;U;unsupported_hook_attributes\007'; return
+   builtin printf '\033]777;xyzlog;2;@NONCE@;U;unsupported_hook_attributes\007'; builtin return
   fi
   command -v base64 >/dev/null || {
-   builtin printf '\033]777;xyzlog;2;@NONCE@;U;missing_tools\007'; return
+   builtin printf '\033]777;xyzlog;2;@NONCE@;U;missing_tools\007'; builtin return
   }
   __xyz_nonce='@NONCE@'
   __xyz_seq=0
   __xyz_ended=0
   __xyz_empty=
   __xyz_failed=0
+  __xyz_ai_active=0
   __xyz_original_ps0_set=${PS0+x}
   __xyz_original_ps0=${PS0-}
   __xyz_original_pc_decl=$pc_decl
   __xyz_original_ps1=${PS1-}
-  __xyz_original_traps=$1
+  __xyz_original_traps=$(__xyz_norm_traps "$1")
   __xyz_original_histcontrol=${HISTCONTROL-}
   __xyz_original_histignore=${HISTIGNORE-}
   __xyz_original_histsize=${HISTSIZE-}
   __xyz_last_history=$(HISTTIMEFORMAT= builtin history 1; builtin printf x)
-  __xyz_b64() { local encoded; encoded=$(builtin printf '%s' "$1" | command base64) || return; builtin printf '%s' "${encoded//$'\n'/}"; }
+  __xyz_b64() { builtin local encoded; encoded=$(builtin printf '%s' "$1" | command base64) || builtin return; builtin printf '%s' "${encoded//$'\n'/}"; }
   __xyz_gap() {
    __xyz_failed=1
    builtin printf '\033]777;xyzlog;2;%s;G;%s;hooks_changed\007' "$__xyz_nonce" "$__xyz_seq"
   }
   __xyz_begin() {
-   local LC_ALL=C h cmd cwd now command64 cwd64
-   (( __xyz_failed == 0 )) || return 0
+   builtin local LC_ALL=C h cmd cwd now command64 cwd64
+   (( __xyz_failed == 0 )) || builtin return 0
+   __xyz_is_envelope && builtin return 0
    builtin printf -v now '%(%s)T' -1
    h=$(HISTTIMEFORMAT= builtin history 1; builtin printf x)
    if [[ $h == "$__xyz_last_history" ]]; then
-    builtin printf '\033]777;xyzlog;2;%s;G;%s;history_missing\007' "$__xyz_nonce" "$__xyz_seq"; return
+    builtin printf '\033]777;xyzlog;2;%s;G;%s;history_missing\007' "$__xyz_nonce" "$__xyz_seq"; builtin return
    fi
    h=${h%x}; h=${h%$'\n'}
    if [[ $h =~ ^[\ ]*[0-9]+[\ *][\ ] ]]; then cmd=${h:${#BASH_REMATCH[0]}}; else
-    builtin printf '\033]777;xyzlog;2;%s;G;%s;history_missing\007' "$__xyz_nonce" "$__xyz_seq"; return
+    builtin printf '\033]777;xyzlog;2;%s;G;%s;history_missing\007' "$__xyz_nonce" "$__xyz_seq"; builtin return
    fi
    cwd=$(builtin pwd -P; builtin printf x); cwd=${cwd%x}; cwd=${cwd%$'\n'}
    if [[ $cwd != /* || -z $cmd ]] || (( ${#cmd} > 16384 || ${#cwd} > 4096 )); then
-    builtin printf '\033]777;xyzlog;2;%s;G;%s;oversize\007' "$__xyz_nonce" "$__xyz_seq"; return
+    builtin printf '\033]777;xyzlog;2;%s;G;%s;oversize\007' "$__xyz_nonce" "$__xyz_seq"; builtin return
    fi
-   command64=$(__xyz_b64 "$cmd") && cwd64=$(__xyz_b64 "$cwd") || { __xyz_gap; return; }
+   command64=$(__xyz_b64 "$cmd") && cwd64=$(__xyz_b64 "$cwd") || { __xyz_gap; builtin return; }
    builtin printf '\033]777;xyzlog;2;%s;B;%s;%s;%s;%s\007' "$__xyz_nonce" "$__xyz_seq" "$now" "$cwd64" "$command64"
   }
   __xyz_end() {
-   local code=$? now
+   builtin local code=$? now
+   if (( __xyz_ai_active == 1 )); then __xyz_action_end "$code"; builtin return "$code"; fi
    if (( __xyz_failed == 0 && __xyz_seq > __xyz_ended )); then
     builtin printf -v now '%(%s)T' -1
     builtin printf '\033]777;xyzlog;2;%s;E;%s;%s;%s\007' "$__xyz_nonce" "$__xyz_seq" "$now" "$code"
     __xyz_ended=$__xyz_seq
     __xyz_last_history=$(HISTTIMEFORMAT= builtin history 1; builtin printf x)
    fi
-   return "$code"
+   builtin return "$code"
+  }
+  __xyz_intact() {
+   __xyz_controls_ok || builtin return 1
+   [[ -z $(builtin compgen -A alias __xyz_) ]] || builtin return 1
+   [[ $(builtin declare -f $__xyz_helper_names) == "$__xyz_owned_helpers" ]] || builtin return 1
+   if [[ ${PS0-} != "$__xyz_owned_ps0" || $(builtin declare -p PROMPT_COMMAND) != "$__xyz_owned_pc_decl" || ${PS1-} != "$__xyz_original_ps1" || $(__xyz_norm_traps "$1") != "$__xyz_original_traps" || ${HISTCONTROL-} != "$__xyz_original_histcontrol" || ${HISTIGNORE-} != "$__xyz_original_histignore" || ${HISTSIZE-} != "$__xyz_original_histsize" || ${histchars-'!^#'} != '!^#' || $- == *e* || $- == *T* || $- == *a* || $- == *r* ]] || builtin shopt -q extdebug || [[ -o posix ]] || ! [[ -o history ]] || ! builtin shopt -q cmdhist promptvars interactive_comments; then
+    builtin return 1
+   fi
+   builtin return 0
   }
   __xyz_ready() {
-   local code=$? names names64 now LC_ALL=C
-   if (( __xyz_failed != 0 )); then return "$code"; fi
-   if [[ ${PS0-} != "$__xyz_owned_ps0" || $(builtin declare -p PROMPT_COMMAND) != "$__xyz_owned_pc_decl" || ${PS1-} != "$__xyz_original_ps1" || $1 != "$__xyz_original_traps" || ${HISTCONTROL-} != "$__xyz_original_histcontrol" || ${HISTIGNORE-} != "$__xyz_original_histignore" || ${HISTSIZE-} != "$__xyz_original_histsize" || ${histchars-'!^#'} != '!^#' || $- == *e* || $- == *T* || $- == *a* || $- == *r* ]] || builtin shopt -q extdebug || [[ -o posix ]] || ! [[ -o history ]] || ! builtin shopt -q cmdhist promptvars interactive_comments; then
-    __xyz_gap; return "$code"
-   fi
+   builtin local code=$? names names64 now LC_ALL=C
+   if (( __xyz_failed != 0 )); then builtin return "$code"; fi
+   if ! __xyz_intact "$1"; then __xyz_gap; builtin return "$code"; fi
    # Names only, never definitions/values (which may contain credentials).
    names=$(builtin compgen -A alias; builtin compgen -A function)
-   if (( ${#names} > 8192 )); then __xyz_gap; return "$code"; fi
-   names64=$(__xyz_b64 "$names") || { __xyz_gap; return "$code"; }
+   if (( ${#names} > 8192 )); then __xyz_gap; builtin return "$code"; fi
+   names64=$(__xyz_b64 "$names") || { __xyz_gap; builtin return "$code"; }
    builtin printf -v now '%(%s)T' -1
    builtin printf '\033]777;xyzlog;2;%s;R;%s;%s;%s\007' "$__xyz_nonce" "$__xyz_seq" "$now" "$names64"
-   return "$code"
+   builtin return "$code"
   }
   __xyz_uninstall() {
    # Run only after explicit confirmation of an idle current Bash prompt.
    # Restore an exact owned hook only; never overwrite a user's later edit.
-   local code=$? restore_pc=0 restore_ps0=0 name
+   builtin local code=$? restore_pc=0 restore_ps0=0 name
    [[ $(builtin declare -p PROMPT_COMMAND 2>/dev/null) == "$__xyz_owned_pc_decl" ]] && restore_pc=1
    [[ ${PS0-} == "$__xyz_owned_ps0" ]] && restore_ps0=1
    if (( restore_pc )); then
@@ -122,15 +137,17 @@ else
     for name in $(builtin compgen -A variable __xyz_); do builtin unset "$name"; done
     for name in $(builtin compgen -A function __xyz_); do builtin unset -f "$name"; done
    fi
-   return "$code"
+   builtin return "$code"
   }
-  PS0=${PS0-}'${__xyz_empty:$((__xyz_seq+=1)):0}$(__xyz_begin)'
+  PS0=${PS0-}'${__xyz_empty:$((__xyz_seq+=$(__xyz_manual_step))):0}$(__xyz_begin)'
   __xyz_owned_ps0=$PS0
   if [[ $pc_decl == 'declare -a '* ]]; then
    PROMPT_COMMAND=(__xyz_end "${PROMPT_COMMAND[@]}" '__xyz_ready "$(builtin trap -p)"')
   else
    PROMPT_COMMAND=$'__xyz_end\n'${PROMPT_COMMAND-}$'\n__xyz_ready "$(builtin trap -p)"'
   fi
+  __xyz_helper_names='__xyz_controls_ok __xyz_norm_traps __xyz_is_envelope __xyz_manual_step __xyz_action_begin __xyz_action_end __xyz_b64 __xyz_gap __xyz_begin __xyz_end __xyz_intact __xyz_ready __xyz_uninstall'
+  __xyz_owned_helpers=$(builtin declare -f $__xyz_helper_names)
   __xyz_owned_pc_decl=$(builtin declare -p PROMPT_COMMAND)
   builtin printf '\033]777;xyzlog;2;%s;H;%s\007' "$__xyz_nonce" "$BASH_VERSION"
  }

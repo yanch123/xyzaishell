@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatSnapshot, ModelEvent } from '../lib/model';
 import { chat, modelConfig, stream } from '../test/modelFixtures';
 
-const mocks = vi.hoisted(() => ({ native: vi.fn(), listen: vi.fn(), config: vi.fn(), list: vi.fn(), create: vi.fn(), get: vi.fn(), send: vi.fn(), sendText: vi.fn(), cancel: vi.fn(), reload: vi.fn(), confirm: vi.fn(), confirmScope: vi.fn(), probe: vi.fn(), save: vi.fn(), testSaved: vi.fn(), cancelTest: vi.fn() }));
+const mocks = vi.hoisted(() => ({ native: vi.fn(), listen: vi.fn(), config: vi.fn(), list: vi.fn(), create: vi.fn(), get: vi.fn(), send: vi.fn(), submission: vi.fn(), sendText: vi.fn(), cancel: vi.fn(), reload: vi.fn(), confirm: vi.fn(), confirmScope: vi.fn(), probe: vi.fn(), save: vi.fn(), testSaved: vi.fn(), cancelTest: vi.fn() }));
 vi.mock('../lib/bridge', () => ({ desktopAvailable: mocks.native }));
 vi.mock('../lib/modelBridge', () => ({ modelBridge: mocks }));
 import { useModelChat } from './useModelChat';
@@ -16,6 +16,7 @@ beforeEach(() => {
   mocks.config.mockResolvedValue({ ...modelConfig });
   mocks.list.mockResolvedValue([chat()]);
   mocks.create.mockResolvedValue(chat('chat-b'));
+  mocks.submission.mockResolvedValue(null);
   mocks.get.mockImplementation(async (id: string) => chat(id));
   mocks.send.mockImplementation(async (id: string) => ({ kind: 'chat', chat: stream(id) }));
   mocks.sendText.mockImplementation(async (id: string) => stream(id));
@@ -80,7 +81,7 @@ describe('M2 canonical chat lifecycle', () => {
     act(() => emit({ kind: 'chat_updated', chat: stream('chat-a', '3', 'answer A') }));
     expect(result.current.current.messages).toHaveLength(0);
     await act(async () => { await result.current.send('chat-b'); });
-    expect(mocks.send.mock.calls).toEqual([['chat-a', 'message A', modelConfig.revision, modelConfig.destination, null], ['chat-b', 'message B', modelConfig.revision, modelConfig.destination, null]]);
+    expect(mocks.send.mock.calls).toEqual([['chat-a', 'message A', modelConfig.revision, modelConfig.destination, null, expect.any(String)], ['chat-b', 'message B', modelConfig.revision, modelConfig.destination, null, expect.any(String)]]);
     expect(result.current.runningCount).toBe(2); expect(mocks.cancel).not.toHaveBeenCalled();
   });
   it('cancels the exact chat and run, retains partial text, ignores late events', async () => {
@@ -324,13 +325,13 @@ describe('unified conversation scope and routing', () => {
     expect(result.current.scopeConsented).toBe(true);
     mocks.send.mockResolvedValue({ kind: 'chat', chat: { ...chat(), source, revision: '3' } });
     await act(async () => expect(await result.current.send('chat-a')).toBe(true));
-    expect(mocks.send).toHaveBeenLastCalledWith('chat-a', '你好', '2', modelConfig.destination, target.session);
+    expect(mocks.send).toHaveBeenLastCalledWith('chat-a', '你好', '2', modelConfig.destination, target.session, expect.any(String));
     rerender({ target: { ...target, session: { ...target.session, generation: '2' } } });
     expect(result.current.scopeConsented).toBe(true);
     act(() => result.current.updateDraft('chat-a', '再看一下'));
     await act(async () => expect(await result.current.send('chat-a')).toBe(true));
     expect(mocks.confirmScope).toHaveBeenCalledOnce();
-    expect(mocks.send).toHaveBeenLastCalledWith('chat-a', '再看一下', '2', modelConfig.destination, { ...target.session, generation: '2' });
+    expect(mocks.send).toHaveBeenLastCalledWith('chat-a', '再看一下', '2', modelConfig.destination, { ...target.session, generation: '2' }, expect.any(String));
   });
   it('revokes scope for a changed recipient or target without dispatching', async () => {
     const { result, rerender } = await scopedReady();
@@ -348,7 +349,7 @@ describe('unified conversation scope and routing', () => {
     rerender({ target: { ...target, state: 'disconnected' } });
     act(() => result.current.updateDraft('chat-a', '你好'));
     await act(async () => expect(await result.current.send('chat-a')).toBe(true));
-    expect(mocks.send).toHaveBeenCalledWith('chat-a', '你好', modelConfig.revision, modelConfig.destination, null);
+    expect(mocks.send).toHaveBeenCalledWith('chat-a', '你好', modelConfig.revision, modelConfig.destination, null, expect.any(String));
     expect(mocks.confirmScope).not.toHaveBeenCalled();
   });
   it('rejects a scope confirmation captured for a former target', async () => {
@@ -379,6 +380,7 @@ describe('ambiguous unified submission fencing', () => {
     const completed = { ...stream('chat-a', '3', 'Done'), active_run_id: null };
     completed.messages[0].text = 'run once'; completed.messages[1].state = 'complete';
     mocks.get.mockResolvedValue(completed);
+    mocks.submission.mockResolvedValue({ kind: 'chat', chat: completed });
     const { result } = await ready();
     act(() => result.current.updateDraft('chat-a', 'run once'));
     await act(async () => expect(await result.current.send('chat-a')).toBe(false));
@@ -396,6 +398,9 @@ describe('ambiguous unified submission fencing', () => {
     expect(result.current.uncertainSubmissions['chat-a']).toBe(true);
     const accepted = stream('chat-a', '3'); accepted.messages[0].text = 'one execution';
     act(() => emit({ kind: 'chat_updated', chat: accepted }));
+    expect(result.current.uncertainSubmissions['chat-a']).toBe(true);
+    mocks.submission.mockResolvedValue({ kind: 'chat', chat: accepted });
+    await act(async () => result.current.reconcileSubmission('chat-a'));
     expect(result.current.uncertainSubmissions['chat-a']).toBeUndefined();
     expect(result.current.drafts['chat-a']).toBe('');
     expect(mocks.send).toHaveBeenCalledOnce();
@@ -409,4 +414,22 @@ describe('ambiguous unified submission fencing', () => {
     expect(result.current.drafts['chat-a']).toBe('keep instruction');
     expect(mocks.send).toHaveBeenCalledOnce();
   });
+});
+
+it('reconciles a redacted accepted turn by its submission ID without comparing raw secrets or resending', async () => {
+  mocks.send.mockRejectedValue(new Error('lost response'));
+  const accepted = { ...stream('chat-a', '3', 'Done'), active_run_id: null };
+  accepted.messages[0].text = '[REDACTED]'; accepted.messages[1].state = 'complete';
+  mocks.submission.mockResolvedValue({ kind: 'chat', chat: accepted });
+  const { result } = await ready();
+  act(() => result.current.updateDraft('chat-a', 'private value that will be redacted'));
+  await act(async () => result.current.send('chat-a'));
+  const submissionId = mocks.send.mock.calls[0][5];
+  expect(submissionId).toMatch(/^[0-9a-f-]{36}$/);
+  expect(mocks.submission).toHaveBeenCalledExactlyOnceWith(submissionId);
+  expect(result.current.uncertainSubmissions['chat-a']).toBeUndefined();
+  expect(result.current.drafts['chat-a']).toBe('');
+  expect(result.current.current?.messages[0].text).toBe('[REDACTED]');
+  await act(async () => expect(await result.current.send('chat-a')).toBe(false));
+  expect(mocks.send).toHaveBeenCalledOnce();
 });

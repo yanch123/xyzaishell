@@ -4,6 +4,7 @@ mod window_launch;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
+use xyz_core::agent::ReadActionOutput;
 use xyz_core::agent::{
     AckTerminalAction, AgentManager, ContinueTerminalTask, ConversationScopeConsent,
     ConversationTurn, DecideTerminalAction, EnsureTaskSecrets, PrepareSecretInput,
@@ -262,6 +263,7 @@ fn confirm_conversation_scope(
 }
 #[tauri::command]
 async fn submit_conversation_turn(
+    submission_id: String,
     chat_id: String,
     text: String,
     revision: String,
@@ -271,10 +273,31 @@ async fn submit_conversation_turn(
 ) -> Result<ConversationTurn, ApiError> {
     let agent = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        agent.submit_conversation_turn(&chat_id, &text, &revision, &destination, session.as_ref())
+        agent.submit_idempotent_conversation_turn(
+            &submission_id,
+            &chat_id,
+            &text,
+            &revision,
+            &destination,
+            session.as_ref(),
+        )
     })
     .await
     .map_err(|_| worker_error())?
+}
+#[tauri::command]
+fn get_conversation_submission(
+    submission_id: String,
+    state: State<'_, AgentManager>,
+) -> Result<Option<ConversationTurn>, ApiError> {
+    state.get_conversation_submission(&submission_id)
+}
+#[tauri::command]
+fn read_action_output(
+    request: ReadActionOutput,
+    state: State<'_, AgentManager>,
+) -> Result<xyz_core::action_output::OutputPage, ApiError> {
+    state.read_action_output(request)
 }
 #[tauri::command]
 async fn send_chat_message(
@@ -653,6 +676,8 @@ fn main() {
             get_chat,
             send_chat_message,
             submit_conversation_turn,
+            get_conversation_submission,
+            read_action_output,
             confirm_conversation_scope,
             cancel_chat_run,
             probe_model_compatibility,

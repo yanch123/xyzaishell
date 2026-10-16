@@ -6,10 +6,31 @@ pub const MAX_FRAME_BYTES: usize = 32 * 1024;
 pub const MAX_COMMAND_BYTES: usize = 16 * 1024;
 pub const MAX_CWD_BYTES: usize = 4 * 1024;
 const PREFIX: &[u8] = b"\x1b]777;xyzlog;";
+const ACTION_HELPERS: &str = include_str!("shell_action_helpers.bash");
 const SCRIPT: &str = include_str!("shell_log_bootstrap.bash");
+const LEGACY_SCRIPT: &str = include_str!("shell_log_bootstrap_legacy.bash");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WireEvent {
+    ActionBegin {
+        sequence: u64,
+        remote_time_s: u64,
+        session_id: String,
+        generation: String,
+        action_id: String,
+        digest: String,
+        cwd: String,
+        command: String,
+    },
+    ActionEnd {
+        sequence: u64,
+        remote_time_s: u64,
+        session_id: String,
+        generation: String,
+        action_id: String,
+        digest: String,
+        exit_code: u8,
+    },
     Closed,
     Unsupported {
         reason: String,
@@ -60,15 +81,25 @@ fn quote(s: &str) -> String {
 /// Install TEMPORARY hooks in the already idle, explicitly confirmed current Bash.
 /// No child shell, startup-file changes, hidden SSH channel, or automatic retry.
 pub fn bootstrap_command(nonce: &str) -> Result<String, ProtocolError> {
-    bootstrap_with_history_default(nonce, false)
+    bootstrap_with_history_default(nonce, false, false)
 }
-fn bootstrap_with_history_default(nonce: &str, startup: bool) -> Result<String, ProtocolError> {
+/// Bash 4.2 uses explicit AI boundaries and prompt-only manual observation gaps.
+pub fn legacy_bootstrap_command(nonce: &str) -> Result<String, ProtocolError> {
+    bootstrap_with_history_default(nonce, false, true)
+}
+fn bootstrap_with_history_default(
+    nonce: &str,
+    startup: bool,
+    legacy: bool,
+) -> Result<String, ProtocolError> {
     if !valid_nonce(nonce) {
         return Err(ProtocolError("invalid integration nonce"));
     }
-    let mut script = SCRIPT.replace("@NONCE@", nonce);
+    let mut script = (if legacy { LEGACY_SCRIPT } else { SCRIPT })
+        .replace("# @ACTION_HELPERS@", ACTION_HELPERS)
+        .replace("@NONCE@", nonce);
     if startup {
-        // Bash 5.1/5.2 initializes an unset HISTSIZE to 500 AFTER rc files.
+        // Bash 4.2/5.1/5.2 initializes an unset HISTSIZE to 500 AFTER rc files.
         // Anticipate that value without assigning or overriding user settings.
         // The ready hook still compares the actual post-startup value, so no
         // readiness is emitted unless Bash really applied that default.
@@ -97,11 +128,12 @@ pub fn startup_command(nonce: &str) -> Result<String, ProtocolError> {
     }
     let unsupported = format!("printf '\\033]777;xyzlog;2;{nonce};U;unsupported_bash\\007'");
     let rc = format!(
-        "if [[ -r $HOME/.bashrc ]]; then builtin source \"$HOME/.bashrc\"; fi\n{}",
-        bootstrap_with_history_default(nonce, true)?
+        "if [[ -r $HOME/.bashrc ]]; then builtin source \"$HOME/.bashrc\"; fi\nif [[ ${{BASH_VERSINFO[0]}} == 4 ]]; then\n{}else\n{}fi\n",
+        bootstrap_with_history_default(nonce, true, true)?,
+        bootstrap_with_history_default(nonce, true, false)?
     );
     let bash = format!(
-        "case ${{BASH_VERSINFO[0]}}.${{BASH_VERSINFO[1]}} in 5.1|5.2) exec \"$BASH\" --noprofile --rcfile <(builtin printf '%s' {}) -i ;; *) {unsupported}; exec \"$BASH\" -i ;; esac",
+        "case ${{BASH_VERSINFO[0]}}.${{BASH_VERSINFO[1]}} in 4.2|5.1|5.2) exec \"$BASH\" --noprofile --rcfile <(builtin printf '%s' {}) -i ;; *) {unsupported}; exec \"$BASH\" -i ;; esac",
         quote(&rc)
     );
     // The account shell only parses exec + quoted arguments. POSIX syntax and
@@ -247,11 +279,61 @@ fn parse_frame(nonce: &str, frame: &[u8]) -> Option<WireEvent> {
 }
 fn parse_valid_frame(nonce: &str, frame: &[u8]) -> Option<WireEvent> {
     let text = std::str::from_utf8(frame).ok()?;
-    let fields: Vec<_> = text.split(';').take(9).collect();
-    if fields.len() < 3 || !matches!(fields[0], "1" | "2") || fields[1] != nonce {
+    let fields: Vec<_> = text.split(';').take(12).collect();
+    if fields.len() < 3 || !matches!(fields[0], "1" | "2" | "3") || fields[1] != nonce {
         return None;
     }
     match fields[2] {
+        "A" | "Z" if fields[0] == "3" => {
+            let begin = fields[2] == "A";
+            if fields.len() != (if begin { 11 } else { 10 }) {
+                return None;
+            }
+            for value in &fields[5..8] {
+                if value.is_empty()
+                    || value.len() > 128
+                    || !value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                {
+                    return None;
+                }
+            }
+            if fields[8].len() != 64
+                || !fields[8]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return None;
+            }
+            if begin {
+                let cwd = decoded(fields[9], MAX_CWD_BYTES).ok()?;
+                let command = decoded(fields[10], 8192).ok()?;
+                if !cwd.starts_with('/') || command.is_empty() {
+                    return None;
+                }
+                Some(WireEvent::ActionBegin {
+                    sequence: sequence(fields[3])?,
+                    remote_time_s: timestamp(fields[4])?,
+                    session_id: fields[5].into(),
+                    generation: fields[6].into(),
+                    action_id: fields[7].into(),
+                    digest: fields[8].into(),
+                    cwd,
+                    command,
+                })
+            } else {
+                Some(WireEvent::ActionEnd {
+                    sequence: sequence(fields[3])?,
+                    remote_time_s: timestamp(fields[4])?,
+                    session_id: fields[5].into(),
+                    generation: fields[6].into(),
+                    action_id: fields[7].into(),
+                    digest: fields[8].into(),
+                    exit_code: number(fields[9])?.try_into().ok()?,
+                })
+            }
+        }
         "X" if fields.len() == 3 => Some(WireEvent::Closed),
         "U" if fields.len() == 4
             && fields[3].len() <= 64
@@ -325,6 +407,9 @@ fn parse_valid_frame(nonce: &str, frame: &[u8]) -> Option<WireEvent> {
                     | "cwd_unavailable"
                     | "oversize"
                     | "hooks_changed"
+                    | "legacy_unobserved_command"
+                    | "legacy_history_fidelity"
+                    | "legacy_async_command"
             ) =>
         {
             Some(WireEvent::Gap {

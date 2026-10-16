@@ -171,7 +171,7 @@ export default function App() {
     const chatId = consent.chatId; setConsent(null); if (chatId) await model.send(chatId);
   };
   const hasModal = connecting || !!ssh.challenge || !!consent || !!switchDecision;
-  const pendingCount = Number(!!ssh.challenge) + Number(!!consent) + Number(!!switchDecision) + Number(!!agent.owner && ['waiting_approval', 'needs_user', 'needs_secrets', 'unsupported_action'].includes(agent.owner.phase));
+  const pendingCount = Number(!!ssh.challenge) + Number(!!consent) + Number(!!switchDecision) + Number(!!agent.owner && ['waiting_approval', 'needs_user', 'needs_secrets', 'unsupported_action', 'budget_paused'].includes(agent.owner.phase));
   const targetLabel = ssh.snapshot.host ? `${ssh.snapshot.username ?? ''}@${ssh.snapshot.host}:${ssh.snapshot.port ?? 22}` : '未连接服务器';
   const closeMenu = (event: React.MouseEvent<HTMLDivElement>) => { if ((event.target as HTMLElement).closest('button')) event.currentTarget.closest('details')?.removeAttribute('open'); };
   return <>
@@ -196,7 +196,7 @@ export default function App() {
         </main>
       </div>
       <section className="workspace-notices" aria-label="工作空间消息"><button aria-expanded={messagesOpen} onClick={() => setMessagesOpen(value => !value)}>{messagesOpen ? '收起' : '展开'}消息 · {pendingCount ? `${pendingCount} 项待决定 · ` : ''}{messages[0]?.text ?? '就绪。配置模型不会影响手动 SSH。'}</button>{messagesOpen && <div className="workspace-message-list">{pendingCount > 0 && <div className="workspace-message warning">待决定事项保留在原入口，阅读或关闭消息不会批准任何操作。{agent.owner && <button onClick={() => { model.selectChat(agent.owner!.chat_id); setInspector(null); }}>查看 AI 任务</button>}</div>}{messages.map(item => <div key={item.id} className={`workspace-message ${item.level}`}><time dateTime={new Date(item.at).toISOString()}>{new Date(item.at).toLocaleTimeString()}</time><span>{item.source} · {item.text}</span></div>)}</div>}</section>
-      <footer className="app-statusbar"><span><Icon name="server" size={12} />{targetLabel} · {SESSION_LABELS[ssh.snapshot.state]}<span className="status-divider">|</span>单服务器 / 单 PTY</span><span>{model.config.ready ? model.config.consented ? '模型可用' : '模型待确认' : '模型未配置'} · <button onClick={() => setMessagesOpen(true)}>{messages.length} 条消息</button> <span className="footer-stage">v0.1.4</span></span></footer>
+      <footer className="app-statusbar"><span><Icon name="server" size={12} />{SESSION_LABELS[ssh.snapshot.state]}</span><span>{model.config.ready ? model.config.consented ? '模型可用' : '模型待确认' : '模型未配置'} · <button onClick={() => setMessagesOpen(true)}>{messages.length} 条消息</button> <span className="footer-stage">v0.1.4</span></span></footer>
     </div>
     <div inert={hasModal}>
       {openedInspectors.includes('shell-log') && <div hidden={inspector !== 'shell-log'} inert={inspector !== 'shell-log'}><ShellLogDialog key={JSON.stringify(logScope) + (logScope.kind === 'current' ? ssh.snapshot.session?.session_id ?? 'none' : '')} native={ssh.native} snapshot={ssh.snapshot} initialScope={logScope} integration={integration.status} onMessage={summary => addMessage('log-export', '日志', summary)} onClose={() => closeInspector('shell-log')} /></div>}

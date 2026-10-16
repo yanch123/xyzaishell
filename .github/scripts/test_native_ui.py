@@ -40,6 +40,35 @@ class NativeVersionPhaseTests(unittest.TestCase):
                 native.verify_phase_version(phase, version, "hash", None)
 
 
+class NativeIdleSelectorTests(unittest.TestCase):
+    def test_released_baseline_retains_its_actual_status_selector(self):
+        driver = mock.Mock()
+        driver.js.return_value = True
+        native.wait_for_chat_idle(driver, native.BASE_VERSION)
+        self.assertIn("无生成中的聊天", driver.js.call_args.args[0])
+
+    def test_simplified_candidate_checks_composer_and_no_active_generation(self):
+        driver = mock.Mock()
+        driver.js.return_value = True
+        native.wait_for_chat_idle(driver, native.TARGET_VERSION)
+        script = driver.js.call_args.args[0]
+        self.assertIn("停止生成", script)
+        self.assertIn("正在提交…", script)
+        self.assertIn("聊天消息", script)
+        self.assertNotIn("chat-status", script)
+
+    def test_candidate_identity_is_backend_rendered_dom_and_missing_is_rejected(self):
+        driver = mock.Mock()
+        driver.js.return_value = 'real-task-id'
+        self.assertEqual(native.rendered_task_identity(driver, native.TARGET_VERSION), 'real-task-id')
+        self.assertIn('data-task-id', driver.js.call_args.args[0])
+        driver.js.return_value = None
+        with self.assertRaises(AssertionError):
+            native.rendered_task_identity(driver, native.TARGET_VERSION)
+        driver.js.return_value = '任务 ID: released-task-id'
+        self.assertEqual(native.rendered_task_identity(driver, native.BASE_VERSION), 'released-task-id')
+
+
 class ProcessQueryTests(unittest.TestCase):
     def test_windows_query_is_fail_closed(self):
         application = pathlib.Path("xyzaishell.exe").resolve()

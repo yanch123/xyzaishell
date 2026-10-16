@@ -518,7 +518,9 @@ impl ShellLogService {
             return;
         }
         match event {
-            WireEvent::Ready { .. } => {}
+            WireEvent::Ready { .. }
+            | WireEvent::ActionBegin { .. }
+            | WireEvent::ActionEnd { .. } => {}
             WireEvent::Unsupported { .. } => {
                 self.finish_active(c, CommandStatus::Unknown, None);
                 self.shared.fail(error("SHELL_LOG_UNSUPPORTED", "Current-shell integration is unsupported; the manual terminal remains available."));
@@ -633,6 +635,28 @@ impl ShellLogService {
                 if c.hello {
                     self.integration_lost(c);
                 }
+            }
+            WireEvent::Gap { sequence, reason }
+                if matches!(
+                    reason.as_str(),
+                    "legacy_history_fidelity"
+                        | "legacy_unobserved_command"
+                        | "legacy_async_command"
+                ) && c.active.is_none() =>
+            {
+                if !c.hello || sequence < c.high_sequence {
+                    return;
+                }
+                c.high_sequence = sequence;
+                self.shared.update(|s| {
+                    if s.state != CaptureState::Paused {
+                        s.state = CaptureState::Gap;
+                    }
+                    s.reason = Some(
+                        "手动命令观察存在缺口，未推断其命令原文或退出状态；后续 AI 命令仍可记录。"
+                            .into(),
+                    );
+                });
             }
             WireEvent::Gap { sequence, .. } => {
                 // A prompt/hook failure can be reported AFTER End, using the
