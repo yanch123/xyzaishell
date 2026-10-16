@@ -732,10 +732,15 @@ class QuietReceiverContract(unittest.TestCase):
         self.assertIn(b'QUIET_SUCCESS', output)
 
     def test_background_output_is_preserved_while_receiver_waits(self):
-        p = self.prepared('(sleep 1; printf "BACKGROUND_OUTPUT_PRESERVED\\n") &', echo=True)
+        directory = tempfile.TemporaryDirectory(prefix='xyz-background-gate-')
+        self.addCleanup(directory.cleanup)
+        gate = pathlib.Path(directory.name) / 'release'
+        p = self.prepared('(while [[ ! -f ' + shlex.quote(str(gate)) +
+            ' ]]; do sleep 0.01; done; printf "BACKGROUND_OUTPUT_PRESERVED\\n") &', echo=True)
         baseline = termios.tcgetattr(p.child_fd)
         command = 'printf RECEIVER_DONE'
         prefix = self.receiver(p, 'background-action', 1, command)
+        gate.touch()  # Release only after M: output must arrive while read waits.
         p.expect_exact(b'BACKGROUND_OUTPUT_PRESERVED\r\n')
         background = prefix + p.before + p.after
         p.send(wire('background-action', 1, command))
@@ -784,22 +789,106 @@ class QuietReceiverContract(unittest.TestCase):
         self.assertNotIn(b'PAYLOAD_EXECUTED', p.before)
         self.assertFalse(any(f[0] in [b'A', b'Z', b'R'] for f in action_frames(p.before)))
 
-    def test_ctrl_c_during_partial_receive_restores_modes_and_never_runs_tail(self):
+    def test_fragmented_body_waits_without_early_execution(self):
         p = self.prepared(echo=True)
         baseline = termios.tcgetattr(p.child_fd)
-        command = 'printf PAYLOAD_EXECUTED'
-        payload = wire('partial-cancel', 1, command)
-        self.receiver(p, 'partial-cancel', 1, command)
-        midpoint = len(payload) // 2
-        p.send(payload[:midpoint])
+        command = "printf '%s' FRAGMENTED_SUCCESS"
+        payload = wire('fragmented-action', 1, command)
+        self.receiver(p, 'fragmented-action', 1, command)
+        split = len(payload) // 2
+        p.send(payload[:split])
+        p.expect(pexpect.TIMEOUT, timeout=0.6)
+        self.assertEqual(action_frames(p.before), [])
+        self.assertNotIn(b'FRAGMENTED_SUCCESS', p.before)
+        p.send(payload[split:])
+        p.expect_exact(PROMPT)
+        events = action_frames(p.before)
+        self.assertEqual([f[0] for f in events], [b'A', b'Z', b'R'])
+        self.assertEqual(base64.b64decode(events[0][8]), command.encode())
+        self.assertEqual(events[0][3:7], events[1][3:7])
+        self.assertEqual(events[0][6], hashlib.sha256(command.encode()).hexdigest().encode())
+        self.assertEqual(events[1][7], b'0')
+        self.assertEqual(p.before.count(command.encode()), 1)
+        self.assertEqual(termios.tcgetattr(p.child_fd), baseline)
+        # A subsequent action proves the receive-only INT handler was removed.
+        self.action(p, 'true', 2)
+
+    def test_ctrl_c_near_maximum_frame_restores_manual_input_without_extra_enter(self):
+        p = self.prepared(echo=True)
+        baseline = termios.tcgetattr(p.child_fd)
+        prefix = "printf '%s' 'PAYLOAD_EXECUTED"
+        command = prefix + 'x' * (8192 - len(prefix) - 1) + "'"
+        self.assertEqual(len(command.encode()), 8192)
+        payload = wire('maximum-cancel', 1, command)
+        self.receiver(p, 'maximum-cancel', 1, command)
+        self.assertEqual(p.send(payload[:-1]), len(payload) - 1)
         p.sendcontrol('c')
         p.expect_exact(PROMPT)
         self.assert_failed_without_execution(p.before)
         self.assertEqual(termios.tcgetattr(p.child_fd), baseline)
-        p.send(payload[midpoint:])
+        p.sendline(b"printf 'MANUAL_%s\\n' RECOVERED")
+        p.expect_exact(b'MANUAL_RECOVERED\r\n')
+        p.expect_exact(PROMPT)
+        self.assertFalse(any(f[0] in [b'A', b'Z', b'R'] for f in action_frames(p.before)))
+        p.send(payload[-1:])
         p.expect_exact(PROMPT)
         self.assertNotIn(b'PAYLOAD_EXECUTED', p.before)
         self.assertFalse(any(f[0] in [b'A', b'Z', b'R'] for f in action_frames(p.before)))
+
+    def test_ctrl_c_at_receiver_ready_restores_modes_without_body_or_extra_input(self):
+        for attempt in range(4):
+            with self.subTest(attempt=attempt):
+                p = self.prepared(echo=True)
+                baseline = termios.tcgetattr(p.child_fd)
+                command = 'printf PAYLOAD_EXECUTED'
+                payload = wire('ready-cancel', 1, command)
+                self.receiver(p, 'ready-cancel', 1, command)
+                # No sleep or body write between receiver readiness and VINTR.
+                p.sendcontrol('c')
+                p.expect_exact(PROMPT)
+                self.assert_failed_without_execution(p.before)
+                self.assertEqual(termios.tcgetattr(p.child_fd), baseline)
+                p.sendline(b"printf 'MANUAL_%s\\n' RECOVERED")
+                p.expect_exact(b'MANUAL_RECOVERED\r\n')
+                p.expect_exact(PROMPT)
+                self.assertFalse(any(f[0] in [b'A', b'Z', b'R'] for f in action_frames(p.before)))
+                p.send(payload)
+                p.expect_exact(PROMPT)
+                self.assertNotIn(b'PAYLOAD_EXECUTED', p.before)
+                self.assertFalse(any(f[0] in [b'A', b'Z', b'R'] for f in action_frames(p.before)))
+                p.close(force=True)
+
+    def test_ctrl_c_during_partial_receive_restores_modes_and_never_runs_tail(self):
+        # Keep these as separate writes: coalescing body+VINTR masks a native
+        # Bash interrupt race that can defer prompt hooks until another Enter.
+        for attempt in range(12):
+            with self.subTest(attempt=attempt):
+                p = self.prepared(echo=True)
+                baseline = termios.tcgetattr(p.child_fd)
+                command = 'printf PAYLOAD_EXECUTED'
+                payload = wire('partial-cancel', 1, command)
+                self.receiver(p, 'partial-cancel', 1, command)
+                midpoint = len(payload) // 2
+                p.send(payload[:midpoint])
+                p.sendcontrol('c')
+                try:
+                    p.expect_exact(PROMPT)
+                except pexpect.TIMEOUT:
+                    self.fail('Ctrl+C did not restore the prompt without extra input; '
+                        f'pid={p.pid} foreground={os.tcgetpgrp(p.child_fd)} '
+                        f'baseline={baseline!r} current={termios.tcgetattr(p.child_fd)!r} '
+                        f'output={p.before!r}')
+                self.assert_failed_without_execution(p.before)
+                self.assertEqual(termios.tcgetattr(p.child_fd), baseline)
+                p.sendline(b"printf 'MANUAL_%s\\n' RECOVERED")
+                p.expect_exact(b'MANUAL_RECOVERED\r\n')
+                p.expect_exact(PROMPT)
+                self.assertFalse(any(f[0] in [b'A', b'Z', b'R'] for f in action_frames(p.before)))
+                p.send(payload[midpoint:])
+                p.expect_exact(PROMPT)
+                self.assertNotIn(b'PAYLOAD_EXECUTED', p.before)
+                self.assertFalse(any(f[0] in [b'A', b'Z', b'R'] for f in action_frames(p.before)))
+                p.close(force=True)
 
 if __name__ == '__main__':
     if len(BOOTSTRAP.encode()) >= 16384:

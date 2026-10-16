@@ -50,7 +50,7 @@ else
   __xyz_ended=0
   __xyz_empty=
   __xyz_failed=0
-  __xyz_ai_active=0; __xyz_receiving=0; __xyz_tty_saved=
+  __xyz_ai_active=0; __xyz_receiving=0; __xyz_receive_int_owned=0; __xyz_receive_cancelled=0; __xyz_tty_saved=
   __xyz_at_prompt=0
   __xyz_original_pc_decl=$pc_decl
   __xyz_original_ps1=${PS1-}
@@ -76,7 +76,7 @@ else
   __xyz_end() {
    builtin local code=$? current_history
    if [[ -n ${__xyz_tty_saved-} || ${__xyz_receiving-0} != 0 ]]; then
-    __xyz_restore_tty; __xyz_receiving=0; __xyz_gap receiver_failed; builtin return "$code"
+    __xyz_drain_receiver; __xyz_restore_tty; __xyz_receiving=0; __xyz_gap receiver_failed; builtin return "$code"
    fi
    if (( __xyz_ai_active == 1 )); then __xyz_action_end "$code"; builtin return "$code"; fi
    if (( __xyz_at_prompt == 1 && __xyz_failed == 0 )); then
@@ -124,7 +124,7 @@ else
    builtin return "$code"
   }
   PROMPT_COMMAND=$'__xyz_end\n'${PROMPT_COMMAND-}$'\n__xyz_ready "$(builtin trap -p)"'
-  __xyz_helper_names='__xyz_controls_ok __xyz_norm_traps __xyz_is_envelope __xyz_manual_step __xyz_action_begin __xyz_action_end __xyz_restore_tty __xyz_receive __xyz_b64 __xyz_gap __xyz_manual_gap __xyz_end __xyz_intact __xyz_ready __xyz_uninstall'
+  __xyz_helper_names='__xyz_controls_ok __xyz_norm_traps __xyz_is_envelope __xyz_manual_step __xyz_action_begin __xyz_action_end __xyz_drain_receiver __xyz_restore_tty __xyz_receive __xyz_b64 __xyz_gap __xyz_manual_gap __xyz_end __xyz_intact __xyz_ready __xyz_uninstall'
   __xyz_owned_helpers=$(builtin declare -f $__xyz_helper_names)
   __xyz_owned_pc_decl=$(builtin declare -p PROMPT_COMMAND)
   builtin printf '\033]777;xyzlog;2;%s;H;%s\007' "$__xyz_nonce" "$BASH_VERSION"

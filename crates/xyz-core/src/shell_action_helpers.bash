@@ -43,28 +43,54 @@
    __xyz_last_history=$(HISTTIMEFORMAT= builtin history 1; builtin printf x)
    builtin return "$code"
   }
+  __xyz_drain_receiver() {
+   builtin local discarded count=0
+   while (( count < 131072 )) && IFS= builtin read -r -t 0; do
+    IFS= builtin read -r -s -t 0.01 -n 1 discarded || builtin return 1
+    ((count+=1))
+   done
+   (( count < 131072 ))
+  }
   __xyz_restore_tty() {
+   builtin local restored=0
    if [[ -n ${__xyz_tty_saved-} ]]; then
-    command stty "$__xyz_tty_saved" < /dev/tty || builtin return 1
-    __xyz_tty_saved=
+    if command stty "$__xyz_tty_saved" < /dev/tty; then __xyz_tty_saved=; else restored=1; fi
    fi
+   if [[ ${__xyz_receive_int_owned-0} == 1 ]]; then
+    builtin trap - INT
+    __xyz_receive_int_owned=0
+   fi
+   builtin return "$restored"
   }
   __xyz_receive() {
-   builtin local frame record hex= bit byte i j value header rest actual code LC_ALL=C
+   builtin local frame record hex= bit byte i j value header rest actual code chunk deadline now attempts=0 LC_ALL=C
    if [[ $__xyz_failed != 0 || $__xyz_ai_active != 0 || $4 != "$((__xyz_seq+1))" ]] || ! __xyz_intact "$6"; then __xyz_gap; builtin return 1; fi
    __xyz_receiving=1
    __xyz_tty_saved=$(command stty -g < /dev/tty) || { __xyz_gap receiver_failed; builtin return 1; }
    [[ -n $__xyz_tty_saved ]] || { __xyz_gap receiver_failed; builtin return 1; }
-   if ! command stty -echo -icanon min 1 time 0 < /dev/tty; then __xyz_restore_tty; __xyz_gap receiver_failed; builtin return 1; fi
+   __xyz_receive_cancelled=0; __xyz_receive_int_owned=1
+   builtin trap '__xyz_receive_cancelled=1; builtin return 130' INT
+   if ! command stty -echo -icanon noflsh min 1 time 0 < /dev/tty; then __xyz_restore_tty; __xyz_gap receiver_failed; builtin return 1; fi
    builtin printf '\033]777;xyzlog;3;%s;M;%s;%s;%s;%s;%s\007' "$__xyz_nonce" "$4" "$1" "$2" "$3" "$5"
-   IFS= builtin read -r -s -t 15 -n 131072 frame
-   code=$?
+   if [[ ${BASH_VERSINFO[0]} == 4 ]]; then
+    IFS= builtin read -r -s -t 15 -n 131072 frame
+    code=$?
+   else
+    frame=; builtin printf -v deadline '%(%s)T' -1; ((deadline+=15))
+    while ((attempts < 60)); do
+     ((attempts+=1)); builtin printf -v now '%(%s)T' -1
+     if ((now >= deadline)); then code=142; builtin break; fi
+     chunk=
+     IFS= builtin read -r -s -t 0.25 -n "$((131072-${#frame}))" chunk
+     code=$?; frame+=$chunk
+     if ((code != 142)); then builtin break; fi
+    done
+   fi
    __xyz_restore_tty || { __xyz_gap receiver_failed; builtin return 1; }
+   if (( __xyz_receive_cancelled != 0 )); then __xyz_drain_receiver; code=130; fi
    if (( code != 0 || ${#frame} < 9 || ${#frame} >= 131072 )) || [[ ${frame:0:1} != '#' || $frame == *[!\ #]* ]]; then __xyz_gap receiver_failed; builtin return 1; fi
    frame=${frame:1}
    if (( ${#frame} % 8 != 0 )); then __xyz_gap receiver_failed; builtin return 1; fi
-   # Every possible late/truncated suffix contains only spaces and comment
-   # characters. Decode without eval or command interpolation.
    j=${#frame}
    for ((i=0; i<j; i+=8)); do
     bit=${frame:i:8}; bit=${bit//#/1}; bit=${bit// /0}
