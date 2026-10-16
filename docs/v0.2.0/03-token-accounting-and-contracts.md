@@ -12,6 +12,12 @@
 
 计量、预算和压缩必须共用同一规范化序列化路径。构造 token 分类清单后，发送的是同一修订投影；不得统计删减前 A、发送删减后 B、却不刷新 UI。候选输入超过既有 prompt 限制时，应在旧截断/拒绝之前检测并尝试合法压缩，避免始终只看到截断后的 60 KiB 而隐藏压力。最终发出前仍验证所有迁移后生效的字节护栏。
 
+### 归档统计不属于模型占用
+
+长期 ConversationArchive、UI 历史分页缓存、动态 WorkingMemory/ContextProjection 必须分别计量。归档的消息数量、磁盘字节数、页缓存大小不进入 input_tokens 或类别份额；只有当前投影实际选择的内容计入模型输入。翻阅／加载旧历史页本身不改变有效投影，不触发压缩或模型网络请求。
+
+归档保存状态与上下文 revision 分离：消息保存成功、缓存页载入等纯存储／展示事件不能伪造新的可压缩来源；新增用户内容或明确选入旧资料才按内容与范围更新来源索引。压缩提交只改工作记忆投影，不覆盖归档原文。持久化配额、保存失败和原文未保存／过期状态需有独立字段／事件，不得用 context_truncated 代替这些不同事实。
+
 ## 2. 三种不同的数量
 
 ### 2.1 当前输入估算
@@ -26,7 +32,7 @@
 
 没有 usage、流式末包丢失、供应商不支持或字段意义不明时返回 null/unknown，不补造“实际 token”。供应商通常不给类别分解，因此类别始终标估算，不把实报总量按比例分摊后叫实报。压缩摘要请求的实报归属 `compaction`，普通问答/终端规划归属 `conversation`/`planning`；摘要调用不能覆盖“上一次主请求”的展示。详情可另列最近压缩请求用量。v0.2.0 不承诺费用、价格或精确账单。
 
-协议依据：OpenAI Chat Completions 的流式 usage 需要请求 `stream_options.include_usage`，最后的 usage 块统计该请求；流中断或取消时可能收不到它。该协议事实不能推广成所有 OpenAI 兼容服务都支持，适配器需按能力处理并保留缺失状态。见 [OpenAI 官方流式事件参考](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)（核对日期：2026-10-16）。80%/50% 阈值及类别方案是本项目设计决策，不是供应商或 Cursor 的既定行为。
+协议依据：OpenAI Chat Completions 的流式 usage 需要请求 `stream_options.include_usage`，最后的 usage 块统计该请求；流中断或取消时可能收不到它。该协议事实不能推广成所有 OpenAI 兼容服务都支持，适配器需按能力处理并保留缺失状态。见 [OpenAI 官方流式事件参考](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)（核对日期：2026-10-16）。80% 触发阈值、默认容量及类别方案是本项目设计决策，不是供应商或 Cursor 的既定行为。
 
 ### 2.3 字节护栏
 
@@ -40,23 +46,27 @@
 
 统一命名：
 
-- `context_window_tokens`（W）：已验证模型元数据或用户明确设置的模型窗口；未知为 null。
+- `context_window_tokens`（W）：解析后的配置窗口。优先级为 `user_override` > `verified_metadata` > `product_default`；产品默认 256K = 256000 tokens（十进制 K），普通缺少元数据的模型使用该默认。仅配置确实不可用时为 null，默认值不代表供应商真实能力。
 - `output_reserve_tokens`（R）：继承现有 `request.max_output_tokens`，当前实现默认 4096；不新增第二个独立输出配置。
-- `safety_margin_tokens`（S）：默认 max(1024, ceil(W × 0.05))；高级覆写必须验证，W 未知时为 null。
-- `input_budget_tokens`（B）：W − R − S；只有 W 已知且 B > 0 时有效。
+- `safety_margin_tokens`（S）：默认 max(1024, ceil(W × 0.05))；高级覆写必须验证，W 不可用时为 null。
+- `input_budget_tokens`（B）：W − R − S；只有 W 为有效配置且 B > 0 时有效。
 - `estimated_input_tokens`（I）：当前请求估算；使用粗略估算时保护判断可取其明确记录的保守上界。
 - `input_occupancy_ratio`：I/B；主界面百分比与默认自动触发都使用该分母。
-- `auto_trigger_ratio = 0.80`；`target_ratio = 0.50`。
+- `auto_trigger_ratio = 0.80`：仅控制自动触发；不设置压缩后目标比例或以降到触发阈值以下作为成功条件。
 
 为了避免“看起来未达阈值却自动压缩”，如保护采用上界，主占用也使用同一上界并注明“保守估算”，不得主指示显示点估计而阈值暗用另一量。类别可显示主估算，若与保护估算不同，详情明确标记，不伪装二者精确相加。
 
-已知 W 时，若审计后的传输字节保护先于 token 阈值达到，可以另行触发自动压缩；原因记录为 `byte_pressure`（与 token 同时触发则为 `both`；完整枚举见 02 的 6.5），主占用百分比仍按原公式。所有自动原因均使用已配置方式，默认 LLM，明确选择自动 quick 时不得调用模型。未知 W 时不按字节触发自动压缩。
+W 有效时（包括产品默认），若审计后的传输字节保护先于 token 阈值达到，可以另行触发自动压缩；原因记录为 `byte_pressure`（与 token 同时触发则为 `both`；完整枚举见 02 的 6.5），主占用百分比仍按原公式。所有自动原因均使用已配置方式，默认 LLM，明确选择自动 quick 时不得调用模型。W 配置无效/不可用时不按字节触发自动压缩；缺少模型元数据但已解析到产品默认值不属于不可用。
 
 输入构成占比 = 某类别估算 / 同一方法下全部类别估算。输出预留和安全余量不进入类别份额分母。构成条只代表输入，预算占用则代表当前输入与 B 的关系，两个标题必须区分。舍入后的份额可使用最大余数法使显示总和为 100%；输入为零时不做除法。
 
-示例（仅演示，不代表某个真实模型）：W=100000，R=4000，S=5000，则 B=91000。I=72800 时主指示 ≈80%，达到自动阈值；目标输入不超过 45500。弹层单列 W、R、S，不另加一个易混淆的常驻窗口占比。
+默认配置示例：W=256000，R=4096，S=12800，则 B=239104。达到 80% 触发边界即评估压缩，但无需达到某个固定压缩后比例；90% → 85% 的严格缩减在保护项完整、最终输入不超过 B 且字节硬预算满足时允许成功。分类份额与占用分母保持独立。
 
-W 未知时 B 与占用比均为 null，显示“容量未知 / 自动压缩待确认容量”，仍显示可得的估算输入和字节检查。不自动触发 LLM 或快速压缩；手动压缩仍可用，LLM 仅在迁移后生效的字节护栏内有界尝试，超限安全失败。不可因 `model.name` 类似官方名称或 API 兼容而填入臆测窗口。模型元数据过期/目标改变时重新解析；用户输入优先，并标记 `user_override`。R+S >= W 时为预算配置错误，不做负数、零除或自动减输出；保留草稿并指引修改配置。
+压缩结果记录 `benefit_tokens` 与 `benefit_bytes`（同一估算器、同一编码规则下的缩减量）：提交时两者均不得为负，至少一项严格为正，并按 02 的触发原因检查对应指标。字节压力下允许 tokens 不变而 bytes 减少，不能把 benefit_tokens >0 误设为所有模式的必要条件。结合 `budget_fits`（待发请求通过全部 token/字节硬预算）与保护集/引用验证共同判定；不能用“未降到 80% 以下”否定一个合法结果，也不能用严格缩减掩盖仍超出硬预算。前后对比不能跨模型或估算器版本。
+
+普通模型无可靠窗口元数据时使用 `product_default`，UI 标记“按默认容量估算”，仍可按配置预算正常自动压缩。不能将该默认改称已验证模型窗口。容量解析随模型/接收方变化重新执行；持久化的可选用户覆盖与解析后的有效值分开，用户未编辑时不得把产品默认值记成 user_override；无效的显式覆盖应报错而不是静默回退默认值。R+S >= W、非法值或配置不可取得时为预算配置错误，B 与占用比返回 null，不做负数、零除或自动减输出；保留草稿并指引修改配置。
+
+供应商实际窗口可能小于默认配置。遇到 provider context overflow 时安全失败，提示调整窗口配置，不自动把失败请求重发、不重放命令、不以一次成功或报错反推精确真实容量。缺少 usage 仍独立显示未知，不影响容量来源标签。
 
 ## 4. 互斥类别契约
 
@@ -99,14 +109,13 @@ type ContextUsageSnapshot = {
   };
   budget: {
     context_window_tokens: number | null;
-    capacity_source: 'verified_metadata' | 'user_override' | 'unknown';
+    capacity_source: 'verified_metadata' | 'user_override' | 'product_default' | 'unavailable';
     output_reserve_tokens: number;
     safety_margin_tokens: number | null;
     input_budget_tokens: number | null;
     decision_input_tokens: number | null;
     input_occupancy_ratio: number | null;
     auto_trigger_ratio: number;
-    target_ratio: number;
   };
   byte_guards: Array<{
     scope: 'planning_prompt' | 'serialized_request';
@@ -133,7 +142,7 @@ type ProviderUsage = {
 };
 ```
 
-`decision_input_tokens` 固定记录本次阈值所用值，正常为 I，保守估算时为上界；主占用亦使用此值。模型能力未知与计数方法未知是两个独立维度，不因缺窗口而丢掉可得估算，也不因可估算而声称窗口已知。`stale` 快照可短暂保留旧值但必须标记更新中，不能据其发请求。
+`decision_input_tokens` 固定记录本次阈值所用值，正常为 I，保守估算时为上界；主占用亦使用此值。实际模型能力、配置容量来源与计数方法是独立维度；无元数据仍用默认配置计算，但不因可估算而声称真实窗口已验证。`stale` 快照可短暂保留旧值但必须标记更新中，不能据其发请求。
 
 后端快照只返回安全聚合数据和关联标识，不携带原始终端文本、secret、摘要正文或序列化请求。开发日志也不得为诊断计数而记录这些内容。界面不根据供应商实报反写当前草稿估算。
 
@@ -142,6 +151,7 @@ type ProviderUsage = {
 - `get_context_usage(chat_id, expected_context_revision)`：只读当前准备结果；草稿预览如需传入，由本机桥传递，不调用外部模型。
 - `compact_context(chat_id, expected_context_revision, mode, client_request_id)`：`mode = llm | quick`，具体执行/排队、状态机和幂等见核心设计。必须带修订号，防止对旧上下文提交摘要。
 - 自动压缩及手动压缩共用预算、投影与提交路径；并发事件通过 chat/config/session/run 修订重新校验。
+- 自动尝试记录内部 `eligible_source_fingerprint` 与覆盖清单，基于可压缩来源范围而非单纯投影 revision 去重。没有新增可压缩内容时，即使占用仍超过 80%，也不重复压缩同一批来源；候选摘要本身不能成为无限自我再压缩的新内容。细节与显式重试见 02。该指纹不泄露原文或秘密，不作为前端公开计量字段。
 - 快照变化事件携带完整修订号，前端丢弃旧 revision；订阅断线后读取权威快照，不猜测操作成功。
 - `client_request_id` 只去重同一操作，不允许压缩重试隐式重放原模型消息或终端命令。
 
@@ -152,8 +162,11 @@ type ProviderUsage = {
 1. 分类和对应输入估算精确相加，所有类别非负，输出预留独立；中英混排、emoji、JSON、工具 schema、角色封装均覆盖。
 2. 草稿变长、工具结果变大、模型切换、秘密重脱敏或引用失效后，快照刷新且过期投影不能发送。
 3. 新响应的实报不能替换下一次请求估算；压缩请求用量不会混入主请求实报。
-4. 未知窗口不显示 0%/100% 或伪造窗口；缺 usage 显示未知；超预算可显示 >100%，不能钳成 100% 后丢失超限状态。
+4. 无元数据模型回落 W=256000、capacity_source=product_default，显示“按默认容量估算”且允许自动压缩；实际无效/不可用配置显示 — 并暂停。缺 usage 显示未知；超预算可显示 >100%，不能钳成 100% 后丢失超限状态。
 5. 主指示与 80% 触发共用 B 和 decision_input_tokens；边界用原值判断。预留、类别占比和字节上限的分母不混用。
 6. 重复文本按真实发送份数计费式计数，不按 UI 对象数量；移除未发送终端记录不改变输入量。
 7. 大历史/小投影与小历史/大工具 schema 两个反例，证明不是按 UI 历史字数估算。
-8. 旧 60 KiB prompt/128 条/256 KiB 发送门槛按 02/04 迁移，不残留隐藏的旧拒绝分支；单消息、独立历史内存及审计后的 transport 限制分别校验。已知 W 的字节保护触发必须独立标因，不能改写 token 占用。
+8. 旧 60 KiB prompt/128 条/256 KiB 发送门槛按 02/04 迁移，不残留隐藏的旧拒绝分支；单消息、独立历史内存及审计后的 transport 限制分别校验。有效 W 的字节保护触发必须独立标因，不能改写 token 占用。
+
+9. 验证 90% → 85% 可合法成功，没有固定压缩后比例门槛；同一可压缩来源无新增时不循环自动触发，新增可压缩内容后才重新评估。
+10. 手动覆盖、可靠元数据、256000 默认的优先级正确；无效覆盖不静默回退；供应商实际容量低于默认时保留上下文并提示调整，不自动重试或重放。
