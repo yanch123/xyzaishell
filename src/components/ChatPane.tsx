@@ -47,7 +47,12 @@ export function ChatPane({ model, onSettings, showHistory, onToggleHistory, onCo
   const choose = (text: string) => { updateDraft(text); composer.current?.focus(); };
   useEffect(() => { stickToBottom.current = true; }, [current?.chat_id]);
   useEffect(() => {
-    if (stickToBottom.current) list.current?.scrollTo({ top: list.current.scrollHeight });
+    const scroll = list.current;
+    if (!stickToBottom.current || !scroll) return;
+    const task = current ? agent?.tasks[current.task_id] : undefined;
+    const target = task?.phase === 'awaiting_display' ? scroll.querySelector('.terminal-task > .terminal-action-card .action-target') : null;
+    const top = target ? scroll.scrollTop + target.getBoundingClientRect().top - scroll.getBoundingClientRect().top : scroll.scrollHeight;
+    scroll.scrollTo({ top });
   }, [current?.chat_id, current?.revision, current && agent?.tasks[current.task_id]?.revision]);
   return <aside className={`chat-pane ${reviewingAttachment ? ' terminal-review' : ''}`} aria-label="AI 聊天工作区">
     <div className="pane-toolbar"><div className="chat-title"><Icon name="spark" size={16} /><span>任务聊天</span><span className="subtle-badge">v0.1.4</span></div><div className="toolbar-actions"><button className={`icon-button ${showHistory ? 'active' : ''}`} aria-label="切换聊天记录" aria-pressed={showHistory} onClick={onToggleHistory} title="聊天记录"><Icon name="history" size={17} /></button><button className="icon-button" aria-label="新建聊天" onClick={() => void model.createChat()} title={chats.length >= MAX_CHATS ? `已达到 ${MAX_CHATS} 个聊天上限` : '新建聊天'} disabled={!model.ready || model.creating || chats.length >= MAX_CHATS}><Icon name="plus" size={18} /></button></div></div>

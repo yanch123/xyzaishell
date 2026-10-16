@@ -1673,3 +1673,149 @@ async fn unified_scope_reuses_same_target_only_with_fresh_session_and_blocks_oth
     assert!(server.trace().input.is_empty());
     fixture.ssh.disconnect(&other_session).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_other_chat_can_talk_while_ready_owner_waits_for_approval_without_replay() {
+    use xyz_core::agent::{ConversationScopeConsent, ConversationTurn};
+    let server = LoopbackServer::start(Behavior::default()).await;
+    let (http, base) = listener().await;
+    let fixture = Fixture::new(&server, &base).await;
+    let first = fixture.chats.create_chat("Terminal owner").unwrap();
+    let second = fixture.chats.create_chat("Discussion").unwrap();
+    let initial = fixture.config.status();
+    let scope = fixture
+        .agent
+        .confirm_conversation_scope(ConversationScopeConsent {
+            revision: initial.revision.unwrap(),
+            destination: initial.destination.unwrap(),
+            session: Some(fixture.session.clone()),
+        })
+        .unwrap();
+    let revision = scope.revision.as_deref().unwrap();
+    let destination = scope.destination.as_deref().unwrap();
+    let ConversationTurn::Terminal { task } = fixture
+        .agent
+        .submit_conversation_turn(
+            &first.chat_id,
+            "Review removing the fixture directory",
+            revision,
+            destination,
+            Some(&fixture.session),
+        )
+        .unwrap()
+    else {
+        panic!("expected terminal capable turn");
+    };
+    let (mut socket, _) = tokio::time::timeout(WAIT, http.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    read_request(&mut socket).await;
+    reply(
+        &mut socket,
+        &tool_body(
+            "terminal_action",
+            r#"{"command_text":"rm -rf /tmp/fixture"}"#,
+            "tool_calls",
+        ),
+    )
+    .await;
+    let display = phase(&fixture.agent, &task.task_id, "awaiting_display").await;
+    ack(&fixture.agent, &display);
+    let owner = phase(&fixture.agent, &task.task_id, "waiting_approval").await;
+    assert!(owner.owner);
+    fixture
+        .ssh
+        .shell_integration()
+        .ready_snapshot(&fixture.session)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .agent
+            .submit_conversation_turn(
+                &first.chat_id,
+                "Same chat must stay reserved",
+                revision,
+                destination,
+                Some(&fixture.session)
+            )
+            .err()
+            .unwrap()
+            .code,
+        "CHAT_BUSY"
+    );
+    let turn = fixture
+        .agent
+        .submit_conversation_turn(
+            &second.chat_id,
+            "Hello, can we discuss something else?",
+            revision,
+            destination,
+            Some(&fixture.session),
+        )
+        .unwrap();
+    assert!(matches!(turn, ConversationTurn::Chat { .. }));
+    let (mut chat_socket, _) = tokio::time::timeout(WAIT, http.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let request = read_request(&mut chat_socket).await;
+    let body: serde_json::Value =
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert!(body
+        .get("tools")
+        .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)));
+    let system = body["messages"][0]["content"]
+        .as_str()
+        .or_else(|| body["messages"][0]["content"][0]["text"].as_str())
+        .unwrap();
+    let availability: serde_json::Value =
+        serde_json::from_str(system.split("Host availability: ").nth(1).unwrap()).unwrap();
+    assert_eq!(availability["terminal_owner_busy"], true);
+    assert_eq!(availability["execution_available"], false);
+    assert_eq!(availability["request_queued"], false);
+    let unchanged = fixture.agent.get(&owner.task_id).unwrap();
+    assert_eq!(unchanged.revision, owner.revision);
+    assert_eq!(unchanged.run_id, owner.run_id);
+    assert_eq!(
+        unchanged.action.as_ref().unwrap().approval_id,
+        owner.action.as_ref().unwrap().approval_id
+    );
+    assert!(unchanged.owner);
+    let answer = chunk(
+        serde_json::json!({"role":"assistant","content":"Hello! We can talk while the other task waits for your decision."}),
+        serde_json::Value::Null,
+    ) + &chunk(serde_json::json!({}), serde_json::json!("stop"))
+        + "data: [DONE]\n\n";
+    reply(&mut chat_socket, &answer).await;
+    tokio::time::timeout(WAIT, async {
+        while fixture
+            .chats
+            .get_chat(&second.chat_id)
+            .unwrap()
+            .active_run_id
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(fixture.agent.get(&second.task_id).is_none());
+    assert!(server.trace().input.is_empty());
+    fixture
+        .agent
+        .cancel(TaskRunRequest {
+            task_id: owner.task_id,
+            run_id: owner.run_id,
+        })
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), http.accept())
+            .await
+            .is_err(),
+        "finishing the owner must not replay the discussion as an executable turn"
+    );
+    assert!(server.trace().input.is_empty());
+    assert!(fixture.agent.get(&second.task_id).is_none());
+}

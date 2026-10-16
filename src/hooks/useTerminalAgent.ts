@@ -162,6 +162,10 @@ export function useTerminalAgent(config: ModelConfigStatus, session: SessionSnap
           if (stopped || !alive.current || document.visibilityState !== 'visible') return;
           for (const task of Object.values(tasksRef.current)) {
             if (task.phase !== 'awaiting_display' || task.action?.displayed || task.action?.blocked || task.action?.policy !== 'auto_normal') continue;
+            // A mounted foreground card owns its stricter target + command
+            // visibility gate. This fallback only advances background tasks
+            // whose committed timeline is not currently mounted in the chat.
+            if (Array.from(document.querySelectorAll<HTMLElement>('.terminal-action-card')).some(card => card.dataset.actionId === task.action!.action_id)) continue;
             const identity = actionIdentity(task);
             if (identity) void acknowledge(identity);
           }

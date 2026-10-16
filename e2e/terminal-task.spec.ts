@@ -41,7 +41,10 @@ test('synthetic unified task: scope consent, painted command, approval and hones
         const request = args.request as Record<string, unknown> | undefined;
         if (cmd === 'confirm_conversation_scope') {
           if (JSON.stringify(request?.session) !== JSON.stringify(session) || request?.revision !== config.revision || request?.destination !== config.destination) throw new Error('Missing target scope');
-          config.consented = true; return structuredClone(config);
+          // Match native confirm_destination: consent advances the monotonic config revision.
+          config.revision = String(Number(config.revision) + 1); config.consented = true;
+          emit('model:event', { kind: 'config_updated', config });
+          return structuredClone(config);
         }
         if (cmd === 'submit_conversation_turn') {
           if (!config.consented || args.revision !== config.revision || JSON.stringify(args.session) !== JSON.stringify(session)) throw new Error('Missing scope consent');

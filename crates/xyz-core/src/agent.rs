@@ -318,6 +318,7 @@ impl AgentManager {
         }
         self.chats.bind_conversation_target(chat_id, &target)?;
         let integration = self.ssh.shell_integration().status();
+        let mut terminal_owner_busy = false;
         if let Some(session) = target
             .session
             .as_ref()
@@ -360,13 +361,22 @@ impl AgentManager {
                         },
                     },
                     true,
-                )?;
-                return Ok(ConversationTurn::Terminal {
-                    task: Box::new(task),
-                });
+                );
+                match task {
+                    Ok(task) => {
+                        return Ok(ConversationTurn::Terminal {
+                            task: Box::new(task),
+                        })
+                    }
+                    // acquire() is authoritative: start_inner has released this
+                    // chat's temporary reservation and has not sent any model
+                    // request or terminal input. Never queue or take the lease.
+                    Err(error) if error.code == "AI_OWNER_BUSY" => terminal_owner_busy = true,
+                    Err(error) => return Err(error),
+                }
             }
         }
-        let availability = serde_json::json!({"connected": target.state == SessionState::Connected, "integration_phase": integration.phase, "error": integration.error, "execution_available": false, "request_queued": false});
+        let availability = serde_json::json!({"connected": target.state == SessionState::Connected, "integration_phase": integration.phase, "error": integration.error, "execution_available": false, "request_queued": false, "terminal_owner_busy": terminal_owner_busy});
         let chat = self.chats.send_message_with_availability(
             chat_id,
             text,

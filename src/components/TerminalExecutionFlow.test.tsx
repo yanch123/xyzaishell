@@ -65,6 +65,25 @@ describe('M3 integrated execution UI', () => {
     fireEvent.click(screen.getByRole('button', { name: '拒绝本次命令' }));
     await waitFor(() => expect(agent.decide).toHaveBeenCalledOnce());
   });
+  it('never globally acknowledges a mounted ordinary command until its target and command are visible', async () => {
+    let targetVisible = false;
+    vi.mocked(HTMLElement.prototype.getBoundingClientRect).mockImplementation(function (this: HTMLElement) {
+      const hidden = this.classList.contains('action-target') && !targetVisible;
+      return { x: 0, y: hidden ? -200 : 0, top: hidden ? -200 : 0, bottom: hidden ? -100 : 600, left: 0, right: 400, width: 400, height: hidden ? 100 : 600, toJSON: () => ({}) };
+    });
+    await ready();
+    const prepared = task({ phase: 'awaiting_display', action: action({ policy: 'auto_normal', risk: 'normal' }) });
+    agent.ack.mockResolvedValue({ ...prepared, revision: '2', phase: 'awaiting_completion', terminal_ready: false, action: { ...prepared.action!, displayed: true, delivery: 'write_accepted' } });
+    act(() => emit({ kind: 'task_updated', task: prepared }));
+    expect(screen.getByRole('group', { name: '精确终端命令' })).toBeDefined();
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 80)); });
+    expect(agent.ack).not.toHaveBeenCalled();
+    targetVisible = true;
+    act(() => window.dispatchEvent(new Event('scroll')));
+    await waitFor(() => expect(agent.ack).toHaveBeenCalledExactlyOnceWith({ task_id: prepared.task_id, run_id: prepared.run_id, action_id: prepared.action!.action_id, display_revision: prepared.action!.display_revision }));
+    expect(agent.decide).not.toHaveBeenCalled();
+  });
+
   it('records and acknowledges an ordinary background action while another chat is selected', async () => {
     await ready();
     const prepared = task({ chat_id: 'chat-b', task_id: 'chat-b', phase: 'awaiting_display', action: action({ policy: 'auto_normal', risk: 'normal' }) });

@@ -54,7 +54,10 @@ test('synthetic unified conversation: greeting, displayed ordinary command and c
         const request = args.request as Record<string, unknown> | undefined;
         if (cmd === 'confirm_conversation_scope') {
           if (JSON.stringify(request?.session) !== JSON.stringify(session) || request?.revision !== config.revision || request?.destination !== config.destination) throw new Error('Missing target scope');
-          config.consented = true; return structuredClone(config);
+          // Match native confirm_destination: consent advances the monotonic config revision.
+          config.revision = String(Number(config.revision) + 1); config.consented = true;
+          emit('model:event', { kind: 'config_updated', config });
+          return structuredClone(config);
         }
         if (cmd === 'submit_conversation_turn') {
           if (!config.consented || args.revision !== config.revision || args.destination !== config.destination || JSON.stringify(args.session) !== JSON.stringify(session)) throw new Error('No current target scope');
@@ -129,7 +132,9 @@ test('synthetic unified conversation: greeting, displayed ordinary command and c
   for (const text of ['Hello', 'Hello, ready to help.', 'Inspect the server', 'Linux verified by uname.', 'What OS did you find?', 'The server uses Linux.']) {
     await expect(page.getByText(text, { exact: true })).toHaveCount(1);
   }
-  await expect(page.getByRole('textbox')).toHaveCount(1);
+  // The SSH terminal also owns an input; count AI composers within its workspace.
+  await expect(page.getByRole('complementary', { name: 'AI 聊天工作区' }).getByRole('textbox')).toHaveCount(1);
+  await expect(page.getByRole('textbox', { name: '终端任务指令' })).toHaveCount(0);
   await expect(page.getByRole('article', { name: '你的消息' })).toHaveCount(3);
   await expect(page.getByRole('article', { name: '模型回复' })).toHaveCount(3);
   const calls = await recordedCalls();
