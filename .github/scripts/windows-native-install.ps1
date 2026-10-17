@@ -119,7 +119,7 @@ try {
     # exact matching signed driver rather than assuming the runner has it.
     & (Join-Path $repo '.github/scripts/install-webview-driver.ps1') -Evidence $evidence
     if ($upgrade) {
-        Invoke-NativeUi 'upgrade' 'upgraded-v0.2.0' $candidateVersion
+        Invoke-NativeUi 'upgrade' 'upgraded-v0.2.1' $candidateVersion
     } else {
     Invoke-NativeUi 'seed' 'first-install-and-restart' $candidateVersion
     $before = Get-ConfigFingerprint
@@ -140,7 +140,7 @@ try {
     }
     $finalFingerprint = Get-ConfigFingerprint
     if ($upgrade) {
-        'PASS: pinned v0.1.4 installed and seeded through real UI; direct v0.2.0 upgrade retained private profile/model bytes, exact legacy backups, migrated archive messages and stable IDs.' | Set-Content -LiteralPath (Join-Path $evidence 'result.txt') -Encoding utf8
+        'PASS: pinned v0.1.4 installed and seeded through real UI; direct v0.2.1 upgrade retained private profile/model bytes, exact legacy backups, migrated archive messages and stable IDs.' | Set-Content -LiteralPath (Join-Path $evidence 'result.txt') -Encoding utf8
     } else {
     @(
         'PASS: actual NSIS install and native UI/IPC synthetic profile/chat persistence.'

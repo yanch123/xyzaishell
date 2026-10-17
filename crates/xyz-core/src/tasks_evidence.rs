@@ -319,8 +319,15 @@ mod tests {
         let candidate = context.ledger.quick_candidate(&job).unwrap();
         let after_body = context.project(&template, Some(&candidate)).unwrap();
         let after = context
-            .measure(&after_body, MeasurementScope::CommittedContext)
+            .measure_projection(
+                &after_body,
+                MeasurementScope::CommittedContext,
+                Some(&candidate),
+            )
             .unwrap();
+        assert!(after.retained_source_ids.as_ref().is_some_and(|sources| {
+            sources.contains("host-candidate-summary") && sources.contains(&reference)
+        }));
         assert!(
             after.usage.byte_guards[0].measured_bytes < before.usage.byte_guards[0].measured_bytes
         );
@@ -411,11 +418,16 @@ mod tests {
             .unwrap();
         let candidate = context.ledger.quick_candidate(&job).unwrap();
         let after = context
-            .measure(
+            .measure_projection(
                 &context.project(&template, Some(&candidate)).unwrap(),
                 MeasurementScope::CommittedContext,
+                Some(&candidate),
             )
             .unwrap();
+        assert!(after.retained_source_ids.as_ref().is_some_and(|sources| {
+            sources.contains("host-candidate-summary")
+                && sources.contains(&source_id(&context, "command-16"))
+        }));
         context
             .ledger
             .commit_compaction(&job, candidate, &before, &after, true)

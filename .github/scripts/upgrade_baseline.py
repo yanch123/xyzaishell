@@ -7,7 +7,7 @@ import urllib.request
 import artifacts
 
 BASE_VERSION = "0.1.4"
-TARGET_VERSION = "0.2.0"
+TARGET_VERSION = "0.2.1"
 BASE_COMMIT = "0e29b1e5912f35e9eabd73ac073524af143cd622"
 BASE_RUN = "38937958608"
 RELEASE_URL = "https://github.com/yanch123/xyzaishell/releases/download/v0.1.4/"

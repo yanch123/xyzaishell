@@ -164,4 +164,58 @@ mod tests {
             .push(job.source_segment_ids[0].clone());
         assert!(CompactionAliases::new(&job).is_err());
     }
+
+    #[test]
+    fn second_generation_summary_text_does_not_expand_ancestor_references() {
+        let mut job = job();
+        job.source_segment_ids = vec!["summary-prior-job".into()];
+        let aliases = CompactionAliases::new(&job).unwrap();
+        let old_summary = json!({
+            "coverage":{"source_ids":["expired-user-source"],"omitted_ranges":[]},
+            "user_constraints":[{"text":"Never delete data.","source_ids":["expired-user-source"]}],
+            "summary_text":"Never delete data."
+        })
+        .to_string();
+        let payload = json!({
+            "source_manifest":["summary-prior-job"],
+            "sources":[{"source_id":"summary-prior-job","text":old_summary}]
+        });
+        let encoded = aliases.encode(&job, &payload).unwrap();
+        assert_eq!(encoded["source_manifest"], json!(["s0"]));
+        assert_eq!(encoded["sources"][0]["text"], payload["sources"][0]["text"]);
+        assert_eq!(aliases.decode(&job, &encoded).unwrap(), payload);
+        assert!(aliases
+            .decode(&job, &json!({"source_ids":["expired-user-source"]}))
+            .is_err());
+        assert!(aliases
+            .encode(&job, &json!({"source_ids":["expired-user-source"]}))
+            .is_err());
+    }
+
+    #[test]
+    fn validated_partial_summaries_merge_only_direct_ids_and_protected_anchors() {
+        let mut job = job();
+        job.source_segment_ids = vec!["summary-a".into(), "new-dialogue".into()];
+        let aliases = CompactionAliases::new(&job).unwrap();
+        let merge = json!({
+            "source_manifest":["summary-a","new-dialogue"],
+            "partial_summaries":[
+                {"coverage":{"source_ids":["summary-a"],"omitted_ranges":[]},
+                 "user_constraints":[{"text":"Do not delete data.","source_ids":["summary-a"]}]},
+                {"coverage":{"source_ids":["new-dialogue"],"omitted_ranges":[]},
+                 "findings":[{"text":"Unverified interpretation","evidence_refs":["protected-user-goal"]}]}
+            ]
+        });
+        let encoded = aliases.encode(&job, &merge).unwrap();
+        assert_eq!(encoded["source_manifest"], json!(["s0", "s1"]));
+        assert_eq!(
+            encoded["partial_summaries"][0]["user_constraints"][0]["source_ids"],
+            json!(["s0"])
+        );
+        assert_eq!(
+            encoded["partial_summaries"][1]["findings"][0]["evidence_refs"],
+            json!(["p0"])
+        );
+        assert_eq!(aliases.decode(&job, &encoded).unwrap(), merge);
+    }
 }

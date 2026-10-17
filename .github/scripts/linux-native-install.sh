@@ -91,7 +91,7 @@ done
 ldd /usr/bin/xyzaishell | tee "$evidence/linkage.txt"
 ! grep -q 'not found' "$evidence/linkage.txt"
 if $upgrade; then
-  run_ui upgrade upgraded-v0.2.0 "$candidate_version"
+  run_ui upgrade upgraded-v0.2.1 "$candidate_version"
 else
   run_ui seed first-install-and-restart "$candidate_version"
   fingerprint > "$fixture/before-reinstall.sha256"
@@ -108,7 +108,7 @@ else
 fi
 fingerprint > "$fixture/final.sha256"
 if $upgrade; then
-  printf '%s\n' 'PASS: pinned v0.1.4 installed and seeded through real UI; direct v0.2.0 upgrade retained private profile/model bytes, exact legacy backups, migrated archive messages and stable IDs.' > "$evidence/result.txt"
+  printf '%s\n' 'PASS: pinned v0.1.4 installed and seeded through real UI; direct v0.2.1 upgrade retained private profile/model bytes, exact legacy backups, migrated archive messages and stable IDs.' > "$evidence/result.txt"
 else
 printf '%s\n' \
   'PASS: actual DEB installed; real native DOM/IPC profile/chat persistence and consent verified.' \

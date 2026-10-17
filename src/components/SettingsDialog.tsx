@@ -106,7 +106,7 @@ export function SettingsDialog({ onClose, model, onConsent, onHistoryStatus }: {
   };
   const testResultCurrent = model.configTest?.file_revision === config.file_revision;
   const canSave = model.native && !model.configBusy && !model.configWriteBlocked && !!baseline.file_revision && !stale;
-  return <NonModalPanel title="工作空间设置" eyebrow="XYZAI SHELL · v0.2.0" onClose={() => requestLeave('close')} className="settings-modal">
+  return <NonModalPanel title="工作空间设置" eyebrow="XYZAI SHELL · v0.2.1" onClose={() => requestLeave('close')} className="settings-modal">
     <nav className="settings-categories" aria-label="设置分类">
       {([['model', '模型'], ['terminal', '终端'], ['general', '通用'], ['history', '历史记录']] as const).map(([value, label]) => <button key={value} type="button" aria-current={category === value ? 'page' : undefined} onClick={() => setCategory(value)}>{label}</button>)}
     </nav>

@@ -34,6 +34,44 @@ FOLLOWUP = "Native fixture follow-up: retain the previous answer 中文"
 FOLLOWUP_REPLY = "Native fixture contextual follow-up reply 中文 " + ("Additional synthetic history detail. " * 120).rstrip()
 PROFILE = "Native fixture profile 中文"
 TOKEN = "synthetic-native-fixture-token"
+TAIL_CONSTRAINT = "Synthetic user restriction: never restart the fixture host."
+OLD_USER = "Native fixture older user instruction. " + ("Background detail for the historical task. " * 100) + TAIL_CONSTRAINT
+SUMMARY_MARKER = "Native fixture v0.2.1 summary: user restriction retained."
+PROJECTION_CHECK = "Native fixture projection check: continue within the retained restriction."
+PROJECTION_REPLY = "Native fixture verified the submitted summarized projection; no command was executed."
+DISPLAY_CATEGORIES = ("system_instructions", "tool_definitions", "fixed_rules", "history_summary", "current_conversation")
+DIALOGUE_PARTS = ("user_messages", "assistant_messages", "tool_calls", "tool_results", "other_inputs")
+
+
+def projection_summary(messages):
+    """Read the actual submitted model input, not browser history or fixture state."""
+    matches = [message["content"] for message in messages
+               if message.get("role") == "user" and SUMMARY_MARKER in str(message.get("content", ""))]
+    assert len(matches) == 1, "Expected exactly one committed LLM summary in the real follow-up request"
+    text = matches[0]
+    summary = json.loads(text[text.index("{"):])
+    assert summary["summary_text"] == SUMMARY_MARKER
+    assert any(item["text"] == TAIL_CONSTRAINT and item["source_ids"] for item in summary["user_constraints"]), "Summary lost the historical user restriction"
+    assert not any(OLD_USER in str(message.get("content", "")) for message in messages), "Summarized user original was reactivated"
+    return text
+
+
+def fixture_summary(payload):
+    ids = payload["source_manifest"]
+    # Chunk requests cite their direct source. Merge requests preserve only
+    # references already validated in their partial summaries.
+    restriction_ids = [source["source_id"] for source in payload.get("sources", []) if TAIL_CONSTRAINT in source.get("text", "")]
+    for partial in payload.get("partial_summaries", []):
+        for constraint in partial.get("user_constraints", []):
+            if constraint["text"] == TAIL_CONSTRAINT:
+                restriction_ids.extend(constraint["source_ids"])
+    restriction_ids = list(dict.fromkeys(restriction_ids))
+    assert all(source_id in ids for source_id in restriction_ids)
+    return {"goal": "Preserve the synthetic conversation", "user_constraints": [{"text": TAIL_CONSTRAINT, "source_ids": restriction_ids}] if restriction_ids else [],
+            "findings": [], "hypotheses": [], "remaining_steps": [],
+            "uncertainties": ["Synthetic fixture only; controlled output validates the pipeline, not model semantic quality"],
+            "coverage": {"source_ids": ids, "omitted_ranges": ids},
+            "summary_text": SUMMARY_MARKER if restriction_ids else "Earlier synthetic history was summarized; no command was executed."}
 
 
 def fixture_output_reserve(version, expected=None):
@@ -124,7 +162,7 @@ class ModelFixture(http.server.BaseHTTPRequestHandler):
                  and body.get("model") == "native-fixture-model"
                  and body.get("stream") is True
                  and not body.get("tools")
-                 and (probe or any(m.get("role") == "user" and m.get("content") in (PROMPT, FOLLOWUP)
+                 and (probe or any(m.get("role") == "user" and m.get("content") in (PROMPT, OLD_USER, FOLLOWUP, PROJECTION_CHECK)
                                    for m in body.get("messages", []))))
         if not valid:
             self.server.invalid_requests += 1
@@ -135,8 +173,19 @@ class ModelFixture(http.server.BaseHTTPRequestHandler):
             self.server.invalid_requests += 1
             self.send_error(400)
             return
+        projection_check = body.get("messages", [])[-1].get("content") == PROJECTION_CHECK
+        if projection_check:
+            try:
+                summary = projection_summary(messages)
+                if self.server.projection_summaries:
+                    assert summary == self.server.projection_summaries[0], "Quick changed the committed LLM summary"
+                self.server.projection_summaries.append(summary)
+            except (AssertionError, ValueError, KeyError, TypeError):
+                self.server.invalid_requests += 1
+                self.send_error(400)
+                return
         chunks = [
-            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "OK" if probe else FOLLOWUP_REPLY if followup else REPLY}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "OK" if probe else PROJECTION_REPLY if projection_check else FOLLOWUP_REPLY if followup else REPLY}, "finish_reason": None}]},
             {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
         ]
         stream = "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
@@ -167,9 +216,7 @@ class ModelFixture(http.server.BaseHTTPRequestHandler):
             if not self.server.release_compaction.wait(timeout=25):
                 self.send_error(504)
                 return
-        summary = {"goal": "Preserve the synthetic conversation", "user_constraints": [], "findings": [],
-                   "hypotheses": [], "remaining_steps": [], "uncertainties": ["Synthetic fixture only; source details and prior partial evidence may be omitted"],
-                   "coverage": {"source_ids": ids, "omitted_ranges": ids}, "summary_text": "Earlier synthetic history was summarized; no command was executed."}
+        summary = fixture_summary(payload)
         chunks = [{"choices": [{"index": 0, "delta": {"role": "assistant", "content": json.dumps(summary)}, "finish_reason": None}]},
                   {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}]
         data = ("".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks) + "data: [DONE]\n\n").encode()
@@ -463,7 +510,7 @@ def assert_literal_reply(driver):
 
 
 def wait_for_chat_idle(driver, version):
-    # Both reviewed v0.1.4 and v0.2.0 use the simplified unified composer.
+    # Both the reviewed v0.1.4 baseline and candidate use the unified composer.
     wait_for(lambda: driver.js("return ![...document.querySelectorAll('button')].some(e=>['停止生成','正在提交…'].includes(e.textContent.trim())) && document.querySelector('textarea[aria-label=\"聊天消息\"]')?.value === ''"))
 
 
@@ -472,6 +519,47 @@ def rendered_task_identity(driver, version):
     value = driver.js("return document.querySelector('.conversation-details')?.getAttribute('data-task-id')")
     assert isinstance(value, str) and value, "Missing rendered candidate task identity"
     return value
+
+
+def verify_accounting(data, require_summary=False):
+    assert data["schema"] == "2", "Expected five-category backend estimate schema"
+    def count(value):
+        assert isinstance(value, str) and re.fullmatch(r"[0-9]+", value), "Missing exact native estimate; unknown must not become zero"
+        return int(value)
+    categories, children = data["categories"], data["children"]
+    assert [item["category"] for item in categories] == list(DISPLAY_CATEGORIES), "Expected exactly five real-source categories"
+    assert [item["category"] for item in children] == list(DIALOGUE_PARTS), "Expected complete dialogue breakdown"
+    totals = {item["category"]: count(item["tokens"]) for item in categories}
+    content, protocol, total = (count(data[key]) for key in ("content", "protocol", "input"))
+    assert sum(totals.values()) == content, "Five-category content total does not reconcile"
+    assert content + protocol == total, "Content plus protocol overhead differs from total input"
+    assert protocol > 0, "Actual chat messages require explicit protocol overhead"
+    assert sum(count(item["tokens"]) for item in children) == totals["current_conversation"], "Dialogue children double-count or omit input"
+    if require_summary:
+        assert totals["history_summary"] > 0, "Committed summary missing from real request estimate"
+    return data
+
+
+def verify_context_accounting(driver, evidence_name, require_summary=False):
+    def read():
+        data = driver.js("""
+      const panel = document.querySelector('.context-popover');
+      return {
+        jobId: panel?.getAttribute('data-compaction-job-id'),
+        jobState: panel?.getAttribute('data-compaction-state'),
+        jobMode: panel?.getAttribute('data-compaction-mode'),
+        schema: panel?.getAttribute('data-category-schema-version'),
+        content: panel?.getAttribute('data-content-input-tokens'),
+        protocol: panel?.getAttribute('data-protocol-overhead-tokens'),
+        input: panel?.getAttribute('data-estimated-input-tokens'),
+        categories: [...(panel?.querySelectorAll('[data-context-category]') ?? [])].map(e=>({category:e.getAttribute('data-context-category'),tokens:e.getAttribute('data-estimated-tokens')})),
+        children: [...(panel?.querySelectorAll('[data-context-dialogue-part]') ?? [])].map(e=>({category:e.getAttribute('data-context-dialogue-part'),tokens:e.getAttribute('data-estimated-tokens')}))
+      };
+        """)
+        return verify_accounting(data, require_summary)
+    # Job completion and the next native usage snapshot are separate events.
+    data = wait_for(read)
+    (driver.evidence / (evidence_name + ".json")).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def verify_context_controls(driver, server):
@@ -488,12 +576,15 @@ def verify_context_controls(driver, server):
     assert driver.js("return document.querySelector('.context-popover').textContent.includes('保守估算')")
     assert driver.js("return !/(?:目标|压缩到|压到|降至|降到)\\s*50%|50%\\s*(?:目标|固定)/.test(document.querySelector('.context-popover').textContent)")
     assert driver.js("return document.querySelector('select[aria-label=\"本次压缩方式\"]').value === 'llm'")
+    verify_context_accounting(driver, "native-context-five-categories-and-protocol")
     driver.screenshot("native-context-default-budget-and-sources")
     driver.click("//select[@aria-label='本次压缩方式']/option[@value='quick']")
     requests_before = len(server.requests)
     driver.click(driver.button("立即压缩"))
     wait_for(lambda: driver.js("return [...document.querySelectorAll('.context-popover [role=status]')].some(e=>e.textContent.trim()==='上下文已整理')"))
     assert len(server.requests) == requests_before, "Quick compaction unexpectedly called the model"
+    assert not server.compaction_requests, "Quick compaction unexpectedly called the summary model"
+    server.successful_compactions += 1
     driver.screenshot("native-quick-compaction-positive-reduction")
     driver.click(driver.button("关闭上下文"))
 
@@ -518,6 +609,55 @@ def wait_for_compaction_provider(driver, server):
     except AssertionError as error:
         raise AssertionError("LLM provider request did not start; native UI state: "
                              + json.dumps(context_control_state(driver), ensure_ascii=False)) from error
+
+
+def rendered_compaction(driver):
+    return driver.js("""
+      const panel = document.querySelector('.context-popover');
+      return {id:panel?.getAttribute('data-compaction-job-id'),state:panel?.getAttribute('data-compaction-state'),mode:panel?.getAttribute('data-compaction-mode')};
+    """)
+
+
+def verify_llm_then_quick_projection(driver, server, version):
+    def followup(turn):
+        element = driver.find("//textarea[@aria-label='聊天消息']")
+        driver.command("POST", f"/element/{element}/value", {"text": PROJECTION_CHECK, "value": list(PROJECTION_CHECK)})
+        driver.click(driver.button("发送"))
+        wait_for(lambda: driver.js("return document.querySelectorAll('article[aria-label=\"模型回复\"]').length") == turn)
+        wait_for_chat_idle(driver, version)
+        assert len(server.requests) == turn and not server.invalid_requests
+        assert server.requests[-1]["messages"][-1]["content"] == PROJECTION_CHECK
+
+    # This first request proves the committed LLM projection is used by the
+    # normal production chat path, independently of saved transcript pages.
+    followup(7)
+    assert len(server.projection_summaries) == 1
+    driver.click("//button[starts-with(@aria-label,'可用输入预算占用')]")
+    verify_context_accounting(driver, "native-context-before-llm-then-quick", require_summary=True)
+    previous = rendered_compaction(driver)
+    driver.click("//select[@aria-label='本次压缩方式']/option[@value='quick']")
+    requests_before = (len(server.requests), len(server.compaction_requests))
+    driver.click(driver.button("立即压缩"))
+    def completed():
+        job = rendered_compaction(driver)
+        return job if job["id"] and job["id"] != previous["id"] and job["mode"] == "quick" and job["state"] in ("succeeded", "no_effect") else False
+    result = wait_for(completed)
+    assert requests_before == (len(server.requests), len(server.compaction_requests)), "Quick contacted the model"
+    if result["state"] == "succeeded":
+        server.successful_compactions += 1
+    verify_context_accounting(driver, "native-context-after-llm-then-quick", require_summary=True)
+    driver.screenshot("native-llm-then-quick-full-summary-protected")
+    driver.click(driver.button("关闭上下文"))
+    followup(8)
+    assert len(server.projection_summaries) == 2
+    assert server.projection_summaries[0] == server.projection_summaries[1], "Quick truncated or changed the committed summary"
+    (driver.evidence / "native-llm-quick-projection.json").write_text(json.dumps({
+        "older_user_source_received": True, "quick_state": result["state"],
+        "full_summary_equal": True, "restriction": TAIL_CONSTRAINT,
+        "summary_sha256": hashlib.sha256(server.projection_summaries[0].encode()).hexdigest(),
+        "post_llm_and_post_quick_chat_requests": 2,
+        "synthetic_pipeline_only": True, "real_model_semantic_quality_tested": False,
+    }, indent=2), encoding="utf-8")
 
 
 def verify_llm_compaction_and_cancel(driver, server):
@@ -559,6 +699,10 @@ def verify_llm_compaction_and_cancel(driver, server):
     wait_for(lambda: driver.js("return [...document.querySelectorAll('.context-popover [role=status]')].some(e=>e.textContent.trim()==='上下文已整理')"))
     assert len(server.compaction_requests) > before + 1
     assert not server.invalid_requests
+    assert any(OLD_USER in source.get("text", "") for body in server.compaction_requests[before + 1:]
+               for source in json.loads(body["messages"][-1]["content"]).get("sources", [])), "LLM never received the eligible older user instruction"
+    server.successful_compactions += 1
+    verify_context_accounting(driver, "native-context-after-llm", require_summary=True)
     driver.screenshot("native-llm-compaction-positive-reduction")
     driver.click(driver.button("关闭上下文"))
 
@@ -572,6 +716,8 @@ def verify_archive_page(driver, message_count):
     assert driver.command("GET", f"/element/{older}/enabled") is False
     driver.click(driver.button("最新一页"))
     wait_for(lambda: driver.js("return document.querySelectorAll('[aria-label=\"归档历史页\"] article').length") == message_count)
+    if message_count == 16:
+        assert driver.js("return document.querySelector('[aria-label=\"归档历史页\"]').textContent.includes(" + json.dumps(OLD_USER) + ")"), "Compaction changed the original user archive"
     driver.screenshot("native-durable-archive-page")
     driver.click(driver.button("收起历史页"))
 
@@ -614,18 +760,20 @@ def seed(driver, server, version):
         # compactions; no source ledger or IPC is injected by this fixture.
         for turn in range(2, 7):
             element = driver.find("//textarea[@aria-label='聊天消息']")
-            driver.command("POST", f"/element/{element}/value", {"text": FOLLOWUP, "value": list(FOLLOWUP)})
+            text = OLD_USER if turn == 2 else FOLLOWUP
+            driver.command("POST", f"/element/{element}/value", {"text": text, "value": list(text)})
             driver.click(driver.button("发送"))
             wait_for(lambda: driver.js("return document.querySelectorAll('article[aria-label=\"模型回复\"]').length") == turn)
             wait_for_chat_idle(driver, version)
             assert len(server.requests) == turn and server.invalid_requests == 0
-            assert server.requests[-1]["messages"][-1]["content"] == FOLLOWUP
+            assert server.requests[-1]["messages"][-1]["content"] == text
             assert not driver.command("POST", "/elements", {"using": "xpath", "value": "//*[@role='dialog' and @aria-label='确认模型接收方']"})
             if turn == 3:
                 verify_context_controls(driver, server)
         driver.screenshot("unified-no-ssh-contextual-followup")
         verify_llm_compaction_and_cancel(driver, server)
-        verify_archive_page(driver, 12)
+        verify_llm_then_quick_projection(driver, server, version)
+        verify_archive_page(driver, 16)
     return profile_id
 
 
@@ -643,7 +791,7 @@ def verify_preserved(driver, server, version, expected_profile_id, message_count
     enable_history(driver, version)
     # The saved title remains '新任务'; it is not derived from message text.
     # This isolated fixture has exactly one conversation (baseline: two messages;
-    # candidate: four, including the contextual follow-up). Require
+    # candidate: sixteen, including projection verification). Require
     # uniqueness, then verify exact reply and persisted task/chat identity below.
     restore = f"//div[@aria-label='本机保存的聊天']/div[span[contains(.,' · {message_count} 条消息')]]/button[normalize-space(.)='仅恢复文字']"
     wait_for(lambda: len(driver.command("POST", "/elements", {"using": "xpath", "value": restore})) == 1)
@@ -700,11 +848,11 @@ def verify_history_upgrade(history, expected_rows):
             assert json.loads(indexed[row[0]][5])["messages"] == [], "Archive metadata retained a bounded transcript copy"
 
 
-def verify_compaction_archive(history):
+def verify_compaction_archive(history, expected_count=2):
     database = history / "history.sqlite3"
     with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
         rows = connection.execute("SELECT event_id,payload FROM compactions ORDER BY event_id").fetchall()
-        assert len(rows) == 2, "Only the successful quick and LLM compactions should be archived"
+        assert len(rows) == expected_count, "Only observed successful compactions should be archived"
         modes = set()
         for event_id, payload in rows:
             event = json.loads(payload)
@@ -857,6 +1005,8 @@ def main():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", expected["port"] if expected else 0), ModelFixture)
     server.requests, server.test_requests, server.invalid_requests = [], [], 0
     server.compaction_requests = []
+    server.projection_summaries = []
+    server.successful_compactions = 0
     server.compaction_started, server.release_compaction = threading.Event(), threading.Event()
     server.hold_compaction = False
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -891,7 +1041,7 @@ allow_loopback_http = true
         phases = ["seed", "restart"] if expected is None else [args.phase]
         identity = expected["identity"] if expected else None
         profile_id = expected["profile_id"] if expected else None
-        message_count = expected.get("message_count", 2) if expected else (12 if args.application_version == TARGET_VERSION else 2)
+        message_count = expected.get("message_count", 2) if expected else (16 if args.application_version == TARGET_VERSION else 2)
         for phase in phases:
             directory = args.evidence / phase
             directory.mkdir(exist_ok=True)
@@ -916,6 +1066,7 @@ allow_loopback_http = true
             assert server.invalid_requests == 0
             if phase == "seed" and args.application_version == TARGET_VERSION:
                 assert len(server.compaction_requests) >= 2, "Expected cancelled and successful real compaction requests"
+                assert len(server.projection_summaries) == 2, "Missing real chat use of the summarized projection before and after quick"
             else:
                 assert not server.compaction_requests, "Restoration unexpectedly started compaction"
             actual = list(stored_identity(history))
@@ -934,7 +1085,7 @@ allow_loopback_http = true
         history_version, preserved_rows = history_rows(history)
         assert history_version == (3 if args.application_version == TARGET_VERSION else 2), "Unexpected native history schema"
         if args.phase == "seed" and args.application_version == TARGET_VERSION:
-            verify_compaction_archive(history)
+            verify_compaction_archive(history, server.successful_compactions)
         profile_version = profile_schema_version(config)
         assert profile_version == 2, "Reviewed native fixture must use profile schema v2"
         if args.phase == "upgrade":
@@ -956,6 +1107,10 @@ allow_loopback_http = true
             "native_ipc": True, "synthetic_loopback_model": True,
             "native_llm_compaction_cancel_retry_positive_reduction": args.phase == "seed" and args.application_version == TARGET_VERSION,
             "context_estimator_and_quick_positive_reduction": args.phase == "seed" and args.application_version == TARGET_VERSION,
+            "five_categories_plus_protocol_reconciled": args.phase == "seed" and args.application_version == TARGET_VERSION,
+            "older_user_llm_then_quick_summary_intact": args.phase == "seed" and args.application_version == TARGET_VERSION,
+            "real_chat_used_summarized_projection": args.phase == "seed" and args.application_version == TARGET_VERSION,
+            "real_model_semantic_quality_tested": False,
             "durable_archive_page_read": args.application_version == TARGET_VERSION,
             "durable_compaction_event_and_source_index": args.phase == "seed" and args.application_version == TARGET_VERSION,
             "profile_and_history_persisted": True, "restored_task_identity_preserved": True,

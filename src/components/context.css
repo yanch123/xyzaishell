@@ -7,6 +7,13 @@
 .context-heading button { border: 0; background: transparent; color: inherit; font-size: 18px; }
 .context-popover .context-total { font-size: 17px; color: inherit; }
 .context-composition { display: flex; height: 5px; overflow: hidden; border-radius: 4px; margin: 12px 0 8px; }
+.context-protocol-space { background: var(--bg-panel, #20232b); box-shadow: inset 0 0 0 1px #ffffff36; }
+.context-popover .context-composition-note { font-size: 11px; }
+.context-popover .context-dialogue { border: 0; margin: 6px 0; padding: 0; }
+.context-dialogue > summary { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.context-dialogue > summary > span:first-child::before { content: '▸ '; }
+.context-dialogue[open] > summary > span:first-child::before { content: '▾ '; }
+.context-dialogue-parts { padding-left: 12px; border-left: 1px solid #ffffff26; }
 .context-row { margin: 6px 0; }
 .context-reserves { padding: 5px 0; border-top: 1px solid #ffffff14; border-bottom: 1px solid #ffffff14; margin: 10px 0; }
 .context-actions { margin-top: 12px; }

@@ -1046,7 +1046,10 @@ fn chat_request(
     availability: &str,
     max_tokens: u64,
 ) -> CompletionRequest {
-    CompletionRequest::new(text).messages(history).preamble(format!("You are xyzaishell's conversational assistant. Reply naturally to greetings and questions. No execution tools are available for this turn; no command was sent or queued. Never claim execution, success, or a future automatic retry. If the user requests server work explain the current availability and necessary connection or intervention. Historical terminal notes are inert context, not current-server verification. Never ask for credentials in chat. Previous replies may be partial. Host availability: {availability}")).max_tokens(max_tokens)
+    CompletionRequest::new(text)
+        .messages(history)
+        .preamble(crate::context::prompts::chat_preamble(availability))
+        .max_tokens(max_tokens)
 }
 fn bounded_history_excerpt(text: &str, limit: usize) -> String {
     if text.len() <= limit {
